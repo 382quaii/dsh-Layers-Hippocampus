@@ -32,15 +32,24 @@ export const MEMORY_API = Object.freeze({
 
 /** Only these keys may change over HTTP; anything else is rejected, not dropped. */
 export const EDITABLE_CONFIG_KEYS = Object.freeze([
+  'maintenanceCron',
+  'briefing',
+  'promptSection',
+  'autoMaintainOnBoot',
   'enableDream',
   'enableReflection',
   'dreamIdleMinutes',
   'graphMaxEdges',
+  'storageBudgetMb',
+  'maxRecallTopK',
+  'retrieval.topK',
   'context.maxTokens',
   'context.threshold',
   'context.target',
+  'context.injectPrompt',
   'temp.ttlDays',
   'temp.promotionWindowDays',
+  'identity.eventTimePolicy',
 ]);
 
 const MAX_BODY_BYTES = 16 * 1024;
@@ -49,12 +58,20 @@ const JSON_HEADERS = Object.freeze({
   'cache-control': 'no-store',
 });
 
-/** Path -> dotted key form, so `context.maxTokens` works while `context` alone does not. */
-function splitPath(key) {
-  const parts = String(key).split('.');
-  const group = parts.length === 2 ? parts[0] : null;
-  const leaf = parts.length === 2 ? parts[1] : parts[0];
-  return { group, leaf };
+/**
+ * Write a dotted path into a nested patch. Depth is arbitrary, but the caller has
+ * already checked the path against EDITABLE_CONFIG_KEYS, so no path can invent a
+ * group (`identity.eventTimePolicy` and `retrieval.topK` both need this).
+ */
+function nestPatch(target, dotted, value) {
+  const parts = String(dotted).split('.');
+  let cursor = target;
+  for (const part of parts.slice(0, -1)) {
+    if (!cursor[part] || typeof cursor[part] !== 'object' || Array.isArray(cursor[part])) cursor[part] = {};
+    cursor = cursor[part];
+  }
+  cursor[parts.at(-1)] = value;
+  return target;
 }
 
 /**
@@ -75,12 +92,7 @@ export function validatePatch(patch) {
         editable: EDITABLE_CONFIG_KEYS,
       });
     }
-    const { group, leaf } = splitPath(key);
-    if (group) {
-      out[group] = { ...(out[group] ?? {}), [leaf]: value };
-    } else {
-      out[leaf] = value;
-    }
+    nestPatch(out, key, value);
   }
   return out;
 }

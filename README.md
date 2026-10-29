@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # dsh-layers-hippocampus · 海马体记忆
 
 给 DeepSeek Harness（DSH）智能体的**分层长期记忆**：追加式事件日志、可重建标签索引、按天日记、独立语义层、L2.5 趋势隔离、离线知识图谱，以及一个 Web 面板。
@@ -87,6 +88,7 @@ plugin_manager action=install_bundle target=<目录或包名>
 | `dreamIdleMinutes` | `180` | 1 – 525 600 |
 | `enableReflection` | `true` | 布尔 |
 | `graphMaxEdges` | `500` | 100 – 2000 |
+| `storageBudgetMb` | `50` | 10 – 1000；只影响环形图阈值，不删数据 |
 | `maxRecallTopK` | `100` | 1 – 1000 |
 | `retrieval.topK` | `20` | 1 – `maxRecallTopK` |
 | `context.maxTokens` | `4000` | 256 – 1 000 000 |
@@ -119,8 +121,10 @@ Cron **和** 空闲 Dream 触发调用同一个入口 `runtime.runMaintenance(so
 | `main` | `hippocampus-panel` | 面板：存储环形图、统计卡、知识图谱 |
 | `settings.section` | `hippocampus-settings` | 配置表单 |
 
-- **环形图**：纯 SVG，中心同时显示用量与百分比；超出软预算时弧线截断为整圈并整体标红。
-- **知识图谱**：力导向布局**只计算一次**并冻进 ref（弹簧 + 斥力 + 向心），随后逐个节点入场；边只在**两端节点都已入场**后绘制，不会出现悬空线；孤立节点带随机抖动。修改 `graphMaxEdges` 后按新上限重新拉取并重绘。
+- **环形图**：纯 SVG，预算来自 `storageBudgetMb`；中心显示用量与百分比，超预算时弧线截断为整圈并整体标红。
+- **知识图谱**：力导向布局**只计算一次**并冻进 ref（弹簧 + 斥力 + 向心），随后逐个节点入场；边只在**两端节点都已入场**后绘制，不会出现悬空线；孤立节点带随机抖动。
+  - **拖拽**：节点用 `onPointerDown/Move/Up` + `setPointerCapture` 拖动，拖拽期间只改 ref 坐标并直接写 DOM（`transform`/线段端点），**不触发任何 setState**；松手后解除 pin，对 1 跳邻域做一次 alpha 衰减的局部松弛。位移 < 4px 仍算点击（切换标签），不会误拖。
+- **设置页**：全部可调配置都在这里——开关（Dream / Reflection / briefing / promptSection / autoMaintainOnBoot / injectPrompt）、数字（含上下限与客户端预检）、下拉（`identity.eventTimePolicy`）、Cron 文本框；保存一次性打包含点号路径的 patch，后端 fail-fast 校验失败时顶部红色横幅显示错误码，成功后广播 `config-changed`，面板立即重拉 stats 与 graph。
 - UI 不调用 Agent 工具，只读下面的 JSON 路由。
 
 ### 截图
@@ -181,3 +185,7 @@ npm run check # 语法检查 + 全量测试
 ## 许可
 
 MIT © 2026 382quaii
+=======
+# dsh-Layers-Hipppocampus
+应用了日志将ds原始数据保存，并用了标签和日记保证了搜索速度，同时用了一系列方法保证了安全性与可靠性
+>>>>>>> a1bda2e07182e65350eaf581badcff01f2a90647

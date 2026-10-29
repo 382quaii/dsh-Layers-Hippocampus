@@ -212,7 +212,33 @@ test('validatePatch rejects non-objects and accepts only the editable set', () =
   assert.throws(() => validatePatch(null), /patch must be an object/);
   assert.throws(() => validatePatch([1, 2]), /patch must be an object/);
   const accepted = validatePatch(Object.fromEntries(EDITABLE_CONFIG_KEYS.map((key, index) => [key, index])));
-  assert.deepEqual(Object.keys(accepted).sort(), ['context', 'dreamIdleMinutes', 'enableDream', 'enableReflection', 'graphMaxEdges', 'temp']);
+  assert.deepEqual(Object.keys(accepted).sort(), [
+    'autoMaintainOnBoot',
+    'briefing',
+    'context',
+    'dreamIdleMinutes',
+    'enableDream',
+    'enableReflection',
+    'graphMaxEdges',
+    'identity',
+    'maintenanceCron',
+    'maxRecallTopK',
+    'promptSection',
+    'retrieval',
+    'storageBudgetMb',
+    'temp',
+  ]);
+});
+
+test('dotted patches nest at any depth and reject unknown groups', () => {
+  assert.deepEqual(validatePatch({ 'identity.eventTimePolicy': 'explicit' }), { identity: { eventTimePolicy: 'explicit' } });
+  assert.deepEqual(validatePatch({ 'retrieval.topK': 12 }), { retrieval: { topK: 12 } });
+  assert.deepEqual(validatePatch({ 'context.maxTokens': 8000, 'temp.ttlDays': 7 }), {
+    context: { maxTokens: 8000 },
+    temp: { ttlDays: 7 },
+  });
+  assert.throws(() => validatePatch({ 'policy.decay.floor': 0.1 }), /not editable/);
+  assert.throws(() => validatePatch({ 'context.nope': 1 }), /not editable/);
 });
 
 test('registerMemoryRoutes registers the full route table and disposes it, or reports why not', () => {

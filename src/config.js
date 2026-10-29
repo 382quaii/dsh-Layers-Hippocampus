@@ -57,6 +57,7 @@ export const CONFIG_KEYS = Object.freeze([
   'dreamIdleMinutes',
   'enableReflection',
   'graphMaxEdges',
+  'storageBudgetMb',
   'maxRecallTopK',
   'retrieval',
   'context',
@@ -90,6 +91,8 @@ export const DEFAULT_CONFIG = Object.freeze({
   // Edges returned by /api/memory/graph. The offline cache may hold up to
   // GRAPH_HARD_CAP; this is the read-time ceiling, so changing it is cheap.
   graphMaxEdges: 500,
+  // Display threshold for the storage ring (MB). Never evicts anything.
+  storageBudgetMb: 50,
   maxRecallTopK: 100,
   retrieval: Object.freeze({ topK: 20 }),
   context: Object.freeze({ maxTokens: 4000, threshold: 0.85, target: 0.7, injectPrompt: true }),
@@ -407,6 +410,13 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     'graphMaxEdges',
     { min: 100, max: 2000 },
   );
+  // Ring budget: integer MB, fail-fast. The UI recomputes the ring from this
+  // value, so an out-of-range number is a config bug, not something to clamp.
+  const storageBudgetMb = requireInteger(
+    input.storageBudgetMb === undefined ? defaults.storageBudgetMb : input.storageBudgetMb,
+    'storageBudgetMb',
+    { min: 10, max: 1000 },
+  );
 
   const resolved = {
     dataDir,
@@ -425,6 +435,7 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     dreamIdleMinutes,
     enableReflection,
     graphMaxEdges,
+    storageBudgetMb,
     maxRecallTopK,
     retrieval: { topK: retrievalTopK },
     context: {

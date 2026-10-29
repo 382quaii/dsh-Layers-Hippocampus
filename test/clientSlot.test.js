@@ -200,6 +200,36 @@ test('the bundle talks to the hippocampus routes and sends graphMaxEdges', () =>
   assert.ok(source.includes('api/hippocampus/retry'), 'the failed banner needs the retry route');
 });
 
+test('the graph drags through pointer events and refs, not through setState', () => {
+  const source = fs.readFileSync(CLIENT_PATH, 'utf8');
+  for (const hook of ['onPointerDown', 'onPointerMove', 'onPointerUp', 'onPointerCancel', 'setPointerCapture', 'releasePointerCapture']) {
+    assert.ok(source.includes(hook), `graph must use ${hook}`);
+  }
+  assert.ok(source.includes('nodeEls'), 'node handles live in a ref');
+  assert.ok(source.includes('lineEls'), 'edge handles live in a ref');
+  assert.ok(source.includes('requestAnimationFrame'), 'release runs a local alpha relaxation');
+  const graph = source.slice(source.indexOf('function KnowledgeGraph'));
+  const body = graph.slice(0, graph.indexOf('// ---- panel'));
+  assert.ok(!body.includes('setState('), 'dragging must not trigger a React re-render');
+});
+
+test('settings cover every documented config key, including storageBudgetMb', () => {
+  const source = fs.readFileSync(CLIENT_PATH, 'utf8');
+  for (const key of [
+    'storageBudgetMb',
+    'identity.eventTimePolicy',
+    'retrieval.topK',
+    'maxRecallTopK',
+    'maintenanceCron',
+    'promptSection',
+    'autoMaintainOnBoot',
+    'temp.promotionWindowDays',
+  ]) {
+    assert.ok(source.includes(key), `settings must expose ${key}`);
+  }
+  assert.ok(source.includes("announce('config-changed')"), 'a save must refresh the panel immediately');
+});
+
 test('the manifest points ./client at a real file and declares a web client', () => {
   const manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, 'utf8'));
   assert.equal(manifest.exports['./client'], './ui/client.js');
@@ -209,6 +239,6 @@ test('the manifest points ./client at a real file and declares a web client', ()
   assert.equal(manifest.dsh.client.platform, 'web');
   assert.equal(manifest.dsh.client.immediately, undefined, 'the UI must not be boot-critical');
   assert.equal(manifest.name, 'dsh-layers-hippocampus');
-  assert.equal(manifest.version, '1.0.0');
+  assert.equal(manifest.version, '1.1.0');
   assert.ok(manifest.dsh.client.inject === undefined || Array.isArray(manifest.dsh.client.inject));
 });

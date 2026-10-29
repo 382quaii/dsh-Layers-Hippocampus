@@ -50,6 +50,9 @@ export { resolveConfig, DEFAULT_CONFIG };
  */
 const RUNTIMES = new WeakMap();
 
+/** Must match package.json — the Loader row and the client module id use it too. */
+const PACKAGE_NAME = 'dsh-layers-hippocampus';
+
 /** The runtime created by `apply()` for this context, or null before activation. */
 export function getRuntime(ctx) {
   return RUNTIMES.get(ctx) ?? null;
@@ -393,11 +396,21 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
    */
   runtime.applyConfig = (next) => {
     runtime.config = next;
-    const engine = runtime.memory.context;
+    const engine = runtime.memory?.context;
     if (engine) {
       engine.maxTokensOverride = next.context.maxTokens;
       engine.thresholdOverride = next.context.threshold;
       engine.targetOverride = next.context.target;
+    }
+    // Retrieval reads `memory.policy` on every call. The resolved policy is
+    // deep-frozen, so replace it with a shallow copy carrying the new topK
+    // instead of mutating a frozen object (which throws in strict mode).
+    const liveMemory = runtime.memory;
+    if (liveMemory?.policy?.candidates) {
+      liveMemory.policy = {
+        ...liveMemory.policy,
+        candidates: { ...liveMemory.policy.candidates, topK: next.retrieval.topK },
+      };
     }
     emit({ type: 'config', config: uiConfig(next) });
     return next;
@@ -481,18 +494,31 @@ function mergeRaw(target, patch) {
   return out;
 }
 
+/**
+ * The UI config contract: exactly the fields the settings form renders and the
+ * panel reads. `identity`/`retrieval` stay nested so the form's dotted keys map
+ * 1:1 onto the patch it sends back.
+ */
 function uiConfig(config) {
   return {
     dataDir: config.dataDir,
     maintenanceCron: config.maintenanceCron,
-    eventTimePolicy: config.identity.eventTimePolicy,
-    retrievalTopK: config.retrieval.topK,
-    context: config.context,
-    temp: config.temp,
+    briefing: config.briefing,
+    promptSection: config.promptSection,
+    autoMaintainOnBoot: config.autoMaintainOnBoot,
     enableDream: config.enableDream,
     dreamIdleMinutes: config.dreamIdleMinutes,
     enableReflection: config.enableReflection,
     graphMaxEdges: config.graphMaxEdges,
+    storageBudgetMb: config.storageBudgetMb,
+    maxRecallTopK: config.maxRecallTopK,
+    retrieval: { topK: config.retrieval.topK },
+    context: config.context,
+    temp: config.temp,
+    identity: { eventTimePolicy: config.identity.eventTimePolicy },
+    // Convenience mirrors kept for older clients; the form uses the nested form.
+    eventTimePolicy: config.identity.eventTimePolicy,
+    retrievalTopK: config.retrieval.topK,
   };
 }
 
@@ -820,9 +846,17 @@ export async function apply(ctx, rawConfig = {}) {
         return { persisted: false, note: 'configEditor unavailable: the change applies until restart' };
       }
       const entries = editor.entries() ?? [];
+      // Match by the package name this build declares, then by any of the row
+      // ids it has shipped under. A row renamed by a profile patch must still be
+      // found: the previous hard-coded '@local/dsh-memory' made every save
+      // live-only after the rename.
+      const rowNameOf = (candidate) => candidate?.options?.name ?? candidate?.name ?? '';
+      const rowIdOf = (candidate) => candidate?.options?.id ?? candidate?.id ?? '';
       const entry =
-        entries.find((candidate) => (candidate?.options?.name ?? candidate?.name) === '@local/dsh-memory') ??
-        entries.find((candidate) => (candidate?.options?.id ?? candidate?.id) === 'memory');
+        entries.find((candidate) => rowNameOf(candidate) === PACKAGE_NAME) ??
+        entries.find((candidate) => ['hippocampus', 'memory'].includes(rowIdOf(candidate))) ??
+        entries.find((candidate) => String(rowNameOf(candidate)).includes('dsh-memory')) ??
+        entries.find((candidate) => String(rowNameOf(candidate)).includes('hippocampus'));
       if (!entry) {
         return { persisted: false, note: 'profile row not found: the change applies until restart' };
       }

@@ -4,6 +4,31 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] — 2026-10-29
+
+### Added
+
+- **Graph dragging**: nodes are movable with pointer events. The dragged node is
+  pinned for the duration, coordinates are mutated in a ref and painted straight
+  to the DOM (no `setState` per frame), and release unpins it and runs a short
+  alpha relaxation over its 1-hop neighbourhood. A pointer travel under 4px is
+  still a click, so selecting a label can never move the node by accident.
+- **`storageBudgetMb`** (integer, default 50, range 10–1000): the storage ring's
+  budget is now configurable instead of hard-coded, and the ring recomputes the
+  moment the value is saved.
+- **Full settings UI**: every editable config key is in the settings section —
+  switches for booleans, bounded number inputs, a select for
+  `identity.eventTimePolicy`, and a text field for the maintenance cron. Saving
+  posts one dotted-path patch through the same fail-fast validator as startup;
+  a rejected value shows a red banner with the `MEM_E_CONFIG_*` code and nothing
+  is applied. A successful save broadcasts `config-changed` so the panel
+  refetches stats and graph immediately.
+
+### Fixed
+
+- Dotted config paths deeper than one level (`identity.eventTimePolicy`,
+  `retrieval.topK`) now nest correctly instead of producing a literal key.
+
 ## [1.0.0] — 2026-10-29
 
 First public release. The package was previously developed under the working

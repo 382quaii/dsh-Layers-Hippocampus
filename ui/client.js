@@ -45,8 +45,22 @@
         retry: '/api/hippocampus/retry',
       };
       const POLL_MS = 3000;
-      /** Soft storage budget used only by the ring; over it the ring turns red. */
-      const STORAGE_BUDGET_BYTES = 50 * 1024 * 1024;
+      /** Fallback ring budget (MB) when the Host has not sent the config yet. */
+      const DEFAULT_BUDGET_MB = 50;
+
+      /**
+       * Panel ↔ settings bus. Saving the form must refresh the panel *now*, not
+       * on the next 3s poll — and the two components are separate slot entries,
+       * so they cannot share React state.
+       */
+      const bus = new EventTarget();
+      const announce = (type) => {
+        try {
+          bus.dispatchEvent(new Event(type));
+        } catch {
+          // An event with no listeners must never break the caller.
+        }
+      };
 
       // ---- data --------------------------------------------------------------
 
@@ -66,8 +80,10 @@
 
         React.useEffect(() => {
           let alive = true;
-          let timer = null;
+          let inFlight = false;
           const tick = async () => {
+            if (!alive || inFlight) return;
+            inFlight = true;
             try {
               const { status, body } = await getJson(API.stats);
               if (!alive) return;
@@ -90,13 +106,17 @@
                 error: { code: 'MEM_E_NETWORK', message: String((error && error.message) || error) },
               }));
             } finally {
-              if (alive) timer = setTimeout(tick, POLL_MS);
+              inFlight = false;
             }
           };
+          const onConfig = () => tick();
           tick();
+          const timer = setInterval(tick, POLL_MS);
+          bus.addEventListener('config-changed', onConfig);
           return () => {
             alive = false;
-            if (timer) clearTimeout(timer);
+            clearInterval(timer);
+            bus.removeEventListener('config-changed', onConfig);
           };
         }, []);
 
@@ -105,7 +125,8 @@
 
       /**
        * Graph fetch keyed by the configured edge ceiling: when the setting
-       * changes, the next render fetches with the new limit and redraws.
+       * changes, the next render fetches with the new limit and redraws. A
+       * `config-changed` event refetches immediately with the current limit.
        */
       function useGraph(limit, available) {
         const [state, setState] = React.useState({ graph: null, error: null, limit: null });
@@ -113,21 +134,26 @@
         React.useEffect(() => {
           if (!available) return undefined;
           let alive = true;
+          const load = () => {
+            getJson(`${API.graph}?limit=${encodeURIComponent(limit)}`)
+              .then(({ body }) => {
+                if (!alive) return;
+                if (body && body.ok && body.graph) {
+                  setState({ graph: body.graph, error: null, limit });
+                } else {
+                  setState((prev) => ({ ...prev, error: (body && body.error) || { code: 'MEM_E_GRAPH', message: 'graph unavailable' }, limit }));
+                }
+              })
+              .catch((error) => {
+                if (alive) setState((prev) => ({ ...prev, error: { code: 'MEM_E_NETWORK', message: String(error) }, limit }));
+              });
+          };
           setState((prev) => ({ ...prev, error: null }));
-          getJson(`${API.graph}?limit=${encodeURIComponent(limit)}`)
-            .then(({ body }) => {
-              if (!alive) return;
-              if (body && body.ok && body.graph) {
-                setState({ graph: body.graph, error: null, limit });
-              } else {
-                setState((prev) => ({ ...prev, error: (body && body.error) || { code: 'MEM_E_GRAPH', message: 'graph unavailable' }, limit }));
-              }
-            })
-            .catch((error) => {
-              if (alive) setState((prev) => ({ ...prev, error: { code: 'MEM_E_NETWORK', message: String(error) }, limit }));
-            });
+          load();
+          bus.addEventListener('config-changed', load);
           return () => {
             alive = false;
+            bus.removeEventListener('config-changed', load);
           };
         }, [limit, available]);
 
@@ -338,7 +364,7 @@
        */
       function StorageRing(props) {
         const used = typeof props.used === 'number' && Number.isFinite(props.used) ? props.used : 0;
-        const budget = props.budget || STORAGE_BUDGET_BYTES;
+        const budget = props.budget || DEFAULT_BUDGET_MB * 1024 * 1024;
         const rawPercent = budget > 0 ? (used / budget) * 100 : 0;
         const over = rawPercent > 100;
         const percent = Math.max(0, Math.min(rawPercent, 100));
@@ -479,6 +505,16 @@
         return positions;
       }
 
+      /**
+       * Force graph with drag.
+       *
+       * The layout is computed once and frozen into `layoutRef`; dragging then
+       * mutates those frozen coordinates and paints the DOM directly through
+       * refs. No `setState` runs during a drag: React re-renders (the 3s stats
+       * poll) reuse the same mutated coordinates, so the picture cannot jump.
+       * On release the node is unpinned and a short local alpha relaxation runs
+       * over its 1-hop neighbourhood — again writing straight to the DOM.
+       */
       function KnowledgeGraph(props) {
         const graph = props.graph;
         const width = 640;
@@ -493,6 +529,42 @@
         }
         const positions = layoutRef.current.positions;
         const byId = new Map(positions.map((position) => [position.id, position]));
+        const indexOfId = new Map(positions.map((position, i) => [position.id, i]));
+
+        // ---- DOM handles: dragging must not go through React -----------------
+        const svgRef = React.useRef(null);
+        const nodeEls = React.useRef([]);
+        const lineEls = React.useRef([]);
+        const dragRef = React.useRef(null);
+        const rafRef = React.useRef(0);
+        const aliveRef = React.useRef(true);
+
+        React.useEffect(() => {
+          aliveRef.current = true;
+          // Fallback for engines where pointer capture on an SVG child fails:
+          // releasing outside the SVG must still end the drag (and must never
+          // leave a node pinned forever).
+          const onWindowUp = (evt) => {
+            const drag = dragRef.current;
+            if (!drag || drag.pointerId !== evt.pointerId) return;
+            dragRef.current = null;
+            const position = positions[drag.index];
+            if (position) position.pinned = false;
+            if (drag.moved) relaxAround(drag.id);
+          };
+          if (typeof window !== 'undefined' && window.addEventListener) {
+            window.addEventListener('pointerup', onWindowUp);
+            window.addEventListener('pointercancel', onWindowUp);
+          }
+          return () => {
+            aliveRef.current = false;
+            if (rafRef.current) cancelAnimationFrame(rafRef.current);
+            if (typeof window !== 'undefined' && window.removeEventListener) {
+              window.removeEventListener('pointerup', onWindowUp);
+              window.removeEventListener('pointercancel', onWindowUp);
+            }
+          };
+        }, []);
 
         // Progressive reveal paints frozen coordinates only; it never re-runs
         // the layout above, so the graph cannot jump back to the start.
@@ -512,6 +584,162 @@
         const [focus, setFocus] = React.useState(null);
         const maxWeight = Math.max(1, ...nodes.map((node) => node.weight || 0));
 
+        /** Repaint node transforms + every rendered line from the frozen array. */
+        const paint = () => {
+          for (let i = 0; i < positions.length; i += 1) {
+            const el = nodeEls.current[i];
+            if (el) el.setAttribute('transform', `translate(${positions[i].x}, ${positions[i].y})`);
+          }
+          for (let i = 0; i < edges.length; i += 1) {
+            const el = lineEls.current[i];
+            if (!el) continue;
+            const a = byId.get(edges[i].source);
+            const b = byId.get(edges[i].target);
+            if (!a || !b) continue;
+            el.setAttribute('x1', a.x);
+            el.setAttribute('y1', a.y);
+            el.setAttribute('x2', b.x);
+            el.setAttribute('y2', b.y);
+          }
+        };
+
+        /** Client point -> viewBox point, so a drag tracks the cursor exactly. */
+        const toSvg = (evt) => {
+          const svg = svgRef.current;
+          if (!svg) return { x: 0, y: 0 };
+          const rect = svg.getBoundingClientRect();
+          const scaleX = rect.width ? width / rect.width : 1;
+          const scaleY = rect.height ? height / rect.height : 1;
+          return { x: (evt.clientX - rect.left) * scaleX, y: (evt.clientY - rect.top) * scaleY };
+        };
+
+        /** Local relaxation: the dragged node and its neighbours only, alpha-decayed. */
+        const relaxAround = (centerId) => {
+          const centerIndex = indexOfId.get(centerId);
+          if (centerIndex === undefined) return;
+          const local = new Set([centerIndex]);
+          for (const edge of edges) {
+            if (edge.source === centerId) local.add(indexOfId.get(edge.target));
+            else if (edge.target === centerId) local.add(indexOfId.get(edge.source));
+          }
+          const localIndexes = [...local].filter((index) => Number.isInteger(index));
+          const localSet = new Set(localIndexes);
+          const links = edges
+            .map((edge) => ({ a: indexOfId.get(edge.source), b: indexOfId.get(edge.target), weight: edge.weight || 1 }))
+            .filter((link) => link.a !== undefined && link.b !== undefined && (localSet.has(link.a) || localSet.has(link.b)));
+
+          let alpha = 0.5;
+          let frame = 0;
+          const step = () => {
+            if (!aliveRef.current) return;
+            alpha *= 0.93;
+            frame += 1;
+            for (const i of localIndexes) {
+              const node = positions[i];
+              for (const j of localIndexes) {
+                if (i === j) continue;
+                const other = positions[j];
+                const dx = node.x - other.x;
+                const dy = node.y - other.y;
+                const distance = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+                const force = (220 / (distance * distance)) * alpha;
+                node.vx += (dx / distance) * force;
+                node.vy += (dy / distance) * force;
+              }
+            }
+            for (const link of links) {
+              const a = positions[link.a];
+              const b = positions[link.b];
+              const dx = b.x - a.x;
+              const dy = b.y - a.y;
+              const distance = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+              const force = ((distance - 80) / distance) * 0.06 * alpha * Math.min(2, link.weight);
+              a.vx += dx * force;
+              a.vy += dy * force;
+              b.vx -= dx * force;
+              b.vy -= dy * force;
+            }
+            for (const i of localIndexes) {
+              const node = positions[i];
+              node.vx *= 0.7;
+              node.vy *= 0.7;
+              node.x = Math.max(24, Math.min(width - 24, node.x + node.vx));
+              node.y = Math.max(24, Math.min(height - 24, node.y + node.vy));
+              // The centre node is pinned only while the pointer is down; after
+              // release it settles like the rest of the local neighbourhood.
+            }
+            paint();
+            if (alpha > 0.03 && frame < 90) rafRef.current = requestAnimationFrame(step);
+          };
+          rafRef.current = requestAnimationFrame(step);
+        };
+
+        const onPointerDown = (node, index, evt) => {
+          if (evt.button !== undefined && evt.button !== 0) return;
+          const position = positions[index];
+          if (!position) return;
+          const point = toSvg(evt);
+          dragRef.current = {
+            id: node.id,
+            index,
+            pointerId: evt.pointerId,
+            offsetX: position.x - point.x,
+            offsetY: position.y - point.y,
+            moved: false,
+            startX: evt.clientX,
+            startY: evt.clientY,
+          };
+          // Pinned for the duration of the drag: the force pass skips it, so the
+          // pointer position always wins.
+          position.pinned = true;
+          position.vx = 0;
+          position.vy = 0;
+          try {
+            evt.currentTarget.setPointerCapture(evt.pointerId);
+          } catch {
+            // Pointer capture is best-effort (older engines); the move handler
+            // still works while the pointer stays over the SVG.
+          }
+          evt.preventDefault?.();
+        };
+
+        const onPointerMove = (evt) => {
+          const drag = dragRef.current;
+          if (!drag || drag.pointerId !== evt.pointerId) return;
+          if (!drag.moved) {
+            const dx = evt.clientX - drag.startX;
+            const dy = evt.clientY - drag.startY;
+            if (dx * dx + dy * dy < 16) return; // < 4px: still a click, not a drag
+            drag.moved = true;
+          }
+          const point = toSvg(evt);
+          const position = positions[drag.index];
+          position.x = Math.max(24, Math.min(width - 24, point.x + drag.offsetX));
+          position.y = Math.max(24, Math.min(height - 24, point.y + drag.offsetY));
+          position.vx = 0;
+          position.vy = 0;
+          paint();
+        };
+
+        const endDrag = (evt) => {
+          const drag = dragRef.current;
+          if (!drag || drag.pointerId !== evt.pointerId) return;
+          dragRef.current = null;
+          const dragged = positions[drag.index];
+          if (dragged) dragged.pinned = false;
+          try {
+            evt.currentTarget.releasePointerCapture(evt.pointerId);
+          } catch {
+            // already released
+          }
+          if (!drag.moved) {
+            // A click selects/toggles the label; a drag never does.
+            setFocus((prev) => (prev === drag.id ? null : drag.id));
+            return;
+          }
+          relaxAround(drag.id);
+        };
+
         if (nodes.length === 0) {
           return h('div', { style: { ...cardStyle, color: palette.muted, fontSize: 13 } }, '暂无图谱：维护完成后由日志（去墓碑）离线生成。');
         }
@@ -527,24 +755,34 @@
           ),
           h(
             'svg',
-            { width: '100%', viewBox: `0 0 ${width} ${height}`, style: { display: 'block' } },
+            {
+              ref: svgRef,
+              width: '100%',
+              viewBox: `0 0 ${width} ${height}`,
+              style: { display: 'block', touchAction: 'none' },
+              onPointerMove,
+              onPointerUp: endDrag,
+              onPointerCancel: endDrag,
+            },
             // Edges first, and only when BOTH endpoints are painted: no dangling lines.
             edges.map((edge, i) => {
               const a = byId.get(edge.source);
               const b = byId.get(edge.target);
               if (!a || !b) return null;
-              const ai = positions.indexOf(a);
-              const bi = positions.indexOf(b);
+              const ai = indexOfId.get(edge.source);
+              const bi = indexOfId.get(edge.target);
               if (ai >= revealed || bi >= revealed) return null;
               return h('line', {
                 key: `e${i}`,
+                ref: (el) => {
+                  lineEls.current[i] = el;
+                },
                 x1: a.x,
                 y1: a.y,
                 x2: b.x,
                 y2: b.y,
                 stroke: palette.border,
                 strokeWidth: Math.min(2.5, 0.4 + (edge.weight || 1) * 0.25),
-                style: { transition: 'opacity 240ms ease' },
                 opacity: 0.8,
               });
             }),
@@ -559,18 +797,27 @@
                 'g',
                 {
                   key: node.id,
+                  ref: (el) => {
+                    nodeEls.current[i] = el;
+                  },
                   transform: `translate(${position.x}, ${position.y})`,
-                  style: { cursor: 'pointer' },
-                  onMouseEnter: () => setFocus(node.id),
-                  onMouseLeave: () => setFocus(null),
-                  onClick: () => setFocus((prev) => (prev === node.id ? null : node.id)),
+                  style: { cursor: 'grab', touchAction: 'none' },
+                  onPointerDown: (evt) => onPointerDown(node, i, evt),
+                  onPointerEnter: () => setFocus(node.id),
+                  onPointerLeave: () => {
+                    if (!dragRef.current) setFocus(null);
+                  },
                 },
+                h('circle', {
+                  r: radius + 6,
+                  fill: 'transparent', // larger hit target, invisible
+                }),
                 h('circle', { r: radius, fill: active ? palette.accent : 'rgba(79,140,255,0.55)', stroke: palette.border, strokeWidth: 1 }),
-                (core || active) && h('text', { x: radius + 4, y: 4, fill: palette.text, style: { fontSize: 10 } }, node.label),
+                (core || active) && h('text', { x: radius + 4, y: 4, fill: palette.text, style: { fontSize: 10, pointerEvents: 'none' } }, node.label),
               );
             }),
           ),
-          h('div', { style: { ...labelStyle, marginTop: 6, marginBottom: 0 } }, '悬停或点击节点查看标签；核心节点常显。'),
+          h('div', { style: { ...labelStyle, marginTop: 6, marginBottom: 0 } }, '拖拽节点可移动；单击查看标签；核心节点常显。'),
         );
       }
 
@@ -612,7 +859,10 @@
           h(
             'div',
             { style: { display: 'flex', gap: 12, flexWrap: 'wrap' } },
-            h(StorageRing, { used: storage.diskBytes || 0 }),
+            h(StorageRing, {
+              used: storage.diskBytes || 0,
+              budget: (payload.config && payload.config.storageBudgetMb ? payload.config.storageBudgetMb : DEFAULT_BUDGET_MB) * 1024 * 1024,
+            }),
             h(
               'div',
               { style: { display: 'flex', flexWrap: 'wrap', gap: 10, flex: '1 1 320px', alignContent: 'flex-start' } },
@@ -679,6 +929,101 @@
         );
       }
 
+      function Select(props) {
+        return h(
+          'label',
+          { style: { display: 'block', padding: '8px 0' } },
+          h('div', { style: { fontSize: 13, marginBottom: 4 } }, props.label),
+          h(
+            'select',
+            {
+              value: props.value,
+              disabled: Boolean(props.disabled),
+              onChange: (event) => props.onChange(event.target.value),
+              style: { width: 220, padding: '6px 8px', borderRadius: 8, border: `1px solid ${palette.border}`, background: 'transparent', color: palette.text },
+            },
+            (props.options || []).map((option) => h('option', { key: option.value, value: option.value }, option.label)),
+          ),
+          props.hint ? h('div', { style: { ...labelStyle, marginTop: 4, marginBottom: 0 } }, props.hint) : null,
+        );
+      }
+
+      function TextInput(props) {
+        return h(
+          'label',
+          { style: { display: 'block', padding: '8px 0' } },
+          h('div', { style: { fontSize: 13, marginBottom: 4 } }, props.label),
+          h('input', {
+            type: 'text',
+            value: props.value,
+            disabled: Boolean(props.disabled),
+            onChange: (event) => props.onChange(event.target.value),
+            style: { width: 220, padding: '6px 8px', borderRadius: 8, border: `1px solid ${palette.border}`, background: 'transparent', color: palette.text },
+          }),
+          props.hint ? h('div', { style: { ...labelStyle, marginTop: 4, marginBottom: 0 } }, props.hint) : null,
+        );
+      }
+
+      function Section(props) {
+        return h(
+          'div',
+          { style: cardStyle },
+          h('div', { style: { fontSize: 13, fontWeight: 600, marginBottom: 4 } }, props.title),
+          props.hint ? h('div', { style: { ...labelStyle, marginBottom: 6 } }, props.hint) : null,
+          props.children,
+        );
+      }
+
+      const EVENT_TIME_OPTIONS = [
+        { value: 'content', label: 'content — 由内容推导（默认）' },
+        { value: 'explicit', label: 'explicit — 调用方必须给时间' },
+        { value: 'ingest', label: 'ingest — 用写入时刻' },
+      ];
+
+      /** Server config -> form draft (nested groups kept separate). */
+      function draftFromConfig(config) {
+        return {
+          maintenanceCron: config.maintenanceCron,
+          briefing: Boolean(config.briefing),
+          promptSection: Boolean(config.promptSection),
+          autoMaintainOnBoot: Boolean(config.autoMaintainOnBoot),
+          enableDream: Boolean(config.enableDream),
+          enableReflection: Boolean(config.enableReflection),
+          dreamIdleMinutes: Number(config.dreamIdleMinutes),
+          graphMaxEdges: Number(config.graphMaxEdges),
+          storageBudgetMb: Number(config.storageBudgetMb),
+          maxRecallTopK: Number(config.maxRecallTopK),
+          retrievalTopK: Number((config.retrieval && config.retrieval.topK) ?? config.retrievalTopK),
+          context: {
+            maxTokens: Number(config.context.maxTokens),
+            threshold: Number(config.context.threshold),
+            target: Number(config.context.target),
+            injectPrompt: Boolean(config.context.injectPrompt),
+          },
+          temp: {
+            ttlDays: Number(config.temp.ttlDays),
+            promotionWindowDays: Number(config.temp.promotionWindowDays),
+          },
+          eventTimePolicy: config.identity ? config.identity.eventTimePolicy : config.eventTimePolicy,
+        };
+      }
+
+      /** Every numeric field with its accepted range; the client pre-checks these. */
+      const NUMBER_RULES = [
+        { key: 'dreamIdleMinutes', label: '空闲判定', min: 1, max: 525600 },
+        { key: 'graphMaxEdges', label: '图谱最大边数', min: 100, max: 2000 },
+        { key: 'storageBudgetMb', label: '存储预算', min: 10, max: 1000 },
+        { key: 'maxRecallTopK', label: '检索上限', min: 1, max: 1000 },
+        { key: 'retrievalTopK', label: '默认 topK', min: 1, max: 1000 },
+        { key: 'context.maxTokens', label: '上下文预算', min: 256, max: 1000000 },
+        { key: 'context.threshold', label: '淘汰阈值', min: 0.01, max: 0.99 },
+        { key: 'context.target', label: '收敛目标', min: 0, max: 0.98 },
+        { key: 'temp.ttlDays', label: 'L2.5 隔离期', min: 1, max: 3650 },
+        { key: 'temp.promotionWindowDays', label: '晋升窗口', min: 0, max: 3650 },
+      ];
+
+      const readPath = (object, dotted) => dotted.split('.').reduce((cursor, part) => (cursor == null ? cursor : cursor[part]), object);
+
       function MemorySettings() {
         const state = useMemoryStats();
         const payload = state.payload;
@@ -688,9 +1033,7 @@
         const [saving, setSaving] = React.useState(false);
 
         React.useEffect(() => {
-          if (serverConfig && draft === null) {
-            setDraft({ ...serverConfig, context: { ...(serverConfig.context || {}) }, temp: { ...(serverConfig.temp || {}) } });
-          }
+          if (serverConfig && draft === null) setDraft(draftFromConfig(serverConfig));
         }, [serverConfig, draft]);
 
         if (payload && payload.phase === 'failed') {
@@ -704,8 +1047,8 @@
           setDraft((prev) => {
             const next = { ...prev, context: { ...(prev.context || {}) }, temp: { ...(prev.temp || {}) } };
             if (path.indexOf('.') >= 0) {
-              const parts = path.split('.');
-              next[parts[0]] = { ...(next[parts[0]] || {}), [parts[1]]: value };
+              const [group, leaf] = path.split('.');
+              next[group] = { ...(next[group] || {}), [leaf]: value };
             } else {
               next[path] = value;
             }
@@ -713,18 +1056,45 @@
           });
         };
 
+        /** Client pre-check mirrors the server ranges; the server stays the authority. */
+        const validateDraft = () => {
+          for (const rule of NUMBER_RULES) {
+            const value = readPath(draft, rule.key);
+            const number = Number(value);
+            if (!Number.isFinite(number)) return `${rule.label} 必须是数字`;
+            if (number < rule.min || number > rule.max) return `${rule.label} 必须在 ${rule.min} – ${rule.max} 之间（当前 ${number}）`;
+          }
+          if (!String(draft.maintenanceCron || '').trim()) return 'Cron 表达式不能为空';
+          return null;
+        };
+
         const save = async () => {
-          setSaving(true);
           setStatus(null);
+          const problem = validateDraft();
+          if (problem) {
+            setStatus({ tone: 'error', text: problem });
+            return;
+          }
+          setSaving(true);
           const patch = {
+            maintenanceCron: String(draft.maintenanceCron).trim(),
+            briefing: Boolean(draft.briefing),
+            promptSection: Boolean(draft.promptSection),
+            autoMaintainOnBoot: Boolean(draft.autoMaintainOnBoot),
             enableDream: Boolean(draft.enableDream),
             enableReflection: Boolean(draft.enableReflection),
             dreamIdleMinutes: Number(draft.dreamIdleMinutes),
             graphMaxEdges: Number(draft.graphMaxEdges),
+            storageBudgetMb: Number(draft.storageBudgetMb),
+            maxRecallTopK: Number(draft.maxRecallTopK),
+            'retrieval.topK': Number(draft.retrievalTopK),
             'context.maxTokens': Number(draft.context.maxTokens),
             'context.threshold': Number(draft.context.threshold),
             'context.target': Number(draft.context.target),
+            'context.injectPrompt': Boolean(draft.context.injectPrompt),
             'temp.ttlDays': Number(draft.temp.ttlDays),
+            'temp.promotionWindowDays': Number(draft.temp.promotionWindowDays),
+            'identity.eventTimePolicy': draft.eventTimePolicy,
           };
           try {
             const { body } = await getJson(API.config, {
@@ -733,10 +1103,14 @@
               body: JSON.stringify({ patch }),
             });
             if (body && body.ok === true) {
+              setDraft(draftFromConfig(body.config));
               setStatus({ tone: body.persisted ? 'ok' : 'warn', text: body.persisted ? '已保存并生效' : `已生效（未持久化）：${body.note || ''}` });
-              setDraft({ ...body.config, context: { ...(body.config.context || {}) }, temp: { ...(body.config.temp || {}) } });
+              // The panel listens for this: it refetches stats + graph right away
+              // instead of waiting for the next 3s poll.
+              announce('config-changed');
             } else {
-              setStatus({ tone: 'error', text: `${(body && body.error && body.error.code) || 'MEM_E_UNKNOWN'}: ${(body && body.error && body.error.message) || '保存失败'}` });
+              const error = (body && body.error) || {};
+              setStatus({ tone: 'error', text: `${error.code || 'MEM_E_UNKNOWN'}: ${error.message || '保存失败'}` });
             }
           } catch (error) {
             setStatus({ tone: 'error', text: String((error && error.message) || error) });
@@ -745,29 +1119,76 @@
           }
         };
 
-        const toneColor = status && status.tone === 'error' ? palette.danger : status && status.tone === 'warn' ? palette.warn : palette.accent;
+        const disabled = saving;
 
         return h(
           'div',
-          { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 12, maxWidth: 640 } },
+          { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 12, maxWidth: 720 } },
           h('div', { style: { fontSize: 16, fontWeight: 600 } }, '海马体记忆'),
-          h('div', { style: labelStyle }, '保存后立即作用于运行时，并在可持久化时写回 Loader 配置。'),
+          h('div', { style: labelStyle }, '保存后立即作用于运行时（fail-fast 校验，越界会被拒绝），并在可持久化时写回 Loader 配置。'),
+          status && status.tone === 'error'
+            ? h(
+                'div',
+                {
+                  style: {
+                    padding: '10px 12px',
+                    borderRadius: 10,
+                    border: `1px solid ${palette.danger}`,
+                    background: 'rgba(217,83,79,0.12)',
+                    color: palette.danger,
+                    fontSize: 13,
+                  },
+                },
+                status.text,
+              )
+            : null,
           h(
-            'div',
-            { style: cardStyle },
+            Section,
+            { title: '行为' },
             h(Toggle, {
               label: '空闲时自动整理（Dream）',
               hint: `连续 ${draft.dreamIdleMinutes} 分钟没有记忆工具调用后跑一次维护（与 Cron 共用同一入口）。`,
               checked: draft.enableDream,
               onChange: (value) => edit('enableDream', value),
-              disabled: saving,
+              disabled,
             }),
             h(Toggle, {
               label: '反思提示（Reflection）',
               hint: '连续工具调用达到阈值后，在提示里追加自我检查。',
               checked: draft.enableReflection,
               onChange: (value) => edit('enableReflection', value),
-              disabled: saving,
+              disabled,
+            }),
+            h(Toggle, {
+              label: '提示词简报（briefing）',
+              hint: '在系统提示里放入一行记忆状态摘要。',
+              checked: draft.briefing,
+              onChange: (value) => edit('briefing', value),
+              disabled,
+            }),
+            h(Toggle, {
+              label: '提示注入（promptSection）',
+              hint: '注册 memory 提示段，教模型何时写、何时读。',
+              checked: draft.promptSection,
+              onChange: (value) => edit('promptSection', value),
+              disabled,
+            }),
+            h(Toggle, {
+              label: '启动后立即维护（autoMaintainOnBoot）',
+              checked: draft.autoMaintainOnBoot,
+              onChange: (value) => edit('autoMaintainOnBoot', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            { title: '调度' },
+            h(TextInput, {
+              label: '维护 Cron（5 段）',
+              hint: '例：0 */6 * * *（每 6 小时）。非法表达式会被后端拒绝。',
+              value: draft.maintenanceCron,
+              onChange: (value) => edit('maintenanceCron', value),
+              disabled,
             }),
             h(Field, {
               label: '空闲判定（分钟）',
@@ -776,13 +1197,34 @@
               max: 525600,
               step: 1,
               onChange: (value) => edit('dreamIdleMinutes', value),
-              disabled: saving,
+              disabled,
             }),
           ),
           h(
-            'div',
-            { style: cardStyle },
-            h('div', { style: { fontSize: 13, fontWeight: 600, marginBottom: 4 } }, '上下文窗口'),
+            Section,
+            { title: '检索', hint: '默认 topK 不得超过检索上限。' },
+            h(Field, {
+              label: '默认 topK（retrieval.topK）',
+              value: draft.retrievalTopK,
+              min: 1,
+              max: 1000,
+              step: 1,
+              onChange: (value) => edit('retrievalTopK', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '检索上限（maxRecallTopK）',
+              value: draft.maxRecallTopK,
+              min: 1,
+              max: 1000,
+              step: 1,
+              onChange: (value) => edit('maxRecallTopK', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            { title: '上下文窗口' },
             h(Field, {
               label: '预算（token）',
               value: draft.context.maxTokens,
@@ -790,7 +1232,7 @@
               max: 1000000,
               step: 256,
               onChange: (value) => edit('context.maxTokens', value),
-              disabled: saving,
+              disabled,
             }),
             h(Field, {
               label: '淘汰阈值',
@@ -800,7 +1242,7 @@
               max: 0.99,
               step: 0.01,
               onChange: (value) => edit('context.threshold', value),
-              disabled: saving,
+              disabled,
             }),
             h(Field, {
               label: '收敛目标',
@@ -809,37 +1251,79 @@
               max: 0.98,
               step: 0.01,
               onChange: (value) => edit('context.target', value),
-              disabled: saving,
+              disabled,
+            }),
+            h(Toggle, {
+              label: '注入上下文预算段（context.injectPrompt）',
+              checked: draft.context.injectPrompt,
+              onChange: (value) => edit('context.injectPrompt', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            { title: '存储与图谱', hint: '存储预算只影响左上角环形图的阈值，不会删除任何数据。' },
+            h(Field, {
+              label: '存储预算上限（MB）',
+              value: draft.storageBudgetMb,
+              min: 10,
+              max: 1000,
+              step: 10,
+              suffix: 'MB',
+              onChange: (value) => edit('storageBudgetMb', value),
+              disabled,
             }),
             h(Field, {
-              label: 'L2.5 隔离期',
+              label: '图谱最大边数（graphMaxEdges）',
+              hint: '保存后立即按新上限重新拉取 /api/hippocampus/graph 并重绘。',
+              value: draft.graphMaxEdges,
+              min: 100,
+              max: 2000,
+              step: 100,
+              onChange: (value) => edit('graphMaxEdges', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            { title: 'L2.5 趋势隔离' },
+            h(Field, {
+              label: '隔离期（天）',
               value: draft.temp.ttlDays,
               min: 1,
               max: 3650,
               step: 1,
               suffix: '天',
               onChange: (value) => edit('temp.ttlDays', value),
-              disabled: saving,
+              disabled,
             }),
-          ),
-          h(
-            'div',
-            { style: cardStyle },
-            h('div', { style: { fontSize: 13, fontWeight: 600, marginBottom: 4 } }, '知识图谱'),
             h(Field, {
-              label: '最大边数',
-              hint: '保存后前端按新上限重新拉取 /api/hippocampus/graph 并重绘。',
-              value: draft.graphMaxEdges,
-              min: 100,
-              max: 2000,
-              step: 100,
-              onChange: (value) => edit('graphMaxEdges', value),
-              disabled: saving,
+              label: '晋升窗口（天）',
+              hint: '必须不大于隔离期。',
+              value: draft.temp.promotionWindowDays,
+              min: 0,
+              max: 3650,
+              step: 1,
+              suffix: '天',
+              onChange: (value) => edit('temp.promotionWindowDays', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            { title: '身份' },
+            h(Select, {
+              label: '事件时间策略（identity.eventTimePolicy）',
+              hint: 'content：由内容推导；explicit：调用方必须提供；ingest：使用写入时刻。',
+              value: draft.eventTimePolicy,
+              options: EVENT_TIME_OPTIONS,
+              onChange: (value) => edit('eventTimePolicy', value),
+              disabled,
             }),
           ),
           h(
             'div',
-            { style: { display: 'flex', alignItems: 'center', gap: 12 } },
+            { style: { display: 'flex', alignItems: 'center', gap: 12, position: 'sticky', bottom: 0, padding: '8px 0', background: 'transparent' } },
             h(
               'button',
               {
@@ -847,22 +1331,21 @@
                 onClick: save,
                 disabled: saving,
                 style: {
-                  padding: '7px 16px',
+                  padding: '7px 18px',
                   borderRadius: 8,
                   border: `1px solid ${palette.accent}`,
                   background: saving ? 'transparent' : palette.accent,
-                  color: saving ? '#fff' : '#fff',
+                  color: '#fff',
                   cursor: saving ? 'default' : 'pointer',
                   fontSize: 13,
                 },
               },
-              saving ? '保存中…' : '保存',
+              saving ? '保存中…' : '保存全部',
             ),
-            status ? h('span', { style: { fontSize: 12, color: toneColor } }, status.text) : null,
+            status && status.tone !== 'error' ? h('span', { style: { fontSize: 12, color: status.tone === 'warn' ? palette.warn : palette.accent } }, status.text) : null,
           ),
         );
       }
-
       return {
         inject: ['slots'],
         apply(ctx) {

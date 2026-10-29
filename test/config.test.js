@@ -52,6 +52,19 @@ test('graphMaxEdges defaults to 500 and is fail-fast outside 100..2000', () => {
   }
 });
 
+test('storageBudgetMb defaults to 50 and is fail-fast outside 10..1000', () => {
+  assert.equal(resolveConfig({}, { env: { DSH_HOME: 'C:/dsh' } }).storageBudgetMb, 50);
+  assert.equal(resolveConfig({ storageBudgetMb: 10 }).storageBudgetMb, 10);
+  assert.equal(resolveConfig({ storageBudgetMb: 1000 }).storageBudgetMb, 1000);
+  for (const bad of [9, 1001, 0, -5, 2.5, '50', null]) {
+    assert.throws(
+      () => resolveConfig({ storageBudgetMb: bad }, { env: { DSH_HOME: 'C:/dsh' } }),
+      (error) => String(error.code).startsWith('MEM_E_CONFIG'),
+      `storageBudgetMb=${JSON.stringify(bad)} must be rejected, not clamped`,
+    );
+  }
+});
+
 test('the deprecated interval key is a hard error, not an ignored field', () => {
   let details = null;
   assert.throws(
