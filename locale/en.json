@@ -1,0 +1,11 @@
+{
+  "meta": {
+    "title": "Hippocampus Memory",
+    "description": "Layered long-term memory for agents: append-only event log, rebuildable tag index, day diaries, independent semantic layer, trend quarantine and an offline knowledge graph."
+  },
+  "panel": {
+    "title": "Hippocampus Memory",
+    "graph": "Knowledge graph",
+    "ring": "Storage"
+  }
+}

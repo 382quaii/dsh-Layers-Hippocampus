@@ -1,0 +1,72 @@
+{
+  "name": "dsh-layers-hippocampus",
+  "version": "1.0.0",
+  "private": false,
+  "description": "Layered long-term memory for DeepSeek Harness: append-only event log, rebuildable tag index, day diaries, independent semantic layer, L2.5 trend quarantine, offline knowledge graph and a Web UI panel.",
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT",
+  "author": "382quaii",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/382quaii/dsh-Layers-Hippocampus.git"
+  },
+  "homepage": "https://github.com/382quaii/dsh-Layers-Hippocampus#readme",
+  "bugs": {
+    "url": "https://github.com/382quaii/dsh-Layers-Hippocampus/issues"
+  },
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "memory",
+    "long-term-memory",
+    "knowledge-graph",
+    "ai-agent"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./client": "./ui/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./src/*": "./src/*"
+  },
+  "files": [
+    "index.js",
+    "src/**/*.js",
+    "ui/**/*.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "screenshots.json",
+    "assets/*.png",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "docs/*.md",
+    "market/**/*.yml",
+    "market/*.md"
+  ],
+  "scripts": {
+    "test": "node test/run.mjs",
+    "check": "node --check index.js && node --check ui/client.js && node test/run.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  }
+}

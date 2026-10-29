@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" role="img" aria-label="Layered memory">
+  <rect x="2" y="2" width="44" height="44" rx="10" fill="#1f2937"/>
+  <g fill="none" stroke="#93c5fd" stroke-width="2.4" stroke-linecap="round">
+    <path d="M14 16h20M14 24h14M14 32h9"/>
+  </g>
+  <circle cx="34" cy="31" r="5" fill="#60a5fa"/>
+  <circle cx="34" cy="31" r="2" fill="#1f2937"/>
+</svg>

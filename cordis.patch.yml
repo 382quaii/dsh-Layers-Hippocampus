@@ -1,0 +1,20 @@
+# Bundle patch for dsh-layers-hippocampus.
+#
+# `plugin_manager install_bundle` installs the package and appends this file to the
+# profile's ordered bundle list. The row mounts on the Host plane so the tool
+# registry, the prompt registry and every session's agent preset see it.
+#
+# Omitted keys fall back to the plugin defaults; the store lives at
+# <DSH_HOME>/memory unless `dataDir` is set explicitly. Folders written by older
+# versions (`memory`, `dsh-memory`, `Layers-Hippocampus`, …) are picked up as
+# migration sources automatically.
+#
+# Disable for one profile without uninstalling: in the profile's own cordis.patch.yml
+#
+#   - id: hippocampus
+#     disabled: true
+- insert:
+    - id: hippocampus
+      name: "dsh-layers-hippocampus"
+      config:
+        briefing: true
