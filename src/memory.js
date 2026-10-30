@@ -22,7 +22,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { assertClock, SystemClock } from './clock.js';
 import { DeletePipeline } from './deletePipeline.js';
-import { MemoryError, ErrorCodes } from './errors.js';
+import { MemoryError, ErrorCodes, invalidInput } from './errors.js';
 import { buildAliasMap, hashPolicy, resolvePolicy } from './policy.js';
 import { controlIdFor } from './identity.js';
 import { makeForget, makeReinforce, makeRestore } from './log/records.js';
@@ -34,12 +34,12 @@ import { IndexManager } from './index/indexManager.js';
 import { GraphCache, GRAPH_HARD_CAP, GRAPH_TOP_NEIGHBORS } from './graph.js';
 import { foldRecords } from './index/buildIndex.js';
 import { Maintenance } from './maintenance.js';
-import { recall as runRecall } from './retrieval.js';
+import { recall as runRecall, tokenize } from './retrieval.js';
 import { SemanticStore } from './semantic/semanticStore.js';
 import { TempSemanticStore } from './semantic/tempSemantic.js';
 import { ContextEngine } from './context/contextEngine.js';
 import { nextRun, parseCron } from './cron.js';
-import { ensureDir, dayKey, genNumber, sha256 } from './util.js';
+import { ensureDir, dayKey, genNumber, sha256, readJson, writeJsonAtomic, snippet } from './util.js';
 
 /** Recursive byte size of a directory tree (symlinks count as their target size). */
 function diskUsage(dir) {
@@ -65,8 +65,105 @@ function diskUsage(dir) {
   return total;
 }
 
-const SUBDIRS = Object.freeze({
-  log: 'log',
+/** Accepted media kinds for `media_url` attachments. */
+export const MEDIA_TYPES = Object.freeze(['image', 'video', 'document', 'audio']);
+/** A run this long of base64 alphabet characters means the bytes were pasted into `content`. */
+export const BASE64_RUN_LIMIT = 256;
+/** Snapshot shape for state/active-task.json. */
+export const ACTIVE_TASK_SCHEMA = 1;
+/** A checkpoint nobody refreshed for this long is demoted by maintenance. */
+export const ACTIVE_TASK_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/** Neighbours of a query tag that enter the candidate pool. */
+export const GRAPH_ASSOCIATIONS = 3;
+/** Score multiplier for an event reached only through a graph neighbour. */
+export const ASSOCIATION_PENALTY = 0.5;
+/** Evicted blocks folded into one episode per batch. */
+export const FOLD_BATCH = 5;
+/** Tag written on a folded-context episode. */
+export const FOLDED_TAG = 'status:folded';
+/** Tag written on a monthly memo. */
+export const MONTHLY_TAG = 'status:monthly';
+
+const BASE64_RUN = /[A-Za-z0-9+/]{256,}={0,2}/;
+const ABSOLUTE_MEDIA = /^([A-Za-z]:[\\/]|\\\\|\/)/;
+
+/**
+ * Reject embedded base64 payloads past the documented threshold. The rule is
+ * length-only (>= 256 consecutive base64 characters), so a 200-character run is
+ * ordinary text and passes: false positives here would reject real prose.
+ */
+export function ensureNoEmbeddedBase64(content) {
+  if (typeof content !== 'string') return;
+  const match = BASE64_RUN.exec(content);
+  if (!match) return;
+  throw new MemoryError(
+    ErrorCodes.INVALID_MEDIA,
+    `content embeds a base64 payload of ${match[0].length} characters (limit ${BASE64_RUN_LIMIT}); store it as a file and pass media_url instead`,
+    { key: 'content', runLength: match[0].length, limit: BASE64_RUN_LIMIT, hint: 'use media_url + media_type' },
+  );
+}
+
+/** `media_url` is a pointer, never inline bytes. */
+export function validateMedia(mediaUrl, mediaType) {
+  if (mediaUrl === null || mediaUrl === undefined || mediaUrl === '') {
+    if (mediaType !== null && mediaType !== undefined) {
+      throw new MemoryError(ErrorCodes.INVALID_MEDIA, 'media_type requires media_url', { key: 'media_type' });
+    }
+    return null;
+  }
+  if (typeof mediaUrl !== 'string') {
+    throw new MemoryError(ErrorCodes.INVALID_MEDIA, 'media_url must be a string', { key: 'media_url' });
+  }
+  const isHttp = /^https?:\/\//i.test(mediaUrl);
+  const isAbsolutePath = ABSOLUTE_MEDIA.test(mediaUrl);
+  if (!isHttp && !isAbsolutePath) {
+    throw new MemoryError(
+      ErrorCodes.INVALID_MEDIA,
+      'media_url must be an http(s) URL or an absolute file path',
+      { key: 'media_url', got: mediaUrl.slice(0, 80) },
+    );
+  }
+  if (mediaType === null || mediaType === undefined) {
+    throw new MemoryError(ErrorCodes.INVALID_MEDIA, 'media_type is required when media_url is set', {
+      key: 'media_type',
+      allowed: MEDIA_TYPES,
+    });
+  }
+  if (!MEDIA_TYPES.includes(mediaType)) {
+    throw new MemoryError(ErrorCodes.INVALID_MEDIA, `media_type must be one of ${MEDIA_TYPES.join(' | ')}`, {
+      key: 'media_type',
+      got: mediaType,
+      allowed: MEDIA_TYPES,
+    });
+  }
+  return { url: mediaUrl, type: mediaType };
+}
+
+/** Names mentioned as @handle or Capitalised-Latin runs — cheap, deterministic. */
+function extractNames(text) {
+  const found = new Set();
+  for (const match of String(text).matchAll(/@([\w\u4e00-\u9fa5]{2,20})/g)) found.add(match[1]);
+  for (const match of String(text).matchAll(/\b([A-Z][a-z]{2,15})\b/g)) found.add(match[1]);
+  return [...found].slice(0, 5);
+}
+
+/** Task statements: `任务：…`, `TODO: …`, `目标: …`. */
+function extractTasks(text) {
+  const found = new Set();
+  for (const match of String(text).matchAll(/(?:任务|目标|TODO|Task|task)\s*[:：]\s*([^\n。；;]{2,60})/g)) {
+    found.add(match[1].trim());
+  }
+  return [...found].slice(0, 5);
+}
+
+function firstSentence(text) {
+  const line = String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (!line) return '';
+  const cut = line.split(/[。.!?！？]/)[0] || line;
+  return snippet(cut, 80);
+}
+
+const SUBDIRS = Object.freeze({  log: 'log',
   archive: 'archive',
   index: 'index',
   semantic: 'semantic',
@@ -158,6 +255,8 @@ export class Memory {
     this._semanticCache = null;
     this._briefing = null;
     this._boot = null;
+    /** Evicted block ids already folded into a summary (per process). */
+    this._foldedIds = new Set();
     this._closed = false;
     this._writeChain = Promise.resolve();
     this.maintenance.onPublished = () => {
@@ -216,9 +315,21 @@ export class Memory {
     idempotencyKey = null,
     dedupe = true,
     isTransientTrend = false,
+    mediaUrl = null,
+    mediaType = null,
   }) {
     this.assertOpen();
-    const payload = { content, tags, salience, meta, entity, event_time: eventTime ?? happenedAt };
+    ensureNoEmbeddedBase64(content);
+    const media = validateMedia(mediaUrl, mediaType);
+    const payload = {
+      content,
+      tags,
+      salience,
+      meta,
+      entity,
+      event_time: eventTime ?? happenedAt,
+      ...(media ? { media } : {}),
+    };
     const plan = ingestEpisode({
       payload,
       clock: this.clock,
@@ -287,6 +398,114 @@ export class Memory {
       indexed: true,
       trend: trend ? { tempId: trend.tempId, action: trend.action, hitCount: trend.entry?.hitCount ?? 0 } : null,
     };
+  }
+
+  /**
+   * One active heavy task (checkpoint). Exactly one is active at a time: writing
+   * a new one demotes the previous, and `maintain()` demotes one that has not
+   * been refreshed for ACTIVE_TASK_TTL_MS. The snapshot itself is a normal event
+   * tagged `active_task`, so it is durable; the pointer in state/ only says which
+   * one is current.
+   */
+  async checkpoint({ taskId, progress, updatedAt } = {}) {
+    this.assertOpen();
+    if (typeof taskId !== 'string' || !taskId.trim()) {
+      throw invalidInput('checkpoint.task_id must be a non-empty string');
+    }
+    const now = this.clock.now();
+    if (!Number.isFinite(progress) || progress < 0 || progress > 100) {
+      throw invalidInput('checkpoint.progress must be a number between 0 and 100', { got: progress });
+    }
+    const at = updatedAt === undefined || updatedAt === null ? now : Number(updatedAt);
+    if (!Number.isFinite(at) || at > now + 60_000) {
+      throw invalidInput('checkpoint.updated_at must be a valid past timestamp');
+    }
+
+    const previous = this.activeTask();
+    const content = JSON.stringify({ task_id: taskId.trim(), progress, updated_at: at });
+    const result = await this.remember({
+      content,
+      tags: ['active_task', `task:${taskId.trim()}`],
+      salience: 1,
+      eventTime: at,
+      dedupe: true,
+    });
+
+    const pointer = {
+      schema: ACTIVE_TASK_SCHEMA,
+      active: true,
+      eventId: result.eventId,
+      taskId: taskId.trim(),
+      progress,
+      updatedAt: at,
+      createdAt: previous.status === 'active' ? previous.createdAt ?? at : at,
+      demotedEventId: previous.status === 'active' ? previous.eventId : null,
+    };
+    ensureDir(this.paths.state);
+    writeJsonAtomic(this.activeTaskPath(), pointer);
+    this.refreshBriefing();
+    return {
+      status: 'active',
+      taskId: pointer.taskId,
+      progress,
+      updatedAt: at,
+      eventId: pointer.eventId,
+      demotedEventId: pointer.demotedEventId,
+      duplicate: result.status === 'duplicate',
+    };
+  }
+
+  activeTaskPath() {
+    return path.join(this.paths.state, 'active-task.json');
+  }
+
+  /**
+   * Read the active task. Reads the pointer, then looks the event up in the raw
+   * index (`snapshot().events`), which is NOT filtered by the active set or its
+   * 200-tag cap — a checkpoint must stay findable under heavy load.
+   */
+  activeTask() {
+    const pointer = readJson(this.activeTaskPath(), null);
+    if (!pointer || pointer.active !== true) return { status: 'none' };
+    const events = this.indexManager.snapshot()?.events ?? [];
+    const event = events.find((candidate) => candidate.eventId === pointer.eventId);
+    if (!event) {
+      return { status: 'missing', taskId: pointer.taskId, eventId: pointer.eventId, updatedAt: pointer.updatedAt };
+    }
+    const stale = this.clock.now() - pointer.updatedAt > ACTIVE_TASK_TTL_MS;
+    return {
+      status: stale ? 'stale' : 'active',
+      taskId: pointer.taskId,
+      eventId: pointer.eventId,
+      progress: pointer.progress,
+      updatedAt: pointer.updatedAt,
+      createdAt: pointer.createdAt ?? pointer.updatedAt,
+      ageMs: this.clock.now() - pointer.updatedAt,
+      stale,
+      content: event.content,
+      tags: (event.tags ?? []).map((tag) => tag.tag ?? tag),
+    };
+  }
+
+  /** Engine fallback: demote a checkpoint nobody refreshed for ACTIVE_TASK_TTL_MS. */
+  demoteStaleTask() {
+    const pointer = readJson(this.activeTaskPath(), null);
+    if (!pointer || pointer.active !== true) return { demoted: false };
+    const now = this.clock.now();
+    const record = this.activeTask();
+    const reason = record.status === 'missing' ? 'missing-event' : now - pointer.updatedAt > ACTIVE_TASK_TTL_MS ? 'stale' : null;
+    if (!reason) return { demoted: false };
+    writeJsonAtomic(this.activeTaskPath(), {
+      schema: ACTIVE_TASK_SCHEMA,
+      active: false,
+      demotedEventId: pointer.eventId,
+      demotedAt: now,
+      reason,
+      taskId: pointer.taskId,
+      progress: pointer.progress,
+      updatedAt: pointer.updatedAt,
+    });
+    return { demoted: true, reason, eventId: pointer.eventId, taskId: pointer.taskId };
   }
 
   /**
@@ -396,6 +615,7 @@ export class Memory {
     }
     const semantic = this.semanticSummaries();
     const tempSemantic = this.tempStore.list({ status: 'temp', now });
+    const associations = this.graphAssociations({ tags, text });
     const result = runRecall({
       index: view,
       query: { text, tags, topK },
@@ -403,24 +623,66 @@ export class Memory {
       now,
       semantic,
       tempSemantic,
+      associations,
     });
     return {
       ...result,
       stale: this._boot ? this._boot.status !== 'ok' : false,
+      associations,
       // A count, not the resident list: the online queue may read the active set
       // but never enumerate it into the response (that is offline adjudication's job).
       activeTagCount: view.activeSet?.entries?.length ?? 0,
       notes: [
         ...(result.notes ?? []),
+        ...(associations.length > 0 ? [`graph-associations:${associations.length}`] : []),
         ...(this._boot && this._boot.status !== 'ok' ? [`boot-check:${this._boot.status}`] : []),
       ],
     };
+  }
+
+  /**
+   * Online association wake-up: for every tag the query already touches, read the
+   * cached graph and take its three strongest neighbours. The neighbours enter the
+   * candidate pool with a 0.5 penalty (retrieval applies it), so an associative
+   * hit can never outrank a direct one.
+   */
+  graphAssociations({ tags = [], text = '' } = {}, { limit = GRAPH_ASSOCIATIONS } = {}) {
+    const graph = this.graph.read();
+    if (!graph || !Array.isArray(graph.edges) || graph.edges.length === 0) return [];
+    const seeds = new Set([...tags, ...tokenize(text)]);
+    if (seeds.size === 0) return [];
+    const byNode = new Map();
+    for (const edge of graph.edges) {
+      for (const [self, other] of [
+        [edge.source, edge.target],
+        [edge.target, edge.source],
+      ]) {
+        if (!seeds.has(self)) continue;
+        if (!byNode.has(self)) byNode.set(self, []);
+        byNode.get(self).push({ tag: other, weight: edge.weight ?? 0 });
+      }
+    }
+    const picked = [];
+    for (const [seed, neighbours] of byNode) {
+      neighbours.sort((a, b) => b.weight - a.weight || a.tag.localeCompare(b.tag));
+      for (const neighbour of neighbours.slice(0, limit)) {
+        picked.push({ tag: neighbour.tag, via: seed, weight: neighbour.weight, penalty: ASSOCIATION_PENALTY });
+      }
+    }
+    return picked;
   }
 
   async maintain({ reason = 'manual' } = {}) {
     this.assertOpen();
     const report = await this.maintenance.run({ reason });
     this._boot = { status: 'ok', logGen: report.logGen, indexGen: report.indexGen };
+    // Monthly memos are part of maintenance: a completed natural month becomes
+    // one durable memo before the graph is rebuilt from the same index.
+    try {
+      report.monthly = await this.generateMonthlyMemos();
+    } catch (error) {
+      report.monthlyError = error instanceof Error ? error.message : String(error);
+    }
     // The graph is part of maintenance, never of the read path: the index is
     // already "log minus tombstones", so this is a projection of a projection.
     try {
@@ -434,6 +696,13 @@ export class Memory {
     } catch (error) {
       // A graph failure must not fail maintenance (and must never block recall).
       report.graphError = error instanceof Error ? error.message : String(error);
+    }
+    // Engine fallback for checkpoints: the model forgetting to demote is not a
+    // failure mode we rely on — seven days without refresh demotes here.
+    try {
+      report.activeTask = this.demoteStaleTask();
+    } catch (error) {
+      report.activeTaskError = error instanceof Error ? error.message : String(error);
     }
     this.refreshBriefing();
     return report;
@@ -455,6 +724,105 @@ export class Memory {
   }
 
   // ---- L2.5 trend quarantine ---------------------------------------------
+
+  /**
+   * Folding ("推币机"): blocks evicted from the context window are not thrown
+   * away. A light rule folds the most recent batch into ONE `folded_summary`
+   * episode and writes it back to L1, tagged `status:folded`, so the transition
+   * from context to long-term memory is smooth and observable.
+   */
+  async foldEvicted(records = []) {
+    this.assertOpen();
+    const fresh = (records ?? []).filter((record) => record?.text && !this._foldedIds.has(record.id));
+    if (fresh.length === 0) return null;
+    const batch = fresh.slice(-FOLD_BATCH);
+    for (const record of batch) this._foldedIds.add(record.id);
+    const now = this.clock.now();
+    const joined = batch.map((record) => record.text).join('\n');
+    const names = extractNames(joined);
+    const tasks = extractTasks(joined);
+    const points = batch
+      .map((record) => firstSentence(record.text))
+      .filter(Boolean)
+      .slice(-3);
+    const content = [
+      `折叠摘要（${new Date(now).toISOString().slice(0, 10)}，${batch.length} 块）`,
+      points.length ? `要点：${points.join('；')}` : '要点：无',
+      names.length ? `人名：${names.join('、')}` : null,
+      tasks.length ? `任务：${tasks.join('、')}` : null,
+    ]
+      .filter(Boolean)
+      .join('；');
+    try {
+      const result = await this.remember({
+        content,
+        tags: [FOLDED_TAG, 'folded_summary'],
+        salience: 0.65,
+        eventTime: now,
+        idempotencyKey: `fold:${batch.map((record) => record.id).join(',')}`.slice(0, 200),
+      });
+      return { folded: batch.length, eventId: result.eventId, status: result.status, names, tasks };
+    } catch (error) {
+      return { folded: 0, error: error?.code ?? String(error) };
+    }
+  }
+
+  monthlyStatePath() {
+    return path.join(this.paths.state, 'months.json');
+  }
+
+  /**
+   * Multi-level time aggregation: once a natural month is over, its diaries are
+   * condensed into one monthly memo (tag `status:monthly`). Memos are written as
+   * ordinary episodes, so they are durable; retrieval gives them no decay and a
+   * boost when the query is about a fuzzy historical period.
+   */
+  async generateMonthlyMemos({ now = this.clock.now() } = {}) {
+    const view = this.indexManager.snapshot();
+    const events = view?.events ?? [];
+    const byMonth = new Map();
+    for (const event of events) {
+      if (!event.day) continue;
+      if ((event.tags ?? []).some((tag) => (tag.tag ?? tag) === MONTHLY_TAG)) continue;
+      const month = String(event.day).slice(0, 7);
+      if (!/^\d{4}-\d{2}$/.test(month)) continue;
+      if (!byMonth.has(month)) byMonth.set(month, []);
+      byMonth.get(month).push(event);
+    }
+    const state = readJson(this.monthlyStatePath(), null);
+    const done = new Set(Array.isArray(state?.months) ? state.months : []);
+    const generated = [];
+    for (const [month, list] of [...byMonth].sort(([a], [b]) => a.localeCompare(b))) {
+      if (done.has(month)) continue;
+      const [year, monthIndex] = month.split('-').map(Number);
+      const nextMonth = Date.UTC(year, monthIndex, 1);
+      if (now < nextMonth) continue; // the month is still running
+      const tagCounts = new Map();
+      for (const event of list) for (const tag of event.tags ?? []) tagCounts.set(tag.tag ?? tag, (tagCounts.get(tag.tag ?? tag) ?? 0) + 1);
+      const topTags = [...tagCounts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 8).map(([tag]) => tag);
+      const highlights = list
+        .slice()
+        .sort((a, b) => b.salience - a.salience || a.eventId.localeCompare(b.eventId))
+        .slice(0, 3)
+        .map((event) => snippet(event.content, 60));
+      const days = new Set(list.map((event) => event.day)).size;
+      const content = `月度记忆 ${month}：${list.length} 条事件 / ${days} 天；主要标签：${topTags.join('、') || '无'}；要点：${highlights.join('；') || '无'}`;
+      const result = await this.remember({
+        content,
+        tags: [MONTHLY_TAG, `month:${month}`],
+        salience: 0.95,
+        eventTime: nextMonth - 1,
+        entity: `month:${month}`,
+      });
+      done.add(month);
+      generated.push({ month, eventId: result.eventId, status: result.status, events: list.length });
+    }
+    if (generated.length > 0) {
+      ensureDir(this.paths.state);
+      writeJsonAtomic(this.monthlyStatePath(), { schema: 1, months: [...done].sort(), updatedAt: now });
+    }
+    return { generated: generated.length, months: generated.map((entry) => entry.month), entries: generated };
+  }
 
   async extractTrend({ content, sourceEvents = [], tags = [], occurredAt, ttlDays } = {}) {
     this.assertOpen();

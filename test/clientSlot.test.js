@@ -230,6 +230,67 @@ test('settings cover every documented config key, including storageBudgetMb', ()
   assert.ok(source.includes("announce('config-changed')"), 'a save must refresh the panel immediately');
 });
 
+test('the client retries on body.state, never on the HTTP status', () => {
+  const source = fs.readFileSync(CLIENT_PATH, 'utf8');
+  for (const marker of ["state === 'ready'", "'pending'", "'in_progress'", "'failed'", 'FAILED_RETRIES', 'BOOT_MAX_WAIT_MS']) {
+    assert.ok(source.includes(marker), `client must branch on ${marker}`);
+  }
+  assert.ok(!/status === 503/.test(source), 'the UI must not special-case HTTP 503');
+  assert.ok(source.includes("announce('reconnect')"), 'manual reconnect must re-arm the poll');
+  assert.ok(!source.includes('BOOT_GRACE_MS'), 'the old 2-minute give-up window must be gone');
+});
+
+test('retryPolicy: a bodiless 404 keeps booting with backoff, it is not fatal', () => {
+  const { makeModule } = loadBundle();
+  const { retryPolicy } = makeModule();
+
+  const first = retryPolicy({ hasJson: false, state: undefined, status: 404, miss: 0, elapsedMs: 500 });
+  assert.equal(first.kind, 'pending');
+  assert.equal(first.delay, 1000);
+  assert.equal(first.gaveUp, undefined);
+
+  let miss = 0;
+  let delay = 0;
+  for (let i = 0; i < 6; i += 1) {
+    const step = retryPolicy({ hasJson: false, state: undefined, status: 404, miss, elapsedMs: 60_000 });
+    miss = step.miss;
+    delay = step.delay;
+  }
+  assert.ok(delay <= 5000, `backoff capped at 5s, got ${delay}`);
+
+  const timedOut = retryPolicy({ hasJson: false, state: undefined, status: 404, miss: 6, elapsedMs: 10 * 60_000 });
+  assert.equal(timedOut.kind, 'failed');
+  assert.equal(timedOut.gaveUp, true);
+  assert.equal(timedOut.error.code, 'MEM_E_BOOT_TIMEOUT');
+});
+
+test('retryPolicy: state decides, and a JSON body without state is not a death sentence', () => {
+  const { makeModule } = loadBundle();
+  const { retryPolicy } = makeModule();
+
+  assert.equal(retryPolicy({ hasJson: true, state: 'ready', status: 200, miss: 5, elapsedMs: 1 }).kind, 'ready');
+  assert.equal(retryPolicy({ hasJson: true, state: 'pending', status: 503, miss: 5, elapsedMs: 1 }).kind, 'pending');
+  assert.equal(retryPolicy({ hasJson: true, state: 'in_progress', status: 200, miss: 5, elapsedMs: 1 }).delay, 2000);
+
+  const firstFailed = retryPolicy({ hasJson: true, state: 'failed', status: 500, miss: 0, elapsedMs: 10 });
+  assert.equal(firstFailed.kind, 'failed');
+  assert.equal(firstFailed.gaveUp, false);
+  const lastFailed = retryPolicy({ hasJson: true, state: 'failed', status: 500, miss: 4, elapsedMs: 10 });
+  assert.equal(lastFailed.gaveUp, true);
+  assert.equal(lastFailed.delay, 0);
+
+  const legacy = retryPolicy({ hasJson: true, state: undefined, status: 200, miss: 5, elapsedMs: 5000 });
+  assert.equal(legacy.kind, 'pending');
+  assert.ok(legacy.delay <= 5000);
+});
+
+test('settings expose decay.halfLifeDays and activeSet.cap with the documented hints', () => {
+  const source = fs.readFileSync(CLIENT_PATH, 'utf8');
+  for (const marker of ['decay.halfLifeDays', 'activeSet.cap', '普通用户 50MB', '8000 - 12000', '调大能记住更久', '下次维护生效']) {
+    assert.ok(source.includes(marker), `settings must include ${marker}`);
+  }
+});
+
 test('the manifest points ./client at a real file and declares a web client', () => {
   const manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, 'utf8'));
   assert.equal(manifest.exports['./client'], './ui/client.js');
@@ -239,6 +300,6 @@ test('the manifest points ./client at a real file and declares a web client', ()
   assert.equal(manifest.dsh.client.platform, 'web');
   assert.equal(manifest.dsh.client.immediately, undefined, 'the UI must not be boot-critical');
   assert.equal(manifest.name, 'dsh-layers-hippocampus');
-  assert.equal(manifest.version, '1.1.0');
+  assert.equal(manifest.version, '1.3.1');
   assert.ok(manifest.dsh.client.inject === undefined || Array.isArray(manifest.dsh.client.inject));
 });

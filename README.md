@@ -1,13 +1,15 @@
-<<<<<<< HEAD
 # dsh-layers-hippocampus · 海马体记忆
 
-给 DeepSeek Harness（DSH）智能体的**分层长期记忆**：追加式事件日志、可重建标签索引、按天日记、独立语义层、L2.5 趋势隔离、离线知识图谱，以及一个 Web 面板。
+给 DeepSeek Harness（DSH）智能体的**分层长期记忆**：追加式事件日志、可重建标签索引、按天日记、独立语义层、L2.5 趋势隔离、离线知识图谱，以及一个完整的 Web 面板。
 
-- **仓库**：<https://github.com/382quaii/dsh-Layers-Hippocampus>
-- **包名**：`dsh-layers-hippocampus`（npm 包名只能小写；仓库名保留 `dsh-Layers-Hippocampus` 的规范拼写，*Hippocampus* 双 **p**）
-- **许可证**：MIT
-- **运行时依赖**：零。Host 半边只用 Node 内置模块，React 由 Harness 提供。
-- **详细设计**：[docs/ARCHITECTURE.zh.md](docs/ARCHITECTURE.zh.md)
+| | |
+| --- | --- |
+| 版本 | **1.3.1** |
+| 包名 | `dsh-layers-hippocampus`（npm 只允许小写；仓库名保留 `dsh-Layers-Hippocampus`，*Hippocampus* 双 **p**） |
+| 仓库 | <https://github.com/382quaii/dsh-Layers-Hippocampus> |
+| 许可证 | MIT |
+| 运行时依赖 | **零**。Host 半边只用 Node 内置模块，React 由 Harness 提供 |
+| 详细设计 | [docs/ARCHITECTURE.zh.md](docs/ARCHITECTURE.zh.md) |
 
 ---
 
@@ -16,10 +18,8 @@
 ### 从 GitHub
 
 ```bash
-pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.0.0"
+pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.3.1"
 ```
-
-然后把 `dsh-layers-hippocampus` 加入 profile `package.json` 的 `dsh.profile.bundles`，或用插件管理器安装（它会自动追加 `cordis.patch.yml`）。
 
 ### 从 npm
 
@@ -27,13 +27,13 @@ pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.0.0"
 pnpm add dsh-layers-hippocampus
 ```
 
-### 通过插件管理器
+### 通过插件管理器（推荐）
 
 ```
-plugin_manager action=install_bundle target=<目录或包名>
+plugin_manager action=install_bundle target="C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory"
 ```
 
-安装后 profile 里会出现这一行：
+安装后 profile 会得到这一行：
 
 ```yaml
 - insert:
@@ -43,19 +43,37 @@ plugin_manager action=install_bundle target=<目录或包名>
         briefing: true
 ```
 
-安装后重启 Host（或重新启用该行）：Host 半边立即生效，UI 半边在下次页面加载时出现。
+Host 半边随下一次宿主启动生效；UI 半边在页面加载时从 boot graph 取得。**冷启动后**用下面的脚本确认路由已就绪：
+
+```bat
+node scripts/wait-for-routes.mjs
+```
 
 ---
 
-## 能做什么
+## 工具
 
-| 工具（`memory_*` 前缀） | 用途 |
+| 工具（`memory_*`） | 用途 |
 | --- | --- |
-| `remember` | 追加一条长期记忆（按内容哈希幂等） |
-| `recall` | 关键词 + 标签检索，带衰减加权 |
+| `remember` | 追加一条长期记忆（内容哈希幂等）；可带 `media_url` + `media_type` 指向附件 |
+| `checkpoint` | 记录**唯一**进行中的重任务：`task_id`、`progress`（0–100）、`updated_at` |
+| `recall` | 关键词 + 标签检索，衰减加权，含图谱联想 |
 | `reinforce` | 确认一次记忆，不重写内容 |
 | `forget` / `restore` | 墓碑与反墓碑 |
-| `admin` | `status` / `maintain` / `list-tags` / `trends` |
+| `admin` | `status` / `maintain` / `active_tags` / `semantic` / `active_task` |
+
+`active_task` 直查底层索引，**不受活跃集合 cap 200 限制**；写入新 checkpoint 会降级旧记录，7 天未刷新由 `maintain()` 自动降级，模型的 `forget` 只是 happy path。
+
+### 多模态与防爆仓
+
+- `media_url` 只接受 **http(s) URL 或绝对路径**；`media_type` ∈ `image | video | document | audio`，缺一即 `MEM_E_INVALID_MEDIA`。
+- 内联 base64 **不落库**：`content` 中连续 base64 字符 ≥ **256** 即抛 `MEM_E_INVALID_MEDIA`；200 字符以内视为普通文本，不会误杀。
+
+### 记忆流转（上下文 → 长期 → 联想 → 月记）
+
+1. **推币机折叠**：上下文触发 evict 时被驱逐的块不再丢弃，引擎把最近一批折成一条 `folded_summary` 事件写回 L1（标签 `status:folded`），抽取人名、任务语句与核心结论。
+2. **在线联想唤醒**：查询命中某个 Tag 时读取 `state/graph.json`，取该节点最强的 **3** 个邻居，把邻居事件以 **0.5 惩罚系数**放进候选池；命中标记 `association.via`，直连结果永远排在联想结果之前。
+3. **月记（Monthly Memo）**：`maintain()` 发现某个自然月已完整，就把该月日记压成一条 `status:monthly` 记忆；月记**不参与日常衰减**（`decay = 1`），模糊时间查询（“上个月”“2023-10”“去年”）会优先召回它。
 
 一切都从**唯一真相源**（追加式日志）派生；索引、日记、活跃标签集、知识图谱都是可丢弃、可重建的投影。
 
@@ -77,22 +95,26 @@ plugin_manager action=install_bundle target=<目录或包名>
 
 ## 配置
 
-全部由 `resolveConfig` **fail-fast 校验**（绝不静默取整），启动与 HTTP 热更新走同一个校验器。
+全部由 `resolveConfig` **fail-fast 校验**（绝不静默取整），启动与 HTTP 热更新走同一个校验器。设置页覆盖了全部可编辑项。
 
 | 键 | 默认 | 范围 / 取值 |
 | --- | --- | --- |
-| `dataDir` | `<DSH_HOME>/memory` | 绝对路径 |
+| `dataDir` | `<DSH_HOME>/memory` | 绝对路径（只读，不在 UI 内编辑） |
 | `migrateFrom` | `null` | 路径；留空时自动探测旧目录 |
 | `maintenanceCron` | `0 */6 * * *` | 5 段 cron，必须能触发 |
+| `briefing` / `promptSection` / `autoMaintainOnBoot` | `true` | 布尔 |
 | `enableDream` | `true` | 布尔 |
 | `dreamIdleMinutes` | `180` | 1 – 525 600 |
 | `enableReflection` | `true` | 布尔 |
 | `graphMaxEdges` | `500` | 100 – 2000 |
-| `storageBudgetMb` | `50` | 10 – 1000；只影响环形图阈值，不删数据 |
+| `storageBudgetMb` | `50` | 10 – 1000（软上限：超限只标红，不删档） |
+| `decay.halfLifeDays` | `30` | 7 – 365；调大记得更久 |
+| `activeSet.cap` | `200` | 100 – 1000；多项目并行可调 500（下次维护生效） |
 | `maxRecallTopK` | `100` | 1 – 1000 |
 | `retrieval.topK` | `20` | 1 – `maxRecallTopK` |
 | `context.maxTokens` | `4000` | 256 – 1 000 000 |
 | `context.threshold` / `context.target` | `0.85` / `0.7` | target < threshold < 1 |
+| `context.injectPrompt` | `true` | 布尔 |
 | `temp.ttlDays` / `temp.promotionWindowDays` | `30` / `20` | promotion ≤ ttl |
 | `identity.eventTimePolicy` | `content` | `content` \| `explicit` \| `ingest` |
 
@@ -102,12 +124,24 @@ plugin_manager action=install_bundle target=<目录或包名>
 
 Cron **和** 空闲 Dream 触发调用同一个入口 `runtime.runMaintenance(source)`。执行中再次触发直接拒绝（`maintenance-in-flight`）——不排队、不补跑。
 
-### 启动状态机
+### 启动状态机（前后端协议）
 
 `pending → in_progress → ready | failed`。
 
-- `ready` 之前工具返回 `MEM_E_NOT_READY`；迁移窗口内 `recall` 重定向到旧目录（`readFrom: "legacy"`）。
-- `failed` 通过 `/api/hippocampus/stats` 暴露错误，并可在面板里重试（`POST /api/hippocampus/retry`）。
+**每个 HTTP 响应都带 `state`**（包括 400/405/409/500）。前端**只按 `body.state` 决定重试**，不按状态码：
+
+| `state` | 前端行为 |
+| --- | --- |
+| `pending` / `in_progress` | 2s 轮询 + Skeleton，不报错 |
+| `ready` | 正常渲染 |
+| `failed` | 1.2s × 5 次短重试，然后显示「重新连接 / 重试」 |
+| 无 body 的 404 | 指数退避（1→2→4→5s 封顶）最多等 **10 分钟**，之后 `MEM_E_BOOT_TIMEOUT` + 手动重连 |
+
+**写请求隔离**：`ready` 之前 `POST /config` 返回 `409 + MEM_E_NOT_READY + state`；工具返回同样带 `state` / `retryable` 的 `MEM_E_NOT_READY`——绝不静默吞掉。
+
+> **冷启动 404 的根因（1.3.1 修复）**：`webServer` 由 web-app 行提供，而它在本插件 `apply()` **之后**才激活。旧代码只在 `apply()` 里 `ctx.get('webServer')` 一次，拿不到就静默跳过注册——冷启动永远没有路由，热重载却正常。现在注册放在 `ctx.inject(['webServer'], child => …)` 的子 fiber 里：服务一出现就注册。`apply()` 本身不 `await` 任何 I/O，bootstrap 由 `runtime.start()` 放进微任务。成功注册会打印 `[Hippocampus] Route registered at <iso> (…)`，失败会打印 `[Hippocampus] Route registration FAILED: <reason>`。
+>
+> 冷启动验证：重启 DSH 后运行 `node scripts/wait-for-routes.mjs`（自动找端口、自动带会话 Cookie）。它逐行打印状态，路由可用时输出 `OK: routes served … (state=ready)`；在此之前是 `state=(none)` 的 404，客户端会一直退避等待，不会 6 次就死锁。
 
 ---
 
@@ -117,14 +151,14 @@ Cron **和** 空闲 Dream 触发调用同一个入口 `runtime.runMaintenance(so
 
 | 插槽 | id / key | 内容 |
 | --- | --- | --- |
-| `sidebar.panellist` | `hippocampus-panel` | 图标（SVG，消费 `size`/`active`） |
+| `sidebar.panellist` | `hippocampus-panel` | 图标（SVG，消费 `size` / `active`） |
 | `main` | `hippocampus-panel` | 面板：存储环形图、统计卡、知识图谱 |
-| `settings.section` | `hippocampus-settings` | 配置表单 |
+| `settings.section` | `hippocampus-settings` | 完整配置表单 |
 
-- **环形图**：纯 SVG，预算来自 `storageBudgetMb`；中心显示用量与百分比，超预算时弧线截断为整圈并整体标红。
-- **知识图谱**：力导向布局**只计算一次**并冻进 ref（弹簧 + 斥力 + 向心），随后逐个节点入场；边只在**两端节点都已入场**后绘制，不会出现悬空线；孤立节点带随机抖动。
-  - **拖拽**：节点用 `onPointerDown/Move/Up` + `setPointerCapture` 拖动，拖拽期间只改 ref 坐标并直接写 DOM（`transform`/线段端点），**不触发任何 setState**；松手后解除 pin，对 1 跳邻域做一次 alpha 衰减的局部松弛。位移 < 4px 仍算点击（切换标签），不会误拖。
-- **设置页**：全部可调配置都在这里——开关（Dream / Reflection / briefing / promptSection / autoMaintainOnBoot / injectPrompt）、数字（含上下限与客户端预检）、下拉（`identity.eventTimePolicy`）、Cron 文本框；保存一次性打包含点号路径的 patch，后端 fail-fast 校验失败时顶部红色横幅显示错误码，成功后广播 `config-changed`，面板立即重拉 stats 与 graph。
+- **环形图**：纯 SVG，预算来自 `storageBudgetMb`；中心同时显示用量与百分比，超预算时弧线截断为整圈并整体标红。
+- **知识图谱**：力导向布局**只计算一次**并冻进 ref（弹簧 + 斥力 + 向心），随后节点逐个入场；边只在**两端节点都已入场**后绘制，不会有悬空线；孤立节点带随机抖动。
+  - **拖拽**：`onPointerDown/Move/Up` + `setPointerCapture`；拖拽期间只改 ref 坐标并直接写 DOM（`transform` 与线段端点），**不触发 setState**；松手后解除 pin，对 1 跳邻域做 alpha 衰减的局部松弛；位移 < 4px 仍算点击（切换标签）。
+- **设置页**：开关（Dream / Reflection / briefing / promptSection / autoMaintainOnBoot / injectPrompt）、数字（含上下限与客户端预检）、下拉（`identity.eventTimePolicy`）、Cron 文本框；保存一次性提交带点号路径的 patch，后端 fail-fast 失败时顶部红色横幅显示 `MEM_E_CONFIG_*`，成功后广播 `config-changed`，面板立即重拉 stats 与 graph。
 - UI 不调用 Agent 工具，只读下面的 JSON 路由。
 
 ### 截图
@@ -135,17 +169,17 @@ Cron **和** 空闲 Dream 触发调用同一个入口 `runtime.runMaintenance(so
 
 ![知识图谱](assets/screenshot-graph.png)
 
-> 三张为**占位预览图**（本机没有浏览器截图工具时生成的 UI 示意图），用于让市场卡片先有内容；换成真机截图只需替换 `assets/` 下的同名 PNG，`screenshots.json` 无需改动。
+> 三张为**占位预览图**；替换 `assets/` 下同名 PNG 即可，`screenshots.json` 无需改动。
 
 ## HTTP API
 
-挂在 Host Web 服务上的同源路由，复用宿主浏览器鉴权。
+挂在 Host Web 服务上的同源路由，复用宿主浏览器鉴权。**所有响应都带 `state`。**
 
 | 方法 | 路径 | 返回 |
 | --- | --- | --- |
-| `GET` | `/api/hippocampus/stats` | `{ ok, phase, panel, briefing, config }`；未就绪 `503` |
-| `GET` | `/api/hippocampus/config` | 可编辑配置子集 |
-| `POST` | `/api/hippocampus/config` | `{ patch }` → 校验 → 生效 → 尽量持久化 |
+| `GET` | `/api/hippocampus/stats` | `{ ok, state, phase, panel, briefing, config }`；未就绪 `503` |
+| `GET` | `/api/hippocampus/config` | 可编辑配置子集（`ready` 前也可读，用于回填表单） |
+| `POST` | `/api/hippocampus/config` | `{ patch }` → fail-fast 校验 → 生效 → 尽量持久化 |
 | `GET` | `/api/hippocampus/graph` | 缓存图谱，`.slice(0, graphMaxEdges)` |
 | `POST` | `/api/hippocampus/retry` | 重试 `failed` 启动（`202`） |
 
@@ -161,11 +195,11 @@ Cron **和** 空闲 Dream 触发调用同一个入口 `runtime.runMaintenance(so
   index/        gen-*/ + CURRENT          A/B 投影
   identity/     ledger.json               幂等 + 墓碑
   semantic/     摘要 + temp.json          独立语义流
-  state/        context.json、maintenance.json、graph.json
+  state/        context.json、maintenance.json、graph.json、months.json、active-task.json
   journal/      删除流水账
 ```
 
-删掉 `index/` 或 `state/graph.json` 都安全：它们会从日志重建。
+删掉 `index/`、`state/graph.json`、`state/months.json` 都安全：它们会从日志重建（月记会按已生成月份重新补齐）。
 
 ## 从旧名字迁移
 
@@ -173,19 +207,32 @@ Cron **和** 空闲 Dream 触发调用同一个入口 `runtime.runMaintenance(so
 
 ---
 
-## 测试
+## 开发与验证
 
 ```bash
-npm test      # node test/run.mjs —— 105 个进程内用例，30 秒看门狗
+npm test      # node test/run.mjs —— 133 个进程内用例，30 秒看门狗
 npm run check # 语法检查 + 全量测试
 ```
 
 全部用例在进程内运行（不 spawn 子进程），时间相关测试一律注入 `FakeClock`，不读真实时钟、不访问网络。
 
+冷启动验收：
+
+```bash
+node scripts/wait-for-routes.mjs            # 自动找端口
+node scripts/wait-for-routes.mjs 55879      # 指定端口
+```
+
+绑定/注册体检（检查 package.json 名、patch 行名、profile 依赖、Junction 与实时路由）：
+
+```bash
+node scripts/check-binding.mjs --port 55879
+```
+
+## 变更记录
+
+见 [CHANGELOG.md](CHANGELOG.md)（当前 **1.3.1**：修复冷启动 404 与前端 404 死锁；1.3.0：折叠 / 联想 / 月记）。
+
 ## 许可
 
 MIT © 2026 382quaii
-=======
-# dsh-Layers-Hipppocampus
-应用了日志将ds原始数据保存，并用了标签和日记保证了搜索速度，同时用了一系列方法保证了安全性与可靠性
->>>>>>> a1bda2e07182e65350eaf581badcff01f2a90647

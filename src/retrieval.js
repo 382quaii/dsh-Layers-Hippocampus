@@ -21,6 +21,11 @@ import { normaliseTagToken } from './policy.js';
 import { clamp, round, snippet } from './util.js';
 
 const TOKEN_RE = /[a-z0-9]{2,}|[\u4e00-\u9fff]{1,}/gi;
+/** Default penalty for an event reached through a graph neighbour. */
+const ASSOCIATION_PENALTY = 0.5;
+/** Monthly memos never decay, and win ties on fuzzy historical queries. */
+const MONTHLY_TAG = 'status:monthly';
+const FUZZY_TIME_RE = /(上个月|本月|这个月|去年|前年|今年|月度|monthly|\d{4}\s*[-年/]\s*\d{1,2})/i;
 
 export function tokenize(text) {
   if (typeof text !== 'string' || !text) return [];
@@ -52,7 +57,7 @@ function uniqueSorted(values) {
  * @param {object[]} [input.semantic] folded semantic summaries
  * @param {object[]} [input.tempSemantic] folded L2.5 quarantine entries
  */
-export function recall({ index, query = {}, policy, now, semantic = [], tempSemantic = [] }) {
+export function recall({ index, query = {}, policy, now, semantic = [], tempSemantic = [], associations = [] }) {
   const topK = Math.round(clamp(Number(query.topK) || policy.candidates.topK, 1, policy.candidates.maxTopK));
   const text = typeof query.text === 'string' ? query.text.trim() : '';
   const rawTags = Array.isArray(query.tags) ? query.tags : query.tags ? [query.tags] : [];
@@ -135,6 +140,25 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
     }
   }
 
+  // ---- graph association (online wake-up) ---------------------------------
+  // Neighbours of a matched tag enter the pool with a fixed penalty. An event
+  // reached ONLY through a neighbour is marked and charged the penalty again at
+  // scoring time, so an associative hit can never outrank a direct one.
+  const associationOf = new Map(); // eventId -> { via, penalty }
+  const directCandidates = new Set(affinity.keys());
+  for (const association of associations) {
+    const tag = association?.tag;
+    if (!tag || !index.tags[tag]) continue;
+    const penalty = Number.isFinite(association.penalty) ? association.penalty : ASSOCIATION_PENALTY;
+    for (const posting of index.tags[tag].postings) {
+      affinity.set(posting.eventId, (affinity.get(posting.eventId) ?? 0) + posting.strength * penalty);
+      if (!directCandidates.has(posting.eventId) && !associationOf.has(posting.eventId)) {
+        associationOf.set(posting.eventId, { via: association.via ?? tag, penalty });
+      }
+    }
+    tagHits.set(tag, Math.max(tagHits.get(tag) ?? 0, penalty));
+  }
+
   const blocks = index.diary?.blocks ?? [];
   const blockByEvent = new Map();
   for (const block of blocks) for (const id of block.eventIds) blockByEvent.set(id, block.day);
@@ -165,6 +189,15 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
     base.notes.push(`degraded:empty-active-set:recentBlocks=${newest.length}`);
   }
 
+  // Monthly memos are summaries, not residents: they are pulled in when the query
+  // asks about a fuzzy historical period ("上个月", "2023-10", "去年" …), which is
+  // exactly the case where day-block paging cannot answer.
+  const monthlyEvents = index.events.filter((event) => (event.tags ?? []).some((tag) => (tag.tag ?? tag) === MONTHLY_TAG));
+  if (monthlyEvents.length > 0 && text && FUZZY_TIME_RE.test(text)) {
+    for (const event of monthlyEvents) candidates.add(event.eventId);
+    base.notes.push(`monthly-candidates:${monthlyEvents.length}:fuzzy-time`);
+  }
+
   // ---- scoring ------------------------------------------------------------
   const halfLife = policy.decay.halfLifeDays;
   const floor = policy.decay.floor;
@@ -172,18 +205,27 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
   for (const eventId of candidates) {
     const event = eventById.get(eventId);
     if (!event) continue;
-    const decay = decayFactor({
-      eventTime: event.anchorTime ?? event.eventTime,
-      lastReinforcedAt: event.lastReinforcedAt,
-      now,
-      halfLifeDays: halfLife,
-      floor,
-    });
+    const tags = event.tags.map((t) => t.tag);
+    const monthly = tags.includes(MONTHLY_TAG);
+    // A monthly memo is a stable summary, not a fading episode: no decay at all,
+    // and a small boost when the query is about a fuzzy historical period.
+    const decay = monthly
+      ? 1
+      : decayFactor({
+          eventTime: event.anchorTime ?? event.eventTime,
+          lastReinforcedAt: event.lastReinforcedAt,
+          now,
+          halfLifeDays: halfLife,
+          floor,
+        });
     const tagScore = affinity.get(eventId) ?? 0;
     const tagAffinity = 1 + Math.min(2, tagScore);
     const lexical = text ? similarity(text, event.content) : 0;
     const lexicalBoost = text ? 0.6 + 0.4 * lexical : 1;
-    const score = event.salience * decay * tagAffinity * lexicalBoost;
+    const association = associationOf.get(eventId) ?? null;
+    const associationFactor = association ? association.penalty : 1;
+    const timeBoost = monthly && text && FUZZY_TIME_RE.test(text) ? 1.3 : 1;
+    const score = event.salience * decay * tagAffinity * lexicalBoost * associationFactor * timeBoost;
     scored.push({
       eventId,
       eventTime: event.eventTime,
@@ -193,7 +235,9 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
       decay,
       tagAffinity: round(tagAffinity, 4),
       lexical: round(lexical, 4),
-      tags: event.tags.map((t) => t.tag),
+      tags,
+      monthly,
+      ...(association ? { association } : {}),
       reinforcementCount: event.reinforcementCount ?? 0,
       snippet: snippet(event.content, 400),
     });
@@ -232,6 +276,8 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
       candidates: candidates.size,
       scored: scored.length,
       tagHits: tagHits.size,
+      associations: associations.length,
+      monthly: scored.filter((hit) => hit.monthly).length,
     },
     candidateTags: [...tagHits.keys()].sort(),
   };

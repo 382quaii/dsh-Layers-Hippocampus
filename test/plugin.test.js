@@ -45,6 +45,15 @@ function fakeCtx() {
       disposers.push(disposer);
       return disposer;
     },
+    get() {
+      return null;
+    },
+    // The real cordis `inject` waits for a service; here webServer is simply
+    // absent, so the child callback runs and registration reports "unavailable".
+    inject(_deps, callback) {
+      callback(this);
+      return () => {};
+    },
     sections,
     contexts,
     get toolsMap() {
@@ -107,18 +116,19 @@ test('an invalid policy is rejected at activation, before any store is created',
   }
 });
 
-test('apply registers five tools and both prompt layers, and dispose removes them', async () => {
+test('apply registers six tools and both prompt layers, and dispose removes them', async () => {
   const dir = tempDir('ctx');
   const ctx = fakeCtx();
   try {
     assert.deepEqual(inject, ['tools', 'systemPrompt']);
     await apply(ctx, { dataDir: dir, maintenanceCron: '0 */6 * * *', autoMaintainOnBoot: false });
-    assert.equal(ctx.toolsMap.size, 5, 'the tool surface exists immediately, before the store is ready');
+    assert.equal(ctx.toolsMap.size, 6, 'the tool surface exists immediately, before the store is ready');
     // Startup is asynchronous; await it the way a caller would.
     await getRuntime(ctx).ready;
 
     assert.deepEqual([...ctx.toolsMap.keys()].sort(), [
       'memory_admin',
+      'memory_checkpoint',
       'memory_forget',
       'memory_recall',
       'memory_reinforce',

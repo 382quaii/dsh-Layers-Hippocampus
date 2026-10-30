@@ -84,6 +84,7 @@ export function fakeCtx() {
   const sections = [];
   const contexts = [];
   const cleanups = [];
+  const services = new Map();
   const ctx = {
     logger: { info() {}, warn() {}, error() {}, debug() {} },
     tools: {
@@ -107,12 +108,34 @@ export function fakeCtx() {
       if (typeof cleanup === 'function') cleanups.push(cleanup);
       return () => {};
     },
+    get(name) {
+      return services.get(name) ?? null;
+    },
+    /**
+     * Cordis `ctx.inject` starts a child fiber that activates when the services
+     * exist. The fake provides them eagerly and runs the callback synchronously,
+     * with a child context that delegates `get` to the parent (so a test may
+     * install `webServer` before calling apply).
+     */
+    inject(_deps, callback) {
+      const child = {
+        logger: ctx.logger,
+        tools: ctx.tools,
+        systemPrompt: ctx.systemPrompt,
+        effect: ctx.effect,
+        get: (name) => ctx.get(name),
+        inject: ctx.inject,
+      };
+      callback(child);
+      return () => {};
+    },
   };
   return {
     ctx,
     tools,
     sections,
     contexts,
+    services,
     dispose() {
       while (cleanups.length > 0) cleanups.pop()();
     },

@@ -162,7 +162,9 @@ export class ContextEngine {
       if (!victim) break; // everything left is pinned: report, never force
       this.blocks = this.blocks.filter((b) => b.id !== victim.id);
       current -= victim.tokens;
-      const record = { id: victim.id, kind: victim.kind, tokens: victim.tokens, score: round(victimScore, 6) };
+      // Keep the TEXT of the victim: folding ("推币机") needs what was evicted,
+      // not just its id — the block is gone from the window either way.
+      const record = { id: victim.id, kind: victim.kind, tokens: victim.tokens, score: round(victimScore, 6), text: victim.text, at: victim.at };
       evictedNow.push(record);
       this.evicted.push({ ...record, at: now });
     }

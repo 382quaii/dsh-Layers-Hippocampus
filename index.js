@@ -84,6 +84,18 @@ function iso(ms) {
   return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }
 
+/** ISO 8601 or epoch ms -> epoch ms; anything else is an input error, never NaN. */
+function toEpoch(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value);
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (/^\d{10,}$/.test(trimmed)) return Number(trimmed);
+    const parsed = Date.parse(trimmed);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  throw new MemoryError(ErrorCodes.INVALID_INPUT, 'timestamp must be ISO 8601 or epoch ms', { got: String(value).slice(0, 60) });
+}
+
 /**
  * DSH tools take a JSON Schema with an OBJECT root. The author-facing shorthand in
  * this file is a map of `field -> schema` plus `required: true`, which is what
@@ -119,6 +131,7 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
   const runtime = {
     config,
     memory,
+    logger: ctx?.logger ?? null,
     /** Raw (unresolved) config: re-merging a patch must not bake in defaults. */
     rawConfig: cloneRaw(raw ?? config),
     phase: 'pending',
@@ -163,6 +176,8 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
   runtime.notReady = (operation) =>
     new MemoryError(ErrorCodes.NOT_READY, `memory is not ready yet (phase=${runtime.phase}); ${operation} unavailable`, {
       phase: runtime.phase,
+      state: runtime.phase,
+      retryable: true,
       error: runtime.phaseError ? asMemoryError(runtime.phaseError).toJSON() : null,
       hint: 'retry once startup completes; memory_admin/status reports phase during startup',
     });
@@ -350,6 +365,9 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
   /** Phase snapshot the UI polls; never throws, unlike the tools. */
   runtime.phaseView = () => ({
     phase: runtime.phase,
+    // The protocol field the UI branches on. `state` and `phase` are the same
+    // value on purpose: the handshake uses one name, logs keep the other.
+    state: runtime.phase,
     ready: runtime.phase === 'ready',
     readyAt: runtime.readyAt,
     error: runtime.phaseError ? asMemoryError(runtime.phaseError).toJSON() : null,
@@ -379,7 +397,7 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
       return { ok: false, ...view, graph: { available: false, nodes: [], edges: [], totalEdges: 0, limit: runtime.config.graphMaxEdges } };
     }
     try {
-      return { ok: true, phase: runtime.phase, graph: runtime.memory.graphView(runtime.config.graphMaxEdges) };
+      return { ok: true, phase: runtime.phase, state: runtime.phase, graph: runtime.memory.graphView(runtime.config.graphMaxEdges) };
     } catch (error) {
       return { ok: false, ...view, error: asMemoryError(error).toJSON(), graph: { available: false, nodes: [], edges: [], limit: runtime.config.graphMaxEdges } };
     }
@@ -515,6 +533,8 @@ function uiConfig(config) {
     retrieval: { topK: config.retrieval.topK },
     context: config.context,
     temp: config.temp,
+    decay: config.decay,
+    activeSet: config.activeSet,
     identity: { eventTimePolicy: config.identity.eventTimePolicy },
     // Convenience mirrors kept for older clients; the form uses the nested form.
     eventTimePolicy: config.identity.eventTimePolicy,
@@ -568,6 +588,57 @@ export async function apply(ctx, rawConfig = {}) {
 
   ctx.effect(() => {
     const disposers = [];
+
+    // ---- HTTP surface: WAIT for the webServer service ----------------------
+    // ROOT CAUSE of the cold-start 404: `webServer` is provided by a LATER row
+    // (the web app), so `ctx.get('webServer')` is undefined while this plugin's
+    // `apply()` runs at boot. Registering only "if available" skipped the routes
+    // on every cold start — warm reloads worked because the service already
+    // existed. `ctx.inject` is the ordering fix: this child fiber is created now
+    // and activates the moment `webServer` is provided.
+    //
+    // ASSUMPTION (explicit): the Host serves registered `webServer` routes once
+    // the providing row is active. This plugin's `apply()` awaits nothing, and
+    // bootstrap stays detached (`runtime.start()` schedules it on a microtask).
+    ctx.inject(['webServer'], (webCtx) => {
+      const editor = ctx.get?.('configEditor') ?? null;
+      const persistConfig = async (patch) => {
+        if (!editor || typeof editor.edit !== 'function' || typeof editor.entries !== 'function') {
+          return { persisted: false, note: 'configEditor unavailable: the change applies until restart' };
+        }
+        const entries = editor.entries() ?? [];
+        // Match by the package name this build declares, then by any of the row
+        // ids it has shipped under. A row renamed by a profile patch must still be
+        // found: the previous hard-coded '@local/dsh-memory' made every save
+        // live-only after the rename.
+        const rowNameOf = (candidate) => candidate?.options?.name ?? candidate?.name ?? '';
+        const rowIdOf = (candidate) => candidate?.options?.id ?? candidate?.id ?? '';
+        const entry =
+          entries.find((candidate) => rowNameOf(candidate) === PACKAGE_NAME) ??
+          entries.find((candidate) => ['hippocampus', 'memory'].includes(rowIdOf(candidate))) ??
+          entries.find((candidate) => String(rowNameOf(candidate)).includes('dsh-memory')) ??
+          entries.find((candidate) => String(rowNameOf(candidate)).includes('hippocampus'));
+        if (!entry) {
+          return { persisted: false, note: 'profile row not found: the change applies until restart' };
+        }
+        await editor.edit(entry, (current) => mergeRaw(cloneRaw(current), patch));
+        return { persisted: true };
+      };
+
+      const routes = registerMemoryRoutes(webCtx, { runtime, persist: persistConfig, logger: ctx.logger });
+      if (routes.registered) {
+        disposers.push(routes.dispose);
+        // Proof line: cold start reached the serving state.
+        console.log(
+          `[Hippocampus] Route registered at ${new Date().toISOString()} (${routes.paths.join(', ')}) phase=${runtime.phase}`,
+        );
+        ctx.logger?.info?.(`hippocampus: http routes ${routes.paths.join(', ')}`);
+      } else {
+        console.error(`[Hippocampus] Route registration FAILED: ${routes.reason}`);
+        ctx.logger?.warn?.(`hippocampus: http routes not registered (${routes.reason})`);
+      }
+    });
+
     const register = (definition) => {
       disposers.push(ctx.tools.register(definition));
     };
@@ -617,14 +688,53 @@ export async function apply(ctx, rawConfig = {}) {
           idempotency_key: { type: 'string', description: 'Client idempotency key; a repeat returns the existing event id' },
           dedupe: { type: 'boolean', description: 'Default true. false records a genuine second occurrence' },
           is_transient_trend: { type: 'boolean', description: 'Mark as a trend: isolated in L2.5, never promoted directly' },
+          media_url: {
+            type: 'string',
+            description:
+              'Pointer to an attachment: an absolute file path or an http(s) URL. ' +
+              'Inline base64 in content is rejected (MEM_E_INVALID_MEDIA) past 256 consecutive characters.',
+          },
+          media_type: {
+            type: 'string',
+            enum: ['image', 'video', 'document', 'audio'],
+            description: 'Required when media_url is set.',
+          },
         },
         output: { schema: { type: 'string' }, render: (_args, value) => toolResult(value) },
         execute: async (args = {}) =>
           stillStarting('remember', async () => {
             runtime.touch();
-            const result = await memory_remember(runtime, args);
+            const result = await memory_remember(runtime, args, { mediaUrl: args.media_url, mediaType: args.media_type });
             runtime.recordToolCall({ landed: result.status === 'appended' });
             return JSON.stringify({ ok: true, ...result, eventTimeIso: iso(result.eventTime) });
+          }),
+      }),
+    );
+
+    register(
+      defineTool({
+        name: `${config.toolPrefix}_checkpoint`,
+        description:
+          'Record the single active heavy task (snapshot). Exactly one checkpoint is active: writing a new one ' +
+          'demotes the previous, and one not refreshed for 7 days is demoted by maintenance. Read it back with ' +
+          'memory_admin action="active_task", which queries the index directly and ignores the active-set cap.',
+        parameters: {
+          task_id: { type: 'string', description: 'Stable task identifier', required: true },
+          progress: { type: 'number', description: 'Percent complete, 0..100', required: true },
+          updated_at: { type: 'string', description: 'ISO 8601 or epoch ms; defaults to now' },
+        },
+        output: { schema: { type: 'string' }, render: (_args, value) => toolResult(value) },
+        execute: async (args = {}) =>
+          stillStarting('checkpoint', async () => {
+            runtime.touch();
+            const updatedAt = args.updated_at === undefined ? undefined : toEpoch(args.updated_at);
+            const result = await runtime.memory.checkpoint({
+              taskId: args.task_id,
+              progress: Number(args.progress),
+              updatedAt,
+            });
+            runtime.recordToolCall({ landed: false });
+            return JSON.stringify({ ok: true, ...result, updatedAtIso: iso(result.updatedAt) });
           }),
       }),
     );
@@ -710,11 +820,12 @@ export async function apply(ctx, rawConfig = {}) {
         name: `${config.toolPrefix}_admin`,
         description:
           'Maintenance and observability. status = dashboard panel; maintain = run the offline job now; ' +
-          'active_tags = resident active set; semantic = L3 summaries.',
+          'active_tags = resident active set; semantic = L3 summaries; active_task = current checkpoint ' +
+          '(read straight from the index, never filtered by the active set).',
         parameters: {
           action: {
             type: 'string',
-            enum: ['status', 'maintain', 'active_tags', 'semantic'],
+            enum: ['status', 'maintain', 'active_tags', 'semantic', 'active_task'],
             description: 'What to do',
             required: true,
           },
@@ -723,12 +834,16 @@ export async function apply(ctx, rawConfig = {}) {
         execute: async (args = {}) => {
           try {
             const action = args.action;
-            if (!['status', 'maintain', 'active_tags', 'semantic'].includes(action)) {
+            if (!['status', 'maintain', 'active_tags', 'semantic', 'active_task'].includes(action)) {
               return errorJson(
                 new MemoryError(ErrorCodes.INVALID_INPUT, `unknown admin action: ${JSON.stringify(action)}`, {
-                  allowed: ['status', 'maintain', 'active_tags', 'semantic'],
+                  allowed: ['status', 'maintain', 'active_tags', 'semantic', 'active_task'],
                 }),
               );
+            }
+            if (action === 'active_task') {
+              if (runtime.phase !== 'ready') return errorJson(runtime.notReady('active_task'));
+              return JSON.stringify({ ok: true, activeTask: runtime.memory.activeTask() });
             }
             if (action === 'maintain') {
               if (runtime.phase !== 'ready') return errorJson(runtime.notReady('maintain'));
@@ -805,7 +920,8 @@ export async function apply(ctx, rawConfig = {}) {
               `- ${config.toolPrefix}_recall: search memory before asking the user to repeat themselves.`,
               `- ${config.toolPrefix}_reinforce: reward a memory that proved useful (moves its decay anchor).`,
               `- ${config.toolPrefix}_forget: delete through tombstone -> archive -> consolidation -> purge.`,
-              `- ${config.toolPrefix}_admin: status / maintain / active_tags / semantic.`,
+              `- ${config.toolPrefix}_checkpoint: record the one active heavy task (task_id, progress, updated_at).`,
+        `- ${config.toolPrefix}_admin: status / maintain / active_tags / semantic / active_task.`,
               'Memory is NOT the session transcript: store durable facts, not turn-by-turn narration.',
               'If a memory call fails, report the error code instead of inventing a result.',
             ].join('\n'),
@@ -833,44 +949,8 @@ export async function apply(ctx, rawConfig = {}) {
     // ---- UI ----------------------------------------------------------------
     // The visual surface lives in the Client half (ui/client.js): it registers
     // sidebar.panellist / main / settings.section through ctx.slots and reads its
-    // data from the HTTP routes below. The Host half renders nothing — no markup,
-    // no DOM access, no second React tree.
-
-    // ---- HTTP surface for the client half (ui/client.js) --------------------
-    // The browser cannot call agent tools, so the panel reads/writes through
-    // these two routes. Persistence goes through configEditor (the Loader's own
-    // write path); when it is unavailable the change is live-only and reported.
-    const editor = ctx.get?.('configEditor') ?? null;
-    const persistConfig = async (patch) => {
-      if (!editor || typeof editor.edit !== 'function' || typeof editor.entries !== 'function') {
-        return { persisted: false, note: 'configEditor unavailable: the change applies until restart' };
-      }
-      const entries = editor.entries() ?? [];
-      // Match by the package name this build declares, then by any of the row
-      // ids it has shipped under. A row renamed by a profile patch must still be
-      // found: the previous hard-coded '@local/dsh-memory' made every save
-      // live-only after the rename.
-      const rowNameOf = (candidate) => candidate?.options?.name ?? candidate?.name ?? '';
-      const rowIdOf = (candidate) => candidate?.options?.id ?? candidate?.id ?? '';
-      const entry =
-        entries.find((candidate) => rowNameOf(candidate) === PACKAGE_NAME) ??
-        entries.find((candidate) => ['hippocampus', 'memory'].includes(rowIdOf(candidate))) ??
-        entries.find((candidate) => String(rowNameOf(candidate)).includes('dsh-memory')) ??
-        entries.find((candidate) => String(rowNameOf(candidate)).includes('hippocampus'));
-      if (!entry) {
-        return { persisted: false, note: 'profile row not found: the change applies until restart' };
-      }
-      await editor.edit(entry, (current) => mergeRaw(cloneRaw(current), patch));
-      return { persisted: true };
-    };
-
-    const routes = registerMemoryRoutes(ctx, { runtime, persist: persistConfig, logger: ctx.logger });
-    if (routes.registered) {
-      disposers.push(routes.dispose);
-      ctx.logger?.info?.(`hippocampus: http routes ${routes.paths.join(', ')}`);
-    } else {
-      ctx.logger?.warn?.(`hippocampus: http routes not registered (${routes.reason})`);
-    }
+    // data from the HTTP routes registered at the top of this effect. The Host
+    // half renders nothing — no markup, no DOM access, no second React tree.
 
     // ---- scheduling: ONE loop ----------------------------------------------
     const timer = setInterval(() => {
@@ -928,11 +1008,19 @@ function injectRecall(runtime, result) {
       now,
     });
   }
-  memory.context.enforce({ now });
+  // Folding: what left the window is not lost. Fire-and-forget so a recall never
+  // waits on a write; a failure is reported through the logger, never through the
+  // recall result.
+  const report = memory.context.enforce({ now });
+  if (report.evicted.length > 0) {
+    memory.foldEvicted(report.evicted).catch((error) => {
+      runtime.logger?.warn?.(`hippocampus: fold failed: ${error?.message ?? error}`);
+    });
+  }
   return config;
 }
 
-async function memory_remember(runtime, args) {
+async function memory_remember(runtime, args, media = {}) {
   return runtime.memory.remember({
     content: args.content,
     happenedAt: args.happened_at,
@@ -943,5 +1031,7 @@ async function memory_remember(runtime, args) {
     idempotencyKey: args.idempotency_key,
     dedupe: args.dedupe,
     isTransientTrend: args.is_transient_trend,
+    mediaUrl: media.mediaUrl ?? null,
+    mediaType: media.mediaType ?? null,
   });
 }

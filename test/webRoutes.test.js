@@ -213,9 +213,11 @@ test('validatePatch rejects non-objects and accepts only the editable set', () =
   assert.throws(() => validatePatch([1, 2]), /patch must be an object/);
   const accepted = validatePatch(Object.fromEntries(EDITABLE_CONFIG_KEYS.map((key, index) => [key, index])));
   assert.deepEqual(Object.keys(accepted).sort(), [
+    'activeSet',
     'autoMaintainOnBoot',
     'briefing',
     'context',
+    'decay',
     'dreamIdleMinutes',
     'enableDream',
     'enableReflection',

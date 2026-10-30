@@ -4,6 +4,80 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.3.1] — 2026-10-30
+
+### Fixed
+
+- **Cold-start 404 (root cause)**: `webServer` is provided by the web-app row, which
+  activates *after* this plugin's `apply()`. The old code called
+  `ctx.get('webServer')` once and silently skipped registration when it was
+  absent — every cold start had no routes, while a warm reload worked. Route
+  registration now lives in `ctx.inject(['webServer'], child => …)`, so the child
+  fiber activates the moment the service appears and the routes are always
+  mounted. Verified live (404 → 200) and covered by a deferred-inject test.
+- **Front-end death spiral**: a bodiless 404 used to be synthesized into a JSON
+  error, which the old retry counter treated as a protocol failure and gave up
+  after six attempts. `getJson` now keeps "no JSON" distinct, and the pure
+  `decideRetry` policy retries bodiless 404s with exponential backoff (capped at
+  5s) for up to 10 minutes before surfacing `MEM_E_BOOT_TIMEOUT` with a manual
+  reconnect button.
+- **Diagnostics**: `apply()` prints `[Hippocampus] Route registered at <iso>
+  (<paths>) phase=<phase>` when the routes are mounted, and
+  `[Hippocampus] Route registration FAILED: <reason>` if the service never
+  provides one.
+
+## [1.3.0] — 2026-10-30
+
+### Added
+
+- **Context folding (推币机)**: blocks evicted from the context window are no longer
+  dropped. A light rule folds the most recent batch into one `folded_summary`
+  episode tagged `status:folded` — extracting names, task statements and core
+  conclusions — and writes it back to the L1 log.
+- **Graph association (在线联想)**: when a query touches a tag, retrieval reads the
+  cached graph and pulls that tag's three strongest neighbours into the candidate
+  pool with an explicit `penalty: 0.5`; such hits are marked `association.via` and
+  can never outrank a direct hit.
+- **Monthly memos (月记)**: `maintain()` condenses a finished natural month into one
+  `status:monthly` episode. Memos do not decay (`decay = 1`) and are pulled in
+  first for fuzzy historical queries ("上个月", "2023-10", "去年" …).
+
+### Changed
+
+- HTTP routes are now registered **before** tools, prompts and scheduling inside
+  `apply()`, so a page that wins the boot race hits a live handler answering
+  `state=pending` instead of a 404. The Host-side assumption is documented in the
+  code: `apply()` awaits nothing, and route service is expected once it returns.
+
+## [1.2.0] — 2026-10-30
+
+### Added
+
+- **`memory_checkpoint`** (`task_id`, `progress`, `updated_at`): exactly one active
+  heavy task. A new checkpoint demotes the previous one, one not refreshed for
+  seven days is demoted by `maintain()`, and `memory_admin action="active_task"`
+  reads it straight from the index — the active-set cap of 200 does not apply.
+- **Multimodal pointers**: `memory_remember` accepts `media_url` (absolute path or
+  http(s) URL) plus `media_type` (`image|video|document|audio`). Inline base64 in
+  `content` is rejected with `MEM_E_INVALID_MEDIA` from 256 consecutive base64
+  characters; 200 characters is still ordinary text.
+- **`decay.halfLifeDays`** (default 30, 7–365) and **`activeSet.cap`** (default 200,
+  100–1000): both declared in `DEFAULT_CONFIG`, validated fail-fast by
+  `resolveConfig`, projected into `policy`, and editable from the settings page.
+- **State handshake**: every route response now carries `state`
+  (`pending|in_progress|ready|failed`), and the UI retries on `state` rather than
+  on the HTTP status. A bodiless 404 during boot is treated as `pending` for a
+  120s grace window (the routes are only mounted once the Host runs `apply()`).
+
+### Changed
+
+- Writes before READY are refused loudly: `POST /api/hippocampus/config` answers
+  `409` with `MEM_E_NOT_READY` and the current state; tools already answered
+  `MEM_E_NOT_READY`, and their error details now include `state` and `retryable`.
+- The settings page covers the full editable surface (18 keys), with the documented
+  hints for `storageBudgetMb`, `context.maxTokens`, `decay.halfLifeDays` and
+  `activeSet.cap`; saving before READY is disabled in the UI and rejected by the API.
+
 ## [1.1.0] — 2026-10-29
 
 ### Added

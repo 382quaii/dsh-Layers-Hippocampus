@@ -23,6 +23,7 @@ export const ErrorCodes = Object.freeze({
   EVENT_TIME_REQUIRED: 'MEM_E_EVENT_TIME_REQUIRED',
   DUPLICATE_SUPPRESSED: 'MEM_E_DUPLICATE_SUPPRESSED',
   TOMBSTONED: 'MEM_E_TOMBSTONED',
+  INVALID_MEDIA: 'MEM_E_INVALID_MEDIA',
   NOT_READY: 'MEM_E_NOT_READY',
 
   // ---- configuration (fail-fast at boot; never silently downgraded) ---------

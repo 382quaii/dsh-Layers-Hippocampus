@@ -67,56 +67,183 @@
       async function getJson(url, init) {
         const response = await fetch(url, { credentials: 'same-origin', ...init });
         let body = null;
+        let hasJson = false;
         try {
           body = await response.json();
+          hasJson = true;
         } catch (error) {
-          body = { ok: false, error: { code: 'MEM_E_NETWORK', message: `HTTP ${response.status}` } };
+          // A 404 from the Host router has NO body: keep it distinguishable from
+          // a JSON error, otherwise the retry policy cannot tell "route not
+          // mounted yet" from "protocol violation".
+          body = null;
+          hasJson = false;
         }
-        return { status: response.status, body };
+        return { status: response.status, body, hasJson };
       }
 
+      /** Explicit `failed` budget: after this many short retries the UI asks the human. */
+      const FAILED_RETRIES = 5;
+      /** A bodiless 404 is retried until this deadline (10 minutes), then it fails. */
+      const BOOT_MAX_WAIT_MS = 10 * 60_000;
+      const BACKOFF_CAP_MS = 5000;
+      const FAILED_DELAY_MS = 1200;
+
+      /**
+       * The ONE retry decision, pure so it can be unit-tested. It never looks at
+       * the HTTP status: `state` is the protocol. A bodiless response (404 from
+       * the Host before the plugin's routes are mounted) is treated as "booting"
+       * with exponential backoff up to BOOT_MAX_WAIT_MS — never as a hard error
+       * after a handful of tries, which is exactly the bug this replaces.
+       */
+      function decideRetry({ hasJson, state, status, miss, elapsedMs }) {
+        if (hasJson && state === 'ready') {
+          return { kind: 'ready', delay: POLL_MS, miss: 0, attempts: 0 };
+        }
+        if (!hasJson || state === undefined || state === null) {
+          if (elapsedMs >= BOOT_MAX_WAIT_MS) {
+            return {
+              kind: 'failed',
+              delay: 0,
+              miss,
+              attempts: miss,
+              gaveUp: true,
+              error: {
+                code: 'MEM_E_BOOT_TIMEOUT',
+                message: `路由在 ${Math.round(elapsedMs / 1000)}s 内仍未就绪（最后一次 HTTP ${status}）`,
+              },
+            };
+          }
+          const nextMiss = miss + 1;
+          return {
+            kind: 'pending',
+            delay: Math.min(1000 * 2 ** Math.min(nextMiss - 1, 3), BACKOFF_CAP_MS),
+            miss: nextMiss,
+            attempts: nextMiss,
+          };
+        }
+        if (state === 'pending' || state === 'in_progress') {
+          return { kind: 'pending', delay: 2000, miss: 0, attempts: 0 };
+        }
+        if (state === 'failed') {
+          const nextMiss = miss + 1;
+          const gaveUp = nextMiss >= FAILED_RETRIES;
+          return { kind: 'failed', delay: gaveUp ? 0 : FAILED_DELAY_MS, miss: nextMiss, gaveUp, attempts: nextMiss };
+        }
+        // Unknown state: do not spin, do not die — keep booting with backoff.
+        const nextMiss = miss + 1;
+        return {
+          kind: 'pending',
+          delay: Math.min(1000 * 2 ** Math.min(nextMiss - 1, 3), BACKOFF_CAP_MS),
+          miss: nextMiss,
+          attempts: nextMiss,
+        };
+      }
+
+      /**
+       * The handshake consumer. Reads /stats, hands the raw shape to decideRetry,
+       * and mirrors the decision into UI state. No HTTP status branching here.
+       */
       function useMemoryStats() {
-        const [state, setState] = React.useState({ loading: true, payload: null, error: null });
+        const [state, setState] = React.useState({
+          loading: true,
+          payload: null,
+          error: null,
+          state: 'pending',
+          gaveUp: false,
+          attempts: 0,
+        });
+        const bootAtRef = React.useRef(Date.now());
 
         React.useEffect(() => {
           let alive = true;
           let inFlight = false;
+          let miss = 0;
+          let timer = null;
+
+          const schedule = (ms) => {
+            if (!alive) return;
+            if (timer) clearTimeout(timer);
+            timer = setTimeout(tick, ms);
+          };
+
           const tick = async () => {
             if (!alive || inFlight) return;
             inFlight = true;
+            let nextDelay = POLL_MS;
             try {
-              const { status, body } = await getJson(API.stats);
+              const { status, body, hasJson } = await getJson(API.stats);
               if (!alive) return;
-              if (body && body.ok === true) {
-                setState({ loading: false, payload: body, error: null });
-              } else if (status === 503 && body) {
-                setState({ loading: false, payload: body, error: null });
-              } else {
+              const decision = decideRetry({
+                hasJson,
+                state: body && body.state,
+                status,
+                miss,
+                elapsedMs: Date.now() - bootAtRef.current,
+              });
+              miss = decision.miss;
+              if (decision.kind === 'ready') {
+                setState({ loading: false, payload: body, error: null, state: 'ready', gaveUp: false, attempts: 0 });
+              } else if (decision.kind === 'pending') {
+                const reported = hasJson && body.state ? body.state : 'pending';
                 setState((prev) => ({
                   loading: false,
-                  payload: prev.payload,
-                  error: (body && body.error) || { code: 'MEM_E_NETWORK', message: `HTTP ${status}` },
+                  payload: hasJson ? body : prev.payload,
+                  error: null,
+                  state: reported,
+                  gaveUp: false,
+                  attempts: decision.attempts,
                 }));
+              } else {
+                setState({
+                  loading: false,
+                  payload: hasJson ? body : null,
+                  error: decision.error || (body && body.error) || { code: 'MEM_E_NETWORK', message: `HTTP ${status}` },
+                  state: 'failed',
+                  gaveUp: decision.gaveUp === true,
+                  attempts: decision.attempts,
+                });
               }
+              nextDelay = decision.delay;
             } catch (error) {
               if (!alive) return;
-              setState((prev) => ({
-                loading: false,
-                payload: prev.payload,
-                error: { code: 'MEM_E_NETWORK', message: String((error && error.message) || error) },
-              }));
+              const elapsedMs = Date.now() - bootAtRef.current;
+              if (elapsedMs < BOOT_MAX_WAIT_MS) {
+                miss += 1;
+                setState((prev) => ({ ...prev, loading: false, state: 'pending', gaveUp: false, attempts: miss, error: null }));
+                nextDelay = Math.min(1000 * 2 ** Math.min(miss - 1, 3), BACKOFF_CAP_MS);
+              } else {
+                setState({
+                  loading: false,
+                  payload: null,
+                  error: { code: 'MEM_E_NETWORK', message: String((error && error.message) || error) },
+                  state: 'failed',
+                  gaveUp: true,
+                  attempts: miss,
+                });
+                nextDelay = 0;
+              }
             } finally {
               inFlight = false;
+              if (alive && nextDelay > 0) schedule(nextDelay);
             }
           };
+
+          const reconnect = () => {
+            bootAtRef.current = Date.now();
+            miss = 0;
+            setState((prev) => ({ ...prev, gaveUp: false, attempts: 0, state: 'pending', error: null }));
+            tick();
+          };
           const onConfig = () => tick();
+
           tick();
-          const timer = setInterval(tick, POLL_MS);
           bus.addEventListener('config-changed', onConfig);
+          bus.addEventListener('reconnect', reconnect);
           return () => {
             alive = false;
-            clearInterval(timer);
+            if (timer) clearTimeout(timer);
             bus.removeEventListener('config-changed', onConfig);
+            bus.removeEventListener('reconnect', reconnect);
           };
         }, []);
 
@@ -156,6 +283,45 @@
             bus.removeEventListener('config-changed', load);
           };
         }, [limit, available]);
+
+        return state;
+      }
+
+      /**
+       * Config comes from its own route, not from /stats: GET /config answers
+       * before READY, so the settings form is populated during startup while a
+       * POST is still refused with MEM_E_NOT_READY.
+       */
+      function useConfig() {
+        const [state, setState] = React.useState({ config: null, state: 'pending', error: null });
+
+        React.useEffect(() => {
+          let alive = true;
+          const load = () => {
+            getJson(API.config)
+              .then(({ status, body }) => {
+                if (!alive) return;
+                if (body && body.config) {
+                  setState({ config: body.config, state: body.state || 'pending', error: null });
+                } else {
+                  setState((prev) => ({
+                    ...prev,
+                    state: body && body.state ? body.state : prev.state,
+                    error: (body && body.error) || { code: 'MEM_E_NETWORK', message: `HTTP ${status}` },
+                  }));
+                }
+              })
+              .catch((error) => {
+                if (alive) setState((prev) => ({ ...prev, error: { code: 'MEM_E_NETWORK', message: String(error) } }));
+              });
+          };
+          load();
+          bus.addEventListener('config-changed', load);
+          return () => {
+            alive = false;
+            bus.removeEventListener('config-changed', load);
+          };
+        }, []);
 
         return state;
       }
@@ -258,13 +424,20 @@
           setBusy(true);
           setResult(null);
           try {
+            // Retry asks the engine to re-run bootstrap; the reconnect event
+            // re-arms the poll even if the Host half itself is not mounted yet.
             const { status, body } = await getJson(API.retry, { method: 'POST' });
             setResult({ ok: status === 202 && body && body.ok !== false, text: (body && (body.message || body.code)) || `HTTP ${status}` });
           } catch (error) {
             setResult({ ok: false, text: String((error && error.message) || error) });
           } finally {
             setBusy(false);
+            announce('reconnect');
           }
+        };
+
+        const reconnect = () => {
+          announce('reconnect');
         };
 
         return h(
@@ -275,41 +448,60 @@
             null,
             h('div', { style: { fontWeight: 600, marginBottom: 4, color: palette.danger } }, '记忆库启动失败'),
             h('div', { style: { fontSize: 13 } }, `${failure.code || 'MEM_E_UNKNOWN'}: ${failure.message || '未知错误'}`),
+            props.attempts ? h('div', { style: { ...labelStyle, marginTop: 4, marginBottom: 0 } }, `已自动重试 ${props.attempts} 次`) : null,
             result ? h('div', { style: { ...labelStyle, marginTop: 4, marginBottom: 0 } }, result.text) : null,
           ),
           h(
-            'button',
-            {
-              type: 'button',
-              onClick: retry,
-              disabled: busy,
-              style: {
-                padding: '6px 14px',
-                borderRadius: 8,
-                border: `1px solid ${palette.danger}`,
-                background: 'transparent',
-                color: palette.danger,
-                cursor: busy ? 'default' : 'pointer',
-                fontSize: 13,
-                whiteSpace: 'nowrap',
+            'div',
+            { style: { display: 'flex', gap: 8 } },
+            h(
+              'button',
+              {
+                type: 'button',
+                onClick: reconnect,
+                style: {
+                  padding: '6px 14px',
+                  borderRadius: 8,
+                  border: `1px solid ${palette.border}`,
+                  background: 'transparent',
+                  color: palette.text,
+                  cursor: 'pointer',
+                  fontSize: 13,
+                  whiteSpace: 'nowrap',
+                },
               },
-            },
-            busy ? '重试中…' : '重试',
-          ),
-        );
+              '重新连接',
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                onClick: retry,
+                disabled: busy,
+                style: {
+                  padding: '6px 14px',
+                  borderRadius: 8,
+                  border: `1px solid ${palette.danger}`,
+                  background: 'transparent',
+                  color: palette.danger,
+                  cursor: busy ? 'default' : 'pointer',
+                  fontSize: 13,
+                  whiteSpace: 'nowrap',
+                },
+              },
+              busy ? '重试中…' : '重试',
+              ),
+            ),
+          );
       }
 
       function PhaseCard(props) {
         const payload = props.payload;
-        if (payload && payload.phase === 'failed') return h(FailureBanner, { error: payload.error || props.error });
-        if (props.error) {
-          return h(
-            'div',
-            { style: { ...cardStyle, borderColor: palette.warn } },
-            h('div', { style: { fontWeight: 600, marginBottom: 6 } }, '无法连接记忆服务'),
-            h('div', { style: { fontSize: 13, color: palette.muted } }, `${props.error.code || 'MEM_E_NETWORK'}: ${props.error.message || ''}`),
-          );
+        const shell = props.shellState || (payload && payload.state) || 'pending';
+        if (shell === 'failed') {
+          return h(FailureBanner, { error: payload?.error || props.error, attempts: props.attempts, gaveUp: props.gaveUp });
         }
+        const spinning = shell === 'pending' || shell === 'in_progress' || props.loading;
         return h(
           'div',
           { style: cardStyle },
@@ -324,11 +516,15 @@
                 border: `2px solid ${palette.accent}`,
                 borderTopColor: 'transparent',
                 display: 'inline-block',
+                animation: spinning ? undefined : 'none',
               },
             }),
-            payload && payload.phase === 'in_progress' ? '正在迁移/加载索引…' : '正在启动…',
+            shell === 'in_progress' ? '正在迁移/加载索引…' : '正在启动…',
           ),
           h('div', { style: { ...labelStyle, marginTop: 8 } }, '启动在后台进行，检索就绪后本卡片会自动刷新。'),
+          props.error
+            ? h('div', { style: { ...labelStyle, marginTop: 4, marginBottom: 0 } }, `${props.error.code || 'MEM_E_NETWORK'}: ${props.error.message || ''}`)
+            : null,
         );
       }
 
@@ -826,12 +1022,17 @@
       function MemoryPanel() {
         const state = useMemoryStats();
         const payload = state.payload;
-        const ready = Boolean(payload && payload.ok === true);
+        // The handshake decides, not HTTP and not `ok`: `state` is the protocol.
+        const ready = state.state === 'ready';
         const limit = (payload && payload.config && payload.config.graphMaxEdges) || 500;
         const graphState = useGraph(limit, ready);
 
-        if (!payload || !ready) {
-          return h('div', { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 12 } }, h(PhaseCard, { payload, error: state.error }));
+        if (!ready) {
+          return h(
+            'div',
+            { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 12 } },
+            h(PhaseCard, { payload, error: state.error, shellState: state.state, attempts: state.attempts, gaveUp: state.gaveUp }),
+          );
         }
 
         const panel = payload.panel || {};
@@ -992,6 +1193,8 @@
           dreamIdleMinutes: Number(config.dreamIdleMinutes),
           graphMaxEdges: Number(config.graphMaxEdges),
           storageBudgetMb: Number(config.storageBudgetMb),
+          decayHalfLifeDays: Number((config.decay && config.decay.halfLifeDays) ?? 30),
+          activeSetCap: Number((config.activeSet && config.activeSet.cap) ?? 200),
           maxRecallTopK: Number(config.maxRecallTopK),
           retrievalTopK: Number((config.retrieval && config.retrieval.topK) ?? config.retrievalTopK),
           context: {
@@ -1013,6 +1216,8 @@
         { key: 'dreamIdleMinutes', label: '空闲判定', min: 1, max: 525600 },
         { key: 'graphMaxEdges', label: '图谱最大边数', min: 100, max: 2000 },
         { key: 'storageBudgetMb', label: '存储预算', min: 10, max: 1000 },
+        { key: 'decayHalfLifeDays', label: '记忆半衰期', min: 7, max: 365 },
+        { key: 'activeSetCap', label: '活跃标签上限', min: 100, max: 1000 },
         { key: 'maxRecallTopK', label: '检索上限', min: 1, max: 1000 },
         { key: 'retrievalTopK', label: '默认 topK', min: 1, max: 1000 },
         { key: 'context.maxTokens', label: '上下文预算', min: 256, max: 1000000 },
@@ -1026,8 +1231,9 @@
 
       function MemorySettings() {
         const state = useMemoryStats();
-        const payload = state.payload;
-        const serverConfig = payload && payload.ok === true ? payload.config : null;
+        const configState = useConfig();
+        const serverConfig = configState.config;
+        const shellState = state.state;
         const [draft, setDraft] = React.useState(null);
         const [status, setStatus] = React.useState(null);
         const [saving, setSaving] = React.useState(false);
@@ -1036,10 +1242,14 @@
           if (serverConfig && draft === null) setDraft(draftFromConfig(serverConfig));
         }, [serverConfig, draft]);
 
-        if (payload && payload.phase === 'failed') {
-          return h('div', { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 12 } }, h(FailureBanner, { error: payload.error || state.error }));
+        if (shellState === 'failed') {
+          return h(
+            'div',
+            { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 12 } },
+            h(FailureBanner, { error: state.error || configState.error, attempts: state.attempts, gaveUp: state.gaveUp }),
+          );
         }
-        if (!serverConfig) return h('div', { style: { padding: 16 } }, h(PhaseCard, { payload, error: state.error }));
+        if (!serverConfig) return h('div', { style: { padding: 16 } }, h(PhaseCard, { payload: state.payload, error: configState.error, shellState }));
         if (!draft) return h('div', { style: { padding: 16, color: palette.muted } }, '读取配置…');
 
         const edit = (path, value) => {
@@ -1086,6 +1296,8 @@
             dreamIdleMinutes: Number(draft.dreamIdleMinutes),
             graphMaxEdges: Number(draft.graphMaxEdges),
             storageBudgetMb: Number(draft.storageBudgetMb),
+            'decay.halfLifeDays': Number(draft.decayHalfLifeDays),
+            'activeSet.cap': Number(draft.activeSetCap),
             maxRecallTopK: Number(draft.maxRecallTopK),
             'retrieval.topK': Number(draft.retrievalTopK),
             'context.maxTokens': Number(draft.context.maxTokens),
@@ -1119,13 +1331,28 @@
           }
         };
 
-        const disabled = saving;
+        const disabled = saving || shellState !== 'ready';
 
         return h(
           'div',
           { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 12, maxWidth: 720 } },
           h('div', { style: { fontSize: 16, fontWeight: 600 } }, '海马体记忆'),
           h('div', { style: labelStyle }, '保存后立即作用于运行时（fail-fast 校验，越界会被拒绝），并在可持久化时写回 Loader 配置。'),
+          shellState !== 'ready'
+            ? h(
+                'div',
+                {
+                  style: {
+                    padding: '8px 12px',
+                    borderRadius: 10,
+                    border: `1px solid ${palette.warn}`,
+                    color: palette.warn,
+                    fontSize: 12,
+                  },
+                },
+                `当前状态：${shellState}。可以查看配置，但写入要等记忆库就绪（写入会被 MEM_E_NOT_READY 拒绝，不会静默丢失）。`,
+              )
+            : null,
           status && status.tone === 'error'
             ? h(
                 'div',
@@ -1227,6 +1454,7 @@
             { title: '上下文窗口' },
             h(Field, {
               label: '预算（token）',
+              hint: '日常 4000；长视频或重构时建议 8000 - 12000。',
               value: draft.context.maxTokens,
               min: 256,
               max: 1000000,
@@ -1265,6 +1493,7 @@
             { title: '存储与图谱', hint: '存储预算只影响左上角环形图的阈值，不会删除任何数据。' },
             h(Field, {
               label: '存储预算上限（MB）',
+              hint: '普通用户 50MB；重度用户可调至 200MB+。软上限：超限只在环形图标红，不删档。',
               value: draft.storageBudgetMb,
               min: 10,
               max: 1000,
@@ -1281,6 +1510,31 @@
               max: 2000,
               step: 100,
               onChange: (value) => edit('graphMaxEdges', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            { title: '老化与活跃集合', hint: '这两个值同时是策略参数：写入 config 即进入 policy，下一次维护生效。' },
+            h(Field, {
+              label: '记忆半衰期（decay.halfLifeDays）',
+              hint: '默认 30 天。调大能记住更久。',
+              value: draft.decayHalfLifeDays,
+              min: 7,
+              max: 365,
+              step: 1,
+              suffix: '天',
+              onChange: (value) => edit('decayHalfLifeDays', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '活跃标签上限（activeSet.cap）',
+              hint: '默认 200。多项目并行可调至 500（下次维护生效）。',
+              value: draft.activeSetCap,
+              min: 100,
+              max: 1000,
+              step: 50,
+              onChange: (value) => edit('activeSetCap', value),
               disabled,
             }),
           ),
@@ -1348,6 +1602,9 @@
       }
       return {
         inject: ['slots'],
+        // Exported for the bundle-contract tests: the pure retry decision is the
+        // piece the P0 fix depends on, so it must be testable without a browser.
+        retryPolicy: decideRetry,
         apply(ctx) {
           let slots = null;
           try {

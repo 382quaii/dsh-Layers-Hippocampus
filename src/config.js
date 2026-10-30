@@ -62,6 +62,8 @@ export const CONFIG_KEYS = Object.freeze([
   'retrieval',
   'context',
   'temp',
+  'decay',
+  'activeSet',
   'identity',
   'policy',
 ]);
@@ -97,6 +99,10 @@ export const DEFAULT_CONFIG = Object.freeze({
   retrieval: Object.freeze({ topK: 20 }),
   context: Object.freeze({ maxTokens: 4000, threshold: 0.85, target: 0.7, injectPrompt: true }),
   temp: Object.freeze({ ttlDays: 30, promotionWindowDays: 20 }),
+  // Decay curve and active-set size are policy knobs, but they are also first-class
+  // config: the UI edits them, so they must be declared and validated here.
+  decay: Object.freeze({ halfLifeDays: 30 }),
+  activeSet: Object.freeze({ cap: 200 }),
   identity: Object.freeze({ eventTimePolicy: 'content' }),
   policy: Object.freeze({}),
 });
@@ -249,7 +255,7 @@ function normaliseRaw(raw) {
   }
 
   const out = { ...nested };
-  for (const group of ['retrieval', 'context', 'temp', 'identity']) {
+  for (const group of ['retrieval', 'context', 'temp', 'decay', 'activeSet', 'identity']) {
     if (isPlainObject(nested[group])) out[group] = { ...nested[group] };
   }
   for (const [alias, path] of Object.entries(FLAT_ALIASES)) {
@@ -277,7 +283,7 @@ function normaliseRaw(raw) {
 export function resolveConfig(raw = {}, { env = process.env } = {}) {
   const input = normaliseRaw(raw);
 
-  for (const group of ['retrieval', 'context', 'temp', 'identity']) {
+  for (const group of ['retrieval', 'context', 'temp', 'decay', 'activeSet', 'identity']) {
     if (group in input && input[group] !== undefined && !isPlainObject(input[group])) {
       throw configError(ErrorCodes.CONFIG_INVALID_TYPE, `config.${group} must be an object`, { key: group });
     }
@@ -371,6 +377,21 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     );
   }
 
+  // Decay half-life and the active-set ceiling are policy values with config
+  // names: one declaration, one validator, and they land in `policy` below.
+  const decayIn = input.decay ?? {};
+  const decayHalfLifeDays = requireInteger(
+    decayIn.halfLifeDays === undefined ? defaults.decay.halfLifeDays : decayIn.halfLifeDays,
+    'decay.halfLifeDays',
+    { min: 7, max: 365 },
+  );
+  const activeSetIn = input.activeSet ?? {};
+  const activeSetCap = requireInteger(
+    activeSetIn.cap === undefined ? defaults.activeSet.cap : activeSetIn.cap,
+    'activeSet.cap',
+    { min: 100, max: 1000 },
+  );
+
   const policyIn = input.policy === undefined ? {} : input.policy;
   if (!isPlainObject(policyIn)) {
     throw configError(ErrorCodes.CONFIG_INVALID_TYPE, 'config.policy must be an object', { key: 'policy' });
@@ -445,6 +466,8 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
       injectPrompt: contextInjectPrompt,
     },
     temp: { ttlDays: tempTtlDays, promotionWindowDays: tempPromotionWindowDays },
+    decay: { halfLifeDays: decayHalfLifeDays },
+    activeSet: { cap: activeSetCap },
     identity: { eventTimePolicy },
     policy: policyIn,
   };
@@ -460,6 +483,8 @@ export function toMemoryOptions(config) {
   const policy = { ...config.policy };
   policy.identity = { ...(policy.identity ?? {}), eventTimePolicy: config.identity.eventTimePolicy };
   policy.temp = { ...(policy.temp ?? {}), ttlDays: config.temp.ttlDays, promotionWindowDays: config.temp.promotionWindowDays };
+  policy.decay = { ...(policy.decay ?? {}), halfLifeDays: config.decay.halfLifeDays };
+  policy.activeSet = { ...(policy.activeSet ?? {}), cap: config.activeSet.cap };
   return {
     dataDir: config.dataDir,
     policy,

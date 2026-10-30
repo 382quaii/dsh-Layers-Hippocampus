@@ -49,6 +49,8 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   'context.injectPrompt',
   'temp.ttlDays',
   'temp.promotionWindowDays',
+  'decay.halfLifeDays',
+  'activeSet.cap',
   'identity.eventTimePolicy',
 ]);
 
@@ -124,8 +126,25 @@ async function readJsonBody(req) {
   }
 }
 
-function fail(res, status, error) {
-  sendJson(res, status, { ok: false, error: asMemoryError(error).toJSON() });
+/**
+ * The one field the UI branches on. Every response carries it — including 400,
+ * 405, 409 and 500 — so a client never has to infer the engine's state from an
+ * HTTP status code. A bare 404 (route not mounted yet, or a stale bundle calling
+ * an old prefix) has no body and is treated as `pending` by the client, with a
+ * long window; that is the only case the protocol cannot carry a state.
+ */
+export function stateOf(runtime) {
+  const phase = runtime?.phase;
+  return phase === 'in_progress' || phase === 'ready' || phase === 'failed' ? phase : 'pending';
+}
+
+function sendState(res, status, runtime, body) {
+  const state = stateOf(runtime);
+  sendJson(res, status, { ...body, state, phase: state });
+}
+
+function fail(res, status, error, runtime) {
+  sendState(res, status, runtime, { ok: false, error: asMemoryError(error).toJSON() });
 }
 
 /**
@@ -146,31 +165,42 @@ export function createMemoryRoutes({ runtime, persist = null, logger = null }) {
 
   const statsHandler = async (req, res) => {
     if (req.method !== 'GET' && req.method !== 'HEAD') {
-      sendJson(res, 405, { ok: false, error: { code: 'MEM_E_INVALID_INPUT', message: 'use GET' } });
+      sendState(res, 405, runtime, { ok: false, error: { code: 'MEM_E_INVALID_INPUT', message: 'use GET' } });
       return;
     }
     try {
       const payload = await runtime.uiPayload();
-      sendJson(res, payload.ok ? 200 : 503, payload);
+      sendState(res, payload.ok ? 200 : 503, runtime, payload);
     } catch (error) {
       log(`stats failed: ${error?.message ?? error}`);
-      fail(res, 500, error);
+      fail(res, 500, error, runtime);
     }
   };
 
   const configHandler = async (req, res) => {
     try {
       if (req.method === 'GET' || req.method === 'HEAD') {
-        const payload = await runtime.uiPayload();
-        sendJson(res, payload.ok ? 200 : 503, {
-          ok: payload.ok,
-          phase: payload.phase,
-          config: payload.config ?? runtime.uiConfig(),
-        });
+        // Reads are always allowed: the form must be fillable while the store
+        // is still loading (otherwise the settings page would be blank on boot).
+        sendState(res, 200, runtime, { ok: true, config: runtime.uiConfig() });
         return;
       }
       if (req.method !== 'POST') {
-        sendJson(res, 405, { ok: false, error: { code: 'MEM_E_INVALID_INPUT', message: 'use GET or POST' } });
+        sendState(res, 405, runtime, { ok: false, error: { code: 'MEM_E_INVALID_INPUT', message: 'use GET or POST' } });
+        return;
+      }
+      // WRITE ISOLATION: a config write before READY is rejected loudly, never
+      // swallowed — the runtime cannot apply it to a store that is not open.
+      if (stateOf(runtime) !== 'ready') {
+        const state = stateOf(runtime);
+        sendState(res, 409, runtime, {
+          ok: false,
+          error: {
+            code: ErrorCodes.NOT_READY,
+            message: `memory is not ready (state=${state}); config write rejected, retry after READY`,
+            details: { state, retryable: state !== 'failed', operation: 'config-write' },
+          },
+        });
         return;
       }
       const body = await readJsonBody(req);
@@ -187,10 +217,9 @@ export function createMemoryRoutes({ runtime, persist = null, logger = null }) {
           persisted = { persisted: false, note: asMemoryError(error).message };
         }
       }
-      sendJson(res, 200, { ok: true, config: runtime.uiConfig(), ...persisted, applied: next });
+      sendState(res, 200, runtime, { ok: true, config: runtime.uiConfig(), ...persisted, applied: next });
     } catch (error) {
-      const status = String(error?.code ?? '').startsWith('MEM_E_CONFIG') ? 400 : 400;
-      fail(res, status, error);
+      fail(res, 400, error, runtime);
     }
   };
 
@@ -198,15 +227,15 @@ export function createMemoryRoutes({ runtime, persist = null, logger = null }) {
   // no sorting and touches no log — `view()` is a slice of an in-memory array.
   const graphHandler = async (req, res) => {
     if (req.method !== 'GET' && req.method !== 'HEAD') {
-      sendJson(res, 405, { ok: false, error: { code: 'MEM_E_INVALID_INPUT', message: 'use GET' } });
+      sendState(res, 405, runtime, { ok: false, error: { code: 'MEM_E_INVALID_INPUT', message: 'use GET' } });
       return;
     }
     try {
       const view = await runtime.graphPayload();
-      sendJson(res, view.ok ? 200 : 503, view);
+      sendState(res, view.ok ? 200 : 503, runtime, view);
     } catch (error) {
       log(`graph failed: ${error?.message ?? error}`);
-      fail(res, 500, error);
+      fail(res, 500, error, runtime);
     }
   };
 
@@ -214,15 +243,15 @@ export function createMemoryRoutes({ runtime, persist = null, logger = null }) {
   // state machine, so this handler never starts a second bootstrap by itself.
   const retryHandler = async (req, res) => {
     if (req.method !== 'POST') {
-      sendJson(res, 405, { ok: false, error: { code: 'MEM_E_INVALID_INPUT', message: 'use POST' } });
+      sendState(res, 405, runtime, { ok: false, error: { code: 'MEM_E_INVALID_INPUT', message: 'use POST' } });
       return;
     }
     try {
       const result = await runtime.retry();
-      sendJson(res, result.ok ? 202 : 409, result);
+      sendState(res, result.ok ? 202 : 409, runtime, result);
     } catch (error) {
       log(`retry failed: ${error?.message ?? error}`);
-      fail(res, 500, error);
+      fail(res, 500, error, runtime);
     }
   };
 
