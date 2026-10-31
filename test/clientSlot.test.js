@@ -300,6 +300,6 @@ test('the manifest points ./client at a real file and declares a web client', ()
   assert.equal(manifest.dsh.client.platform, 'web');
   assert.equal(manifest.dsh.client.immediately, undefined, 'the UI must not be boot-critical');
   assert.equal(manifest.name, 'dsh-layers-hippocampus');
-  assert.equal(manifest.version, '1.3.1');
+  assert.equal(manifest.version, '1.4.0');
   assert.ok(manifest.dsh.client.inject === undefined || Array.isArray(manifest.dsh.client.inject));
 });

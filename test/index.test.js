@@ -20,7 +20,7 @@ import {
 } from './helpers.js';
 
 test('index is rebuildable: a wiped index rebuilds to an identical digest', async () => {
-  const { memory, dir, cleanup } = await makeMemory();
+  const { memory, dir, cleanup } = await makeMemory({ config: { delete: { graceHours: 0 } } });
   try {
     await memory.remember({ content: 'pnpm is preferred for monorepos', tags: ['preference:tooling'], salience: 0.8 });
     await memory.remember({ content: 'the deploy step needs a manual approval', tags: ['project:dsh'], salience: 0.6 });
@@ -50,7 +50,7 @@ test('index is rebuildable: a wiped index rebuilds to an identical digest', asyn
 });
 
 test('no line-number pointers: eventIds survive a rewrite while line positions drift', async () => {
-  const { memory, dir, cleanup } = await makeMemory();
+  const { memory, dir, cleanup } = await makeMemory({ policy: { delete: { graceHours: 0 } } });
   try {
     const first = await memory.remember({ content: 'first episode', tags: ['stream'], salience: 0.4 });
     const second = await memory.remember({ content: 'second episode', tags: ['stream'], salience: 0.5 });

@@ -41,7 +41,7 @@ test('P0: the host-facing definitions are object-rooted, including memory_admin'
   const host = fakeCtx();
   try {
     await apply(host.ctx, { dataDir: dir, maintenanceCron: '0 */6 * * *', autoMaintainOnBoot: false });
-    assert.equal(host.tools.size, 6);
+    assert.equal(host.tools.size, 7);
     for (const [name, definition] of host.tools) {
       assert.equal(definition.parameters.type, 'object', `${name} root is an object`);
       assert.equal(typeof definition.parameters.properties, 'object');

@@ -10,7 +10,7 @@ import test from 'node:test';
 import { makeMemory } from './helpers.js';
 
 test('deleting a high-salience episode distils a semantic summary first', async () => {
-  const { memory, cleanup } = await makeMemory();
+  const { memory, cleanup } = await makeMemory({ policy: { delete: { graceHours: 0 } } });
   try {
     const episode = await memory.remember({
       content: 'the team always runs pnpm -r build before publishing',
@@ -52,7 +52,7 @@ test('deleting a high-salience episode distils a semantic summary first', async 
 });
 
 test('archive mode is reversible, purge is not', async () => {
-  const { memory, cleanup } = await makeMemory();
+  const { memory, cleanup } = await makeMemory({ policy: { delete: { graceHours: 0 } } });
   try {
     const episode = await memory.remember({ content: 'temporary deployment note', tags: ['topic:deploy'], salience: 0.4 });
     await memory.maintain({ reason: 'fixture' });
@@ -83,7 +83,7 @@ test('archive mode is reversible, purge is not', async () => {
 
 test('strict consolidation pauses the job and resumes after the policy is relaxed', async () => {
   const { memory, cleanup } = await makeMemory({
-    policy: { delete: { consolidationMode: 'strict' } },
+    policy: { delete: { consolidationMode: 'strict', graceHours: 0 } },
   });
   try {
     const episode = await memory.remember({ content: 'critical delivery pattern explanation', tags: ['pattern:delivery'], salience: 0.85 });
@@ -110,7 +110,7 @@ test('strict consolidation pauses the job and resumes after the policy is relaxe
 });
 
 test('replaying a finished deletion job changes nothing', async () => {
-  const { memory, cleanup } = await makeMemory();
+  const { memory, cleanup } = await makeMemory({ policy: { delete: { graceHours: 0 } } });
   try {
     const episode = await memory.remember({ content: 'one-off episode with salience', tags: ['t'], salience: 0.9 });
     await memory.maintain({ reason: 'fixture' });
@@ -130,7 +130,7 @@ test('replaying a finished deletion job changes nothing', async () => {
 });
 
 test('a wrong id is rejected before any mutation', async () => {
-  const { memory, cleanup } = await makeMemory();
+  const { memory, cleanup } = await makeMemory({ policy: { delete: { graceHours: 0 } } });
   try {
     const episode = await memory.remember({ content: 'keep me', tags: ['t'], salience: 0.5 });
     await memory.maintain({ reason: 'fixture' });

@@ -32,6 +32,7 @@ export const MEMORY_API = Object.freeze({
 
 /** Only these keys may change over HTTP; anything else is rejected, not dropped. */
 export const EDITABLE_CONFIG_KEYS = Object.freeze([
+  'dataDir',
   'maintenanceCron',
   'briefing',
   'promptSection',
@@ -51,6 +52,15 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   'temp.promotionWindowDays',
   'decay.halfLifeDays',
   'activeSet.cap',
+  'raw.mode',
+  'raw.minSalience',
+  'raw.maxTurnKb',
+  'raw.maxBytesPerDay',
+  'raw.maxTotalMb',
+  'raw.retentionDays',
+  'raw.maxScanMb',
+  'delete.graceHours',
+  'review.enabled',
   'identity.eventTimePolicy',
 ]);
 
@@ -135,7 +145,7 @@ async function readJsonBody(req) {
  */
 export function stateOf(runtime) {
   const phase = runtime?.phase;
-  return phase === 'in_progress' || phase === 'ready' || phase === 'failed' ? phase : 'pending';
+  return phase === 'in_progress' || phase === 'ready' || phase === 'failed' || phase === 'migrating' ? phase : 'pending';
 }
 
 function sendState(res, status, runtime, body) {
@@ -205,6 +215,23 @@ export function createMemoryRoutes({ runtime, persist = null, logger = null }) {
       }
       const body = await readJsonBody(req);
       const patch = validatePatch(body.patch ?? body);
+      // dataDir is not a live config value: it starts a background migration and
+      // returns 202 immediately. The request never waits on the copy.
+      if (patch.dataDir !== undefined) {
+        if (Object.keys(patch).length !== 1) {
+          sendState(res, 400, runtime, {
+            ok: false,
+            error: {
+              code: ErrorCodes.INVALID_INPUT,
+              message: 'dataDir must be migrated on its own: send only { dataDir } in this request',
+            },
+          });
+          return;
+        }
+        const descriptor = runtime.startMigration(patch.dataDir);
+        sendState(res, 202, runtime, { ok: true, migration: descriptor, state: 'migrating' });
+        return;
+      }
       const next = await runtime.updateConfig(patch);
       let persisted = { persisted: false, note: 'config applied for this process only' };
       if (persist) {

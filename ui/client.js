@@ -121,6 +121,10 @@
             attempts: nextMiss,
           };
         }
+        if (state === 'migrating') {
+          // Background data-dir migration: long wait; the panel renders progress.
+          return { kind: 'pending', delay: 1500, miss: 0, attempts: 0, migrating: true };
+        }
         if (state === 'pending' || state === 'in_progress') {
           return { kind: 'pending', delay: 2000, miss: 0, attempts: 0 };
         }
@@ -1019,6 +1023,27 @@
 
       // ---- panel -------------------------------------------------------------
 
+      /** Live progress for a UI-triggered data-dir migration. */
+      function MigrationCard(props) {
+        const migration = props.migration || {};
+        const total = Number(migration.totalBytes) || 0;
+        const copied = Number(migration.copiedBytes) || 0;
+        const percent = total > 0 ? Math.min(100, Math.round((copied / total) * 100)) : 0;
+        const failed = migration.status === 'failed';
+        return h(
+          'div',
+          { style: { ...cardStyle, borderColor: failed ? palette.danger : palette.accent } },
+          h('div', { style: { fontWeight: 600, marginBottom: 6, color: failed ? palette.danger : palette.text } }, failed ? '数据迁移失败' : '正在迁移数据目录…'),
+          h('div', { style: { ...labelStyle, marginBottom: 6 } }, `${migration.from ?? '—'} → ${migration.to ?? '—'}（${migration.phase ?? 'copying'}）`),
+          h(
+            'div',
+            { style: { height: 8, borderRadius: 999, background: palette.border, overflow: 'hidden', marginBottom: 6 } },
+            h('div', { style: { width: `${percent}%`, height: '100%', background: failed ? palette.danger : palette.accent, transition: 'width 400ms ease' } }),
+          ),
+          h('div', { style: { ...labelStyle, marginBottom: 0 } }, failed ? `${migration.error?.code ?? 'MEM_E_MIGRATION_IO'}: ${migration.error?.message ?? ''}` : `${percent}% · 迁移期间记忆写入暂停，完成后自动切换`),
+        );
+      }
+
       function MemoryPanel() {
         const state = useMemoryStats();
         const payload = state.payload;
@@ -1027,6 +1052,9 @@
         const limit = (payload && payload.config && payload.config.graphMaxEdges) || 500;
         const graphState = useGraph(limit, ready);
 
+        if (state.state === 'migrating') {
+          return h('div', { style: { padding: 16 } }, h(MigrationCard, { migration: payload?.migration ?? state.migration }));
+        }
         if (!ready) {
           return h(
             'div',
@@ -1197,6 +1225,13 @@
           activeSetCap: Number((config.activeSet && config.activeSet.cap) ?? 200),
           maxRecallTopK: Number(config.maxRecallTopK),
           retrievalTopK: Number((config.retrieval && config.retrieval.topK) ?? config.retrievalTopK),
+          dataDir: config.dataDir,
+          rawMode: (config.raw && config.raw.mode) ?? 'salience',
+          rawMinSalience: Number((config.raw && config.raw.minSalience) ?? 0.6),
+          rawMaxTotalMb: Number((config.raw && config.raw.maxTotalMb) ?? 256),
+          rawRetentionDays: Number((config.raw && config.raw.retentionDays) ?? 30),
+          deleteGraceHours: Number((config.delete && config.delete.graceHours) ?? 24),
+          reviewEnabled: (config.review && config.review.enabled) !== false,
           context: {
             maxTokens: Number(config.context.maxTokens),
             threshold: Number(config.context.threshold),
@@ -1225,6 +1260,10 @@
         { key: 'context.target', label: '收敛目标', min: 0, max: 0.98 },
         { key: 'temp.ttlDays', label: 'L2.5 隔离期', min: 1, max: 3650 },
         { key: 'temp.promotionWindowDays', label: '晋升窗口', min: 0, max: 3650 },
+        { key: 'rawMinSalience', label: 'raw 最小显著度', min: 0, max: 1 },
+        { key: 'rawMaxTotalMb', label: 'raw 总量', min: 16, max: 4096 },
+        { key: 'rawRetentionDays', label: 'raw 保留期', min: 1, max: 365 },
+        { key: 'deleteGraceHours', label: '删除宽限期', min: 0, max: 168 },
       ];
 
       const readPath = (object, dotted) => dotted.split('.').reduce((cursor, part) => (cursor == null ? cursor : cursor[part]), object);
@@ -1286,6 +1325,29 @@
             return;
           }
           setSaving(true);
+          // dataDir is a migration, not a live value: it goes in its own request.
+          const dirChanged = typeof draft.dataDir === 'string' && draft.dataDir.trim() && draft.dataDir !== (serverConfig.dataDir ?? '');
+          if (dirChanged) {
+            try {
+              const { status, body } = await getJson(API.config, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ patch: { dataDir: draft.dataDir.trim() } }),
+              });
+              if (status === 202 && body && body.ok) {
+                setStatus({ tone: 'warn', text: `迁移已启动（state=migrating）：${body.migration?.to ?? draft.dataDir}；完成后数据目录自动切换` });
+                announce('reconnect');
+              } else {
+                const error = (body && body.error) || {};
+                setStatus({ tone: 'error', text: `${error.code || 'MEM_E_MIGRATION'}: ${error.message || `HTTP ${status}`}` });
+              }
+            } catch (error) {
+              setStatus({ tone: 'error', text: String((error && error.message) || error) });
+            } finally {
+              setSaving(false);
+            }
+            return;
+          }
           const patch = {
             maintenanceCron: String(draft.maintenanceCron).trim(),
             briefing: Boolean(draft.briefing),
@@ -1306,6 +1368,12 @@
             'context.injectPrompt': Boolean(draft.context.injectPrompt),
             'temp.ttlDays': Number(draft.temp.ttlDays),
             'temp.promotionWindowDays': Number(draft.temp.promotionWindowDays),
+            'raw.mode': String(draft.rawMode),
+            'raw.minSalience': Number(draft.rawMinSalience),
+            'raw.maxTotalMb': Number(draft.rawMaxTotalMb),
+            'raw.retentionDays': Number(draft.rawRetentionDays),
+            'delete.graceHours': Number(draft.deleteGraceHours),
+            'review.enabled': Boolean(draft.reviewEnabled),
             'identity.eventTimePolicy': draft.eventTimePolicy,
           };
           try {
@@ -1485,6 +1553,84 @@
               label: '注入上下文预算段（context.injectPrompt）',
               checked: draft.context.injectPrompt,
               onChange: (value) => edit('context.injectPrompt', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            { title: '存储位置（迁移）', hint: '换硬盘时改这里：保存后启动后台迁移，前端显示进度，完成后自动切换；旧目录保留为备份。' },
+            h(TextInput, {
+              label: 'dataDir（绝对路径）',
+              hint: '必须是绝对路径；目标不能是当前目录的子目录，也不能已有数据。迁移中 state=migrating。',
+              value: draft.dataDir ?? '',
+              onChange: (value) => edit('dataDir', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            { title: '原始回合留存（raw）', hint: '只做取证，不参与索引；高价值/代码/报错/工具输出才会留，且有日/总量/保留期上限。' },
+            h(Select, {
+              label: 'raw.mode',
+              hint: 'salience：只留高价值轮次；all：全留（仍受上限）；off：关闭 deep_raw。',
+              value: draft.rawMode,
+              options: [
+                { value: 'salience', label: 'salience — 只留高价值（默认）' },
+                { value: 'all', label: 'all — 全量（受预算限制）' },
+                { value: 'off', label: 'off — 不留 raw' },
+              ],
+              onChange: (value) => edit('rawMode', value),
+              disabled,
+            }),
+            h(Field, {
+              label: 'raw 最小显著度',
+              value: draft.rawMinSalience,
+              min: 0,
+              max: 1,
+              step: 0.05,
+              onChange: (value) => edit('rawMinSalience', value),
+              disabled,
+            }),
+            h(Field, {
+              label: 'raw 总量上限（MB）',
+              value: draft.rawMaxTotalMb,
+              min: 16,
+              max: 4096,
+              step: 16,
+              suffix: 'MB',
+              onChange: (value) => edit('rawMaxTotalMb', value),
+              disabled,
+            }),
+            h(Field, {
+              label: 'raw 保留期（天）',
+              value: draft.rawRetentionDays,
+              min: 1,
+              max: 365,
+              step: 1,
+              suffix: '天',
+              onChange: (value) => edit('rawRetentionDays', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            { title: '删除与复习', hint: '两阶段删除先挂起，宽限期内 restore 可取消；复习排期由引擎推进。' },
+            h(Field, {
+              label: '删除宽限期（小时）',
+              hint: '0 = 立即执行（旧行为）；默认 24 小时。',
+              value: draft.deleteGraceHours,
+              min: 0,
+              max: 168,
+              step: 1,
+              suffix: '小时',
+              onChange: (value) => edit('deleteGraceHours', value),
+              disabled,
+            }),
+            h(Toggle, {
+              label: '启用间隔重复复习（1,2,4,7,15,30 天）',
+              hint: 'reinforce 会让事件进入下一档；到期项由 maintain 汇总到 memory_admin action=reviews。',
+              checked: draft.reviewEnabled,
+              onChange: (value) => edit('reviewEnabled', value),
               disabled,
             }),
           ),

@@ -116,18 +116,19 @@ test('an invalid policy is rejected at activation, before any store is created',
   }
 });
 
-test('apply registers six tools and both prompt layers, and dispose removes them', async () => {
+test('apply registers seven tools and both prompt layers, and dispose removes them', async () => {
   const dir = tempDir('ctx');
   const ctx = fakeCtx();
   try {
     assert.deepEqual(inject, ['tools', 'systemPrompt']);
     await apply(ctx, { dataDir: dir, maintenanceCron: '0 */6 * * *', autoMaintainOnBoot: false });
-    assert.equal(ctx.toolsMap.size, 6, 'the tool surface exists immediately, before the store is ready');
+    assert.equal(ctx.toolsMap.size, 7, 'the tool surface exists immediately, before the store is ready');
     // Startup is asynchronous; await it the way a caller would.
     await getRuntime(ctx).ready;
 
     assert.deepEqual([...ctx.toolsMap.keys()].sort(), [
       'memory_admin',
+      'memory_capture',
       'memory_checkpoint',
       'memory_forget',
       'memory_recall',
@@ -148,7 +149,7 @@ test('the tool surface round-trips a memory through JSON', async () => {
   const dir = tempDir('roundtrip');
   const ctx = fakeCtx();
   try {
-    await apply(ctx, { dataDir: dir, maintenanceCron: '0 */6 * * *', autoMaintainOnBoot: false, policy: { activeSet: { minEvents: 1 } } });
+    await apply(ctx, { dataDir: dir, maintenanceCron: '0 */6 * * *', autoMaintainOnBoot: false, delete: { graceHours: 0 }, policy: { activeSet: { minEvents: 1 } } });
     await getRuntime(ctx).ready;
     const now = new Date().toISOString(); // the tool takes the event time from its payload
     const remembered = await ctx.call('memory_remember', {

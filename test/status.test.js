@@ -18,6 +18,9 @@ const PANEL_KEYS = [
   'maintenance',
   'generations',
   'graph',
+  'raw',
+  'reviews',
+  'pendingDeletes',
 ].sort();
 
 test('the status panel has the full documented shape', async () => {

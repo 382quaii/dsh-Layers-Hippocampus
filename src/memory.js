@@ -32,6 +32,9 @@ import { DeadLetterQueue, IdentityLedger, TombstoneStore } from './log/identityL
 import { IndexStore } from './index/indexStore.js';
 import { IndexManager } from './index/indexManager.js';
 import { GraphCache, GRAPH_HARD_CAP, GRAPH_TOP_NEIGHBORS } from './graph.js';
+import { RawStore } from './rawStore.js';
+import { ReviewSchedule } from './schedule.js';
+import { PendingDeletes } from './pendingDelete.js';
 import { foldRecords } from './index/buildIndex.js';
 import { Maintenance } from './maintenance.js';
 import { recall as runRecall, tokenize } from './retrieval.js';
@@ -217,6 +220,18 @@ export class Memory {
     this.semanticStore = new SemanticStore({ root: this.paths.semantic });
     // Offline graph projection: rebuilt by maintain(), read as a slice by the API.
     this.graph = new GraphCache({ dataDir: this.dataDir, clock: this.clock });
+    // Forensic raw turns: never indexed, never loaded at boot, only deep_raw/prune.
+    this.raw = new RawStore({ dataDir: this.dataDir, clock: this.clock, getConfig: () => this.config });
+    // Engine-owned review schedule and pending-delete queue.
+    this.reviews = new ReviewSchedule({
+      file: path.join(this.paths.state, 'reviews.json'),
+      clock: this.clock,
+      getPolicy: () => this.policy,
+    });
+    this.pendingDeletes = new PendingDeletes({
+      file: path.join(this.paths.state, 'pending-deletes.json'),
+      clock: this.clock,
+    });
     this.tempStore = new TempSemanticStore({
       root: this.paths.semantic,
       clock: this.clock,
@@ -548,6 +563,8 @@ export class Memory {
     }
     await this.logStore.append(records);
     await this.indexManager.applyRecords(records);
+    // A reinforcement IS a review: advance the spaced-repetition step.
+    for (const target of ids) this.reviews.advance(target, { now: this.clock.now() });
     this.refreshBriefing();
     return {
       reinforced: ids,
@@ -556,19 +573,42 @@ export class Memory {
     };
   }
 
-  /** Delete: phase 1-4 pipeline, then a rebuild so the published index agrees. */
+  /** Delete: two-phase by default (grace countdown), then the 4-phase pipeline. */
   async forget({ eventIds, mode = 'purge', reason = 'unspecified' }) {
     this.assertOpen();
     const ids = this.normaliseIds(eventIds);
+    // Validate BEFORE parking: a typo must fail now, not silently expire 24h later.
+    const snapshot = await this.logStore.snapshot();
+    const known = new Set(
+      snapshot.records.filter((record) => record.type === 'episode').map((record) => record.event_id),
+    );
+    const missing = ids.filter((id) => !known.has(id));
+    if (missing.length > 0) {
+      throw new MemoryError(ErrorCodes.NOT_FOUND, 'cannot delete unknown event ids', { missing });
+    }
+    const graceHours = this.policy.delete?.graceHours ?? 24;
+    if (graceHours > 0) {
+      // Phase 0: park it. Nothing is tombstoned yet; `restore` just cancels.
+      const pending = this.pendingDeletes.request({ eventIds: ids, mode, reason, graceHours });
+      return {
+        state: 'pending_delete',
+        pending,
+        dueAt: pending.dueAt,
+        graceHours,
+        note: 'cancel with restore before dueAt; maintenance purges after the grace period',
+      };
+    }
     const job = await this.deletePipeline.request({ eventIds: ids, mode, reason });
     const maintenance = await this.maintenance.run({ reason: `forget:${job.id}` });
-    return { job: this.publicJob(job), maintenance: this.publicMaintenance(maintenance) };
+    return { state: 'deleted', job: this.publicJob(job), maintenance: this.publicMaintenance(maintenance) };
   }
 
-  /** Undo a tombstone while the bytes still exist (archive mode or pre-purge). */
+  /** Undo a tombstone, or cancel a pending delete before its deadline. */
   async restore({ eventIds, reason = 'rollback' }) {
     this.assertOpen();
     const ids = this.normaliseIds(eventIds);
+    const cancelled = this.pendingDeletes.cancel(ids);
+    if (cancelled.length > 0) return { restored: [], cancelled, note: 'pending delete cancelled before its deadline' };
     const snapshot = await this.logStore.snapshot();
     const present = new Set(
       snapshot.records.filter((record) => record.type === 'episode').map((record) => record.event_id),
@@ -641,6 +681,22 @@ export class Memory {
   }
 
   /**
+   * Raw turn capture (forensic layer). Gated and capped by `raw.*` config; a
+   * gated turn returns a verdict instead of throwing, an I/O failure throws.
+   */
+  async captureRaw(turn = {}) {
+    this.assertOpen();
+    return this.raw.capture(turn);
+  }
+
+  /** Bounded deep scan over raw shards; never claims completeness. */
+  async deepRaw(query = {}) {
+    this.assertOpen();
+    const tombstones = new Set(this.tombstones.ids());
+    return this.raw.scan({ ...query, isTombstoned: (eventId) => tombstones.has(eventId) });
+  }
+
+  /**
    * Online association wake-up: for every tag the query already touches, read the
    * cached graph and take its three strongest neighbours. The neighbours enter the
    * candidate pool with a 0.5 penalty (retrieval applies it), so an associative
@@ -703,6 +759,35 @@ export class Memory {
       report.activeTask = this.demoteStaleTask();
     } catch (error) {
       report.activeTaskError = error instanceof Error ? error.message : String(error);
+    }
+    // v1.4.0 offline jobs: raw retention, spaced-repetition due list, and the
+    // promotion of expired pending deletes into the 4-phase pipeline.
+    try {
+      report.rawPrune = await this.raw.prune({ now: this.clock.now() });
+    } catch (error) {
+      report.rawPruneError = error instanceof Error ? error.message : String(error);
+    }
+    try {
+      const due = this.pendingDeletes.due(this.clock.now());
+      const promoted = [];
+      for (const item of due) {
+        await this.deletePipeline.request({ eventIds: item.eventIds, mode: item.mode, reason: item.reason });
+        this.pendingDeletes.remove(item.id);
+        promoted.push({ id: item.id, events: item.eventIds.length });
+      }
+      report.pendingDeletes = { promoted };
+      if (promoted.length > 0) {
+        // Purge rewrites the log, so the index must be rebuilt before anything
+        // else in this maintenance pass reads it.
+        report.pendingDeletes.maintenance = this.publicMaintenance(await this.maintenance.run({ reason: 'pending-delete' }));
+      }
+    } catch (error) {
+      report.pendingDeletesError = error instanceof Error ? error.message : String(error);
+    }
+    try {
+      report.reviews = this.reviews.tick({ events: this.indexManager.snapshot()?.events ?? [], now: this.clock.now() });
+    } catch (error) {
+      report.reviewsError = error instanceof Error ? error.message : String(error);
     }
     this.refreshBriefing();
     return report;
@@ -917,6 +1002,10 @@ export class Memory {
         generations: generation,
         // Cached graph summary: counts only, so the panel stays cheap.
         graph: this.graph.status({ limit: this.config?.graphMaxEdges ?? null, indexGeneration: index.generation ?? null }),
+        // v1.4.0 surfaces: raw shards, review queue, pending deletes.
+        raw: { ...this.raw.stats(), mode: this.config?.raw?.mode ?? 'salience' },
+        reviews: this.reviews.status({ now }),
+        pendingDeletes: this.pendingDeletes.status(now),
       },
     };
   }

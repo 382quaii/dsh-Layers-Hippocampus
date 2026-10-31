@@ -4,7 +4,7 @@
 
 | | |
 | --- | --- |
-| 版本 | **1.3.1** |
+| 版本 | **1.4.0** |
 | 包名 | `dsh-layers-hippocampus`（npm 只允许小写；仓库名保留 `dsh-Layers-Hippocampus`，*Hippocampus* 双 **p**） |
 | 仓库 | <https://github.com/382quaii/dsh-Layers-Hippocampus> |
 | 许可证 | MIT |
@@ -18,7 +18,7 @@
 ### 从 GitHub
 
 ```bash
-pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.3.1"
+pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.4.0"
 ```
 
 ### 从 npm
@@ -57,10 +57,27 @@ node scripts/wait-for-routes.mjs
 | --- | --- |
 | `remember` | 追加一条长期记忆（内容哈希幂等）；可带 `media_url` + `media_type` 指向附件 |
 | `checkpoint` | 记录**唯一**进行中的重任务：`task_id`、`progress`（0–100）、`updated_at` |
-| `recall` | 关键词 + 标签检索，衰减加权，含图谱联想 |
-| `reinforce` | 确认一次记忆，不重写内容 |
-| `forget` / `restore` | 墓碑与反墓碑 |
-| `admin` | `status` / `maintain` / `active_tags` / `semantic` / `active_task` |
+| `recall` | 关键词 + 标签检索，衰减加权，含图谱联想；`mode: "deep_raw"` 走受限 raw 扫描 |
+| `capture` | 把**一轮原始对话**存入取证层（受门控与预算限制，不进索引） |
+| `reinforce` | 确认一次记忆，不重写内容，并推进复习档位 |
+| `forget` / `restore` | 两阶段删除（`pending_delete` 倒计时）与取消/反墓碑 |
+| `admin` | `status` / `maintain` / `active_tags` / `semantic` / `active_task` / `reviews` / `pending_deletes` |
+
+### 原始回合留存（raw）与 `deep_raw`
+
+- 独立日分片 `raw/YYYY-MM-DD.jsonl`，**不进主日志、不进索引、启动不加载**；只有 `deep_raw` 和 `maintain()` 的淘汰会读它。
+- 门控 `raw.mode`：`salience`（默认，高显著度 / 代码 / 堆栈 / 工具输出才留）、`all`、`off`；`force: true` 可单条强留。
+- 四道闸：单轮 `maxTurnKb`（超出存 head+tail 各 8KB）、每日 `maxBytesPerDay`、总量 `maxTotalMb`、保留期 `retentionDays`（代码分片保留 90 天）；内容哈希去重、密钥类长串 redaction。
+- `memory_recall mode="deep_raw"` 从新到旧扫描，预算 `raw.maxScanMb` / 5000 轮；预算耗尽返回 `truncated: true` 与扫描量，**不假装全量**；raw 关闭时返回 `MEM_E_RAW_DISABLED`。
+
+### 两阶段删除与间隔重复
+
+- `forget` 先挂起（默认 24h，`delete.graceHours`），`restore` 在到期前直接取消；到期由 `maintain()` 推进到 tombstone→archive→consolidation→purge。未知 id 在挂起前就报 `MEM_E_NOT_FOUND`。
+- 复习排期 `1,2,4,7,15,30` 天，持久化在 `state/reviews.json`；`reinforce` 推进一档，`maintain()` 汇总到期项，`memory_admin action="reviews"` 可查。
+
+### 数据目录迁移（UI）
+
+设置页 `dataDir` 可编辑：保存后返回 **202 + state=migrating**，后台 `fs.promises.cp` 拷贝、两端 `recordCount` 校验、写入 `.migration-complete` 后才切换 `dataDir` 并重开存储；校验失败删除目标、旧目录仍权威；源目录保留为备份。并发请求由 `.migration.lock` 阻断（`MEM_E_MIGRATION_LOCKED`），面板显示进度条。
 
 `active_task` 直查底层索引，**不受活跃集合 cap 200 限制**；写入新 checkpoint 会降级旧记录，7 天未刷新由 `maintain()` 自动降级，模型的 `forget` 只是 happy path。
 
@@ -117,6 +134,16 @@ node scripts/wait-for-routes.mjs
 | `context.injectPrompt` | `true` | 布尔 |
 | `temp.ttlDays` / `temp.promotionWindowDays` | `30` / `20` | promotion ≤ ttl |
 | `identity.eventTimePolicy` | `content` | `content` \| `explicit` \| `ingest` |
+| `raw.mode` | `salience` | `off` \| `salience` \| `all` |
+| `raw.minSalience` | `0.6` | 0 – 1 |
+| `raw.maxTurnKb` | `64` | 8 – 1024 |
+| `raw.maxBytesPerDay` | `8` | 1 – 128 MB |
+| `raw.maxTotalMb` | `256` | 16 – 4096 MB |
+| `raw.retentionDays` | `30` | 1 – 365（code 分片保留 90 天） |
+| `raw.maxScanMb` | `16` | 1 – 256 MB |
+| `delete.graceHours` | `24` | 0 – 168（0 = 立即执行） |
+| `review.enabled` | `true` | 布尔 |
+| `migration.timeoutMs` | `600000` | 10000 – 3600000 |
 
 错误码稳定：`MEM_E_CONFIG_INVALID_CRON`、`MEM_E_CONFIG_OUT_OF_RANGE`、`MEM_E_CONFIG_UNKNOWN_KEY` 等。
 
@@ -210,7 +237,7 @@ Cron **和** 空闲 Dream 触发调用同一个入口 `runtime.runMaintenance(so
 ## 开发与验证
 
 ```bash
-npm test      # node test/run.mjs —— 133 个进程内用例，30 秒看门狗
+npm test      # node test/run.mjs —— 142 个进程内用例，30 秒看门狗
 npm run check # 语法检查 + 全量测试
 ```
 
@@ -231,7 +258,7 @@ node scripts/check-binding.mjs --port 55879
 
 ## 变更记录
 
-见 [CHANGELOG.md](CHANGELOG.md)（当前 **1.3.1**：修复冷启动 404 与前端 404 死锁；1.3.0：折叠 / 联想 / 月记）。
+见 [CHANGELOG.md](CHANGELOG.md)（当前 **1.4.0**：raw 原始回合取证 / 间隔重复 / 两阶段删除 / UI 数据目录迁移；1.3.1：冷启动 404；1.3.0：折叠 / 联想 / 月记）。
 
 ## 许可
 

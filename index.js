@@ -27,8 +27,10 @@
  * must resolve standalone under pnpm's strict node_modules layout.
  */
 
+import path from 'node:path';
 import { resolveConfig, toMemoryOptions, DEFAULT_CONFIG } from './src/config.js';
 import { migrateDataDir } from './src/migration.js';
+import { MigrationRunner } from './src/migrationRunner.js';
 import { CronScheduler } from './src/scheduler.js';
 import { asMemoryError, ErrorCodes, MemoryError } from './src/errors.js';
 import { Memory } from './src/memory.js';
@@ -146,7 +148,19 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
     started: false,
     stopped: false,
     retrying: false,
+    /** Last UI-triggered migration snapshot (state/migration.json), if any. */
+    migration: null,
+    /** Set by apply(): persists config patches through configEditor. */
+    persist: null,
   };
+
+  const migrationRunner = new MigrationRunner({
+    stateFile: path.join(config.dataDir, 'state', 'migration.json'),
+    clock: clock ?? { now: () => Date.now() },
+    logger: ctx?.logger ?? null,
+  });
+  runtime.migrationRunner = migrationRunner;
+  runtime.migration = migrationRunner.read();
 
   let resolveReady;
   let rejectReady;
@@ -296,7 +310,9 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
       runtime.readyAt = memory.clock.now();
       runtime.scheduler = new CronScheduler({
         clock: memory.clock,
-        getCronExpression: () => config.maintenanceCron,
+        // Read through runtime.config: applyConfig() swaps that object, the
+        // capture below must never pin the boot-time cron.
+        getCronExpression: () => runtime.config.maintenanceCron,
         run: () => runtime.runMaintenance('cron'),
         logger: {
           info: (message) => ctx?.logger?.info?.(message),
@@ -369,6 +385,7 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
     // value on purpose: the handshake uses one name, logs keep the other.
     state: runtime.phase,
     ready: runtime.phase === 'ready',
+    migrating: runtime.phase === 'migrating',
     readyAt: runtime.readyAt,
     error: runtime.phaseError ? asMemoryError(runtime.phaseError).toJSON() : null,
     maintenanceInFlight: runtime.maintenanceInFlight,
@@ -378,12 +395,22 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
   /** UI cards read exactly this: one source of truth (no panel-specific math). */
   runtime.uiPayload = async () => {
     const view = runtime.phaseView();
-    if (runtime.phase !== 'ready') return { ok: false, ...view };
+    if (runtime.phase !== 'ready') {
+      // Migration is a first-class state: the panel needs its progress even
+      // though the store is offline for writes.
+      return { ok: false, ...view, migration: runtime.migrationStatus() };
+    }
     try {
       const status = await memory.status();
-      return { ok: true, ...view, panel: status.panel, briefing: memory.briefing(), config: uiConfig(config) };
+      return {
+        ok: true,
+        ...view,
+        panel: { ...status.panel, migration: runtime.migrationStatus() },
+        briefing: memory.briefing(),
+        config: uiConfig(runtime.config),
+      };
     } catch (error) {
-      return { ok: false, ...view, error: asMemoryError(error).toJSON() };
+      return { ok: false, ...view, error: asMemoryError(error).toJSON(), migration: runtime.migrationStatus() };
     }
   };
 
@@ -444,6 +471,82 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
     runtime.applyConfig(next);
     runtime.rawConfig = merged;
     return next;
+  };
+
+  /**
+   * UI-triggered data-dir migration. Returns as soon as the background job is
+   * accepted (HTTP 202); the copy/verify/reload continues out of band and the
+   * caller polls `state` until it is `ready` again.
+   */
+  runtime.startMigration = (targetDir) => {
+    if (runtime.phase === 'migrating') {
+      throw new MemoryError(ErrorCodes.MIGRATION_LOCKED, 'a migration is already running', { to: runtime.migration?.to ?? null });
+    }
+    if (runtime.phase !== 'ready') {
+      throw runtime.notReady('migrate');
+    }
+    const from = runtime.config.dataDir;
+    const descriptor = migrationRunner.start({
+      from,
+      to: targetDir,
+      timeoutMs: runtime.config.migration.timeoutMs,
+      onSuccess: async (job) => {
+        try {
+          await runtime.completeMigration(job);
+        } catch (error) {
+          runtime.migration = { ...job, status: 'failed', error: { code: asMemoryError(error).code, message: error.message } };
+          runtime.phase = 'ready';
+          emit({ type: 'migration', migration: runtime.migration });
+          ctx?.logger?.error?.(`hippocampus: migration reload failed: ${error?.message ?? error}`);
+        }
+      },
+      onFailure: async (job) => {
+        // The old store is still authoritative; keep serving it.
+        runtime.migration = job;
+        runtime.phase = 'ready';
+        emit({ type: 'migration', migration: job });
+      },
+    });
+    runtime.phase = 'migrating';
+    runtime.migration = descriptor;
+    emit({ type: 'migration', migration: descriptor });
+    return descriptor;
+  };
+
+  /** Verify + switch: only called after the runner counted both logs. */
+  runtime.completeMigration = async (job) => {
+    const merged = mergeRaw(cloneRaw(runtime.rawConfig), { dataDir: job.to });
+    const next = resolveConfig(merged);
+    const nextOptions = toMemoryOptions(next);
+    try {
+      if (typeof runtime.persist === 'function') await runtime.persist({ dataDir: job.to });
+    } catch (error) {
+      // Persistence failing must not leave two authoritative stores: report it.
+      ctx?.logger?.warn?.(`hippocampus: migration persisted=false: ${error?.message ?? error}`);
+    }
+    try {
+      memory.close();
+    } catch {
+      /* the old store is read-mostly */
+    }
+    memory = new Memory({ dataDir: next.dataDir, policy: nextOptions.policy, config: nextOptions.config, clock });
+    runtime.memory = memory;
+    runtime.config = next;
+    runtime.rawConfig = merged;
+    await memory.init();
+    if (runtime.scheduler) memory.attachScheduler(runtime.scheduler);
+    runtime.migration = job;
+    runtime.phase = 'ready';
+    runtime.readyAt = memory.clock.now();
+    emit({ type: 'migration', migration: job });
+    emit({ type: 'ready', at: runtime.readyAt, migratedTo: job.to });
+    return job;
+  };
+
+  runtime.migrationStatus = () => {
+    const latest = migrationRunner.read();
+    if (latest) runtime.migration = latest;
+    return runtime.migration;
   };
 
   /**
@@ -535,6 +638,10 @@ function uiConfig(config) {
     temp: config.temp,
     decay: config.decay,
     activeSet: config.activeSet,
+    raw: config.raw,
+    delete: config.delete,
+    review: config.review,
+    migration: config.migration,
     identity: { eventTimePolicy: config.identity.eventTimePolicy },
     // Convenience mirrors kept for older clients; the form uses the nested form.
     eventTimePolicy: config.identity.eventTimePolicy,
@@ -625,6 +732,8 @@ export async function apply(ctx, rawConfig = {}) {
         return { persisted: true };
       };
 
+      // A successful UI migration persists the new dataDir through the same seam.
+      runtime.persist = persistConfig;
       const routes = registerMemoryRoutes(webCtx, { runtime, persist: persistConfig, logger: ctx.logger });
       if (routes.registered) {
         disposers.push(routes.dispose);
@@ -744,17 +853,40 @@ export async function apply(ctx, rawConfig = {}) {
         name: `${config.toolPrefix}_recall`,
         description:
           'Retrieve memories: diary blocks coarsely filter, then events are ranked by tag match, lexical overlap and ' +
-          'decay x salience. Read-only — no adjudication, no writes. An empty active set degrades to the most recent ' +
-          'diary blocks and reports mode="degraded" with a reason.',
+          'decay x salience, with graph-neighbour association (0.5 penalty). Read-only — no adjudication, no writes. ' +
+          'Use mode="deep_raw" to search the bounded raw-turn shards when episode-level detail is not enough; that ' +
+          'scan has a byte/turn budget and reports truncated=true when it stops early.',
         parameters: {
           text: { type: 'string', description: 'What to search for' },
           tags: { type: 'array', items: { type: 'string' }, description: 'Tag filters; empty means no tag filter' },
           top_k: { type: 'number', description: `Max hits, default ${config.retrieval.topK}, max ${config.maxRecallTopK}` },
           verbose: { type: 'boolean', description: 'Include full content instead of snippets' },
+          mode: {
+            type: 'string',
+            enum: ['auto', 'deep_raw'],
+            description: 'auto (default) = indexed recall; deep_raw = bounded scan over raw turn shards',
+          },
+          time_from: { type: 'string', description: 'deep_raw only: ISO 8601 / epoch ms lower bound' },
+          time_to: { type: 'string', description: 'deep_raw only: ISO 8601 / epoch ms upper bound' },
+          regex: { type: 'boolean', description: 'deep_raw only: treat text as a restricted regular expression' },
         },
         output: { schema: { type: 'string' }, render: (_args, value) => toolResult(value) },
         execute: async (args = {}) =>
           stillStarting('recall', async () => {
+            if (args.mode === 'deep_raw') {
+              if (runtime.phase !== 'ready') return errorJson(runtime.notReady('deep_raw'));
+              const limit = Math.max(1, Math.min(Number(args.top_k) || 20, config.maxRecallTopK));
+              const result = await runtime.memory.deepRaw({
+                text: args.text ?? '',
+                timeFrom: args.time_from === undefined ? null : toEpoch(args.time_from),
+                timeTo: args.time_to === undefined ? null : toEpoch(args.time_to),
+                limit,
+                regex: args.regex === true,
+              });
+              runtime.touch();
+              runtime.recordToolCall({ landed: (result.hits ?? []).length > 0 });
+              return JSON.stringify({ ok: true, ...result });
+            }
             const result = await runtime.recall({
               text: args.text ?? '',
               tags: args.tags ?? [],
@@ -764,6 +896,46 @@ export async function apply(ctx, rawConfig = {}) {
             if (runtime.phase === 'ready' && config.context.injectPrompt) {
               injectRecall(runtime, result);
             }
+            return JSON.stringify({ ok: true, ...result });
+          }),
+      }),
+    );
+
+    register(
+      defineTool({
+        name: `${config.toolPrefix}_capture`,
+        description:
+          'Capture ONE raw turn into the forensic layer (day-sharded JSONL, never indexed). Gated by raw.mode: ' +
+          'in "salience" mode only high-salience turns, code, stack traces, tool output, or force=true are kept; ' +
+          'everything else returns stored=false with a reason. Size, daily, and total budgets are enforced; ' +
+          'oversized turns are truncated (head+tail) rather than dropped.',
+        parameters: {
+          content: { type: 'string', description: 'The verbatim turn text (input or output)', required: true },
+          role: { type: 'string', enum: ['user', 'assistant', 'tool'], description: 'Who produced this turn' },
+          kind: { type: 'string', enum: ['chat', 'code', 'error', 'tool_output'], description: 'Content kind (drives gating)' },
+          session_id: { type: 'string', description: 'Session id, for forensic grouping' },
+          turn_id: { type: 'string', description: 'Stable turn id; defaults to a content hash' },
+          salience: { type: 'number', description: 'Importance 0..1 (drives the salience gate)' },
+          tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags' },
+          ref_event_id: { type: 'string', description: 'Episode id this turn backs, if any' },
+          force: { type: 'boolean', description: 'Bypass the gate (still subject to budgets)' },
+        },
+        output: { schema: { type: 'string' }, render: (_args, value) => toolResult(value) },
+        execute: async (args = {}) =>
+          stillStarting('capture', async () => {
+            runtime.touch();
+            const result = await runtime.memory.captureRaw({
+              content: args.content,
+              role: args.role,
+              kind: args.kind,
+              sessionId: args.session_id,
+              turnId: args.turn_id,
+              salience: args.salience,
+              tags: args.tags,
+              refEventId: args.ref_event_id,
+              force: args.force === true,
+            });
+            runtime.recordToolCall({ landed: result.stored === true });
             return JSON.stringify({ ok: true, ...result });
           }),
       }),
@@ -795,9 +967,10 @@ export async function apply(ctx, rawConfig = {}) {
       defineTool({
         name: `${config.toolPrefix}_forget`,
         description:
-          'Delete memories through the 4-phase pipeline (tombstone -> archive -> consolidation -> purge). ' +
-          'High-salience facts are distilled into a semantic summary before their bytes are removed; ' +
-          'the pattern outlives the episode.',
+          'Delete memories. Two-phase by default: the event is parked in pending_delete for delete.graceHours ' +
+          '(default 24h) and can be cancelled with restore; maintenance then runs the 4-phase pipeline ' +
+          '(tombstone -> archive -> consolidation -> purge). High-salience facts are distilled into a semantic ' +
+          'summary before their bytes are removed.',
         parameters: {
           event_ids: { type: 'array', items: { type: 'string' }, description: 'Event ids to delete', required: true },
           mode: { type: 'string', enum: ['purge', 'archive'], description: 'purge (default) or archive' },
@@ -825,7 +998,7 @@ export async function apply(ctx, rawConfig = {}) {
         parameters: {
           action: {
             type: 'string',
-            enum: ['status', 'maintain', 'active_tags', 'semantic', 'active_task'],
+            enum: ['status', 'maintain', 'active_tags', 'semantic', 'active_task', 'reviews', 'pending_deletes'],
             description: 'What to do',
             required: true,
           },
@@ -834,12 +1007,20 @@ export async function apply(ctx, rawConfig = {}) {
         execute: async (args = {}) => {
           try {
             const action = args.action;
-            if (!['status', 'maintain', 'active_tags', 'semantic', 'active_task'].includes(action)) {
+            if (!['status', 'maintain', 'active_tags', 'semantic', 'active_task', 'reviews', 'pending_deletes'].includes(action)) {
               return errorJson(
                 new MemoryError(ErrorCodes.INVALID_INPUT, `unknown admin action: ${JSON.stringify(action)}`, {
-                  allowed: ['status', 'maintain', 'active_tags', 'semantic', 'active_task'],
+                  allowed: ['status', 'maintain', 'active_tags', 'semantic', 'active_task', 'reviews', 'pending_deletes'],
                 }),
               );
+            }
+            if (action === 'reviews') {
+              if (runtime.phase !== 'ready') return errorJson(runtime.notReady('reviews'));
+              return JSON.stringify({ ok: true, reviews: runtime.memory.reviews.status({ now: runtime.memory.clock.now() }) });
+            }
+            if (action === 'pending_deletes') {
+              if (runtime.phase !== 'ready') return errorJson(runtime.notReady('pending_deletes'));
+              return JSON.stringify({ ok: true, pendingDeletes: runtime.memory.pendingDeletes.status(runtime.memory.clock.now()) });
             }
             if (action === 'active_task') {
               if (runtime.phase !== 'ready') return errorJson(runtime.notReady('active_task'));
@@ -917,11 +1098,12 @@ export async function apply(ctx, rawConfig = {}) {
             [
               `Long-term memory (tool prefix: ${config.toolPrefix}):`,
               `- ${config.toolPrefix}_remember: store a durable fact with tags, salience and (when known) happened_at.`,
-              `- ${config.toolPrefix}_recall: search memory before asking the user to repeat themselves.`,
-              `- ${config.toolPrefix}_reinforce: reward a memory that proved useful (moves its decay anchor).`,
-              `- ${config.toolPrefix}_forget: delete through tombstone -> archive -> consolidation -> purge.`,
+              `- ${config.toolPrefix}_recall: search memory before asking the user to repeat themselves; mode="deep_raw" scans the bounded raw-turn shards.`,
+              `- ${config.toolPrefix}_capture: keep one verbatim turn for forensics (gated; not indexed).`,
+              `- ${config.toolPrefix}_reinforce: reward a memory that proved useful (moves its decay anchor and advances the review schedule).`,
+              `- ${config.toolPrefix}_forget: two-phase delete — pending_delete countdown, then tombstone -> archive -> consolidation -> purge.`,
               `- ${config.toolPrefix}_checkpoint: record the one active heavy task (task_id, progress, updated_at).`,
-        `- ${config.toolPrefix}_admin: status / maintain / active_tags / semantic / active_task.`,
+              `- ${config.toolPrefix}_admin: status / maintain / active_tags / semantic / active_task / reviews / pending_deletes.`,
               'Memory is NOT the session transcript: store durable facts, not turn-by-turn narration.',
               'If a memory call fails, report the error code instead of inventing a result.',
             ].join('\n'),

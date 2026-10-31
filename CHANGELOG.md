@@ -4,6 +4,41 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] — 2026-10-31
+
+### Added
+
+- **Raw-turn forensics (`memory_capture`, `memory_recall mode:"deep_raw"`)**: a
+  separate day-sharded JSONL store (`raw/`) that is never indexed, never loaded at
+  boot, and never touched by normal recall. Gated by `raw.mode` (default
+  `salience`: high-salience, code, stack traces, tool output, or `force`), deduped
+  by content hash, secret-redacted, and capped by `maxTurnKb` (head+tail
+  truncation), `maxBytesPerDay`, `maxTotalMb`, and `retentionDays` (pruned by
+  maintenance; code shards keep 90 days). `deep_raw` scans newest→oldest under a
+  byte/turn budget and reports `truncated: true` instead of pretending it saw
+  everything.
+- **Spaced repetition**: engine-owned schedule (`1,2,4,7,15,30` days) persisted in
+  `state/reviews.json`; `maintain()` reconciles due items and `reinforce` advances
+  the step. Exposed as `memory_admin action="reviews"`.
+- **Two-phase delete**: `forget` parks the event for `delete.graceHours`
+  (default 24) in `pending_deletes`; `restore` cancels it, and `maintain()`
+  promotes expired requests into the 4-phase pipeline. Unknown ids now fail
+  immediately, before parking.
+- **UI data-dir migration**: `dataDir` is editable in the settings page. Saving it
+  takes `.migration.lock`, returns HTTP 202 with `state=migrating`, copies with
+  `fs.promises.cp` in the background, verifies `recordCount` on both sides, and
+  only then switches and reloads the store. A mismatch removes the target and
+  keeps the old store authoritative; the source is never deleted.
+- New config groups: `raw.*`, `delete.graceHours`, `review.enabled`,
+  `migration.timeoutMs` (all fail-fast validators, UI tooltips included).
+
+### Changed
+
+- Panel adds `raw`, `reviews`, and `pendingDeletes`; the settings page renders a
+  migration progress card while `state=migrating`.
+- `Memory._scheduler` cron now reads `runtime.config` per tick, so a hot config
+  update changes the schedule without a restart.
+
 ## [1.3.1] — 2026-10-30
 
 ### Fixed

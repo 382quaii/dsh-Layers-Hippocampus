@@ -41,6 +41,8 @@ export const FLAT_ALIASES = Object.freeze({
 });
 
 export const EVENT_TIME_POLICIES = Object.freeze(['content', 'explicit', 'ingest']);
+/** Raw-turn retention modes: off / gated by value / everything. */
+export const RAW_MODES = Object.freeze(['off', 'salience', 'all']);
 
 /** Every accepted top-level key (nested groups are validated separately). */
 export const CONFIG_KEYS = Object.freeze([
@@ -64,6 +66,10 @@ export const CONFIG_KEYS = Object.freeze([
   'temp',
   'decay',
   'activeSet',
+  'raw',
+  'delete',
+  'review',
+  'migration',
   'identity',
   'policy',
 ]);
@@ -103,6 +109,22 @@ export const DEFAULT_CONFIG = Object.freeze({
   // config: the UI edits them, so they must be declared and validated here.
   decay: Object.freeze({ halfLifeDays: 30 }),
   activeSet: Object.freeze({ cap: 200 }),
+  // Raw-turn retention: gated, capped, pruned by maintenance. Off by default
+  // would lose the forensic trail, so the default keeps high-value turns only.
+  raw: Object.freeze({
+    mode: 'salience',
+    minSalience: 0.6,
+    maxTurnKb: 64,
+    maxBytesPerDay: 8,
+    maxTotalMb: 256,
+    retentionDays: 30,
+    maxScanMb: 16,
+  }),
+  // Two-phase delete: forget parks the event for this long before the pipeline runs.
+  delete: Object.freeze({ graceHours: 24 }),
+  // Spaced repetition schedule (days between reviews).
+  review: Object.freeze({ enabled: true, intervals: [1, 2, 4, 7, 15, 30] }),
+  migration: Object.freeze({ timeoutMs: 600_000 }),
   identity: Object.freeze({ eventTimePolicy: 'content' }),
   policy: Object.freeze({}),
 });
@@ -113,6 +135,33 @@ function configError(code, message, details) {
 
 function isPlainObject(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Spaced-repetition intervals: a non-empty, strictly ascending list of whole days.
+ * Sortedness is validated rather than repaired — a descending schedule is a bug.
+ */
+function requireIntervals(value, key) {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw configError(ErrorCodes.CONFIG_INVALID_TYPE, `config.${key} must be a non-empty array of day counts`, {
+      key,
+      got: Array.isArray(value) ? 'array' : typeof value,
+    });
+  }
+  if (value.length > 12) {
+    throw configError(ErrorCodes.CONFIG_OUT_OF_RANGE, `config.${key} accepts at most 12 intervals`, { key, got: value.length });
+  }
+  const out = value.map((entry, index) => requireInteger(entry, `${key}[${index}]`, { min: 1, max: 365 }));
+  for (let index = 1; index < out.length; index += 1) {
+    if (out[index] <= out[index - 1]) {
+      throw configError(ErrorCodes.CONFIG_OUT_OF_RANGE, `config.${key} must be strictly ascending`, {
+        key,
+        got: out,
+        at: index,
+      });
+    }
+  }
+  return out;
 }
 
 function getPath(object, dotted) {
@@ -255,7 +304,7 @@ function normaliseRaw(raw) {
   }
 
   const out = { ...nested };
-  for (const group of ['retrieval', 'context', 'temp', 'decay', 'activeSet', 'identity']) {
+  for (const group of ['retrieval', 'context', 'temp', 'decay', 'activeSet', 'raw', 'delete', 'review', 'migration', 'identity']) {
     if (isPlainObject(nested[group])) out[group] = { ...nested[group] };
   }
   for (const [alias, path] of Object.entries(FLAT_ALIASES)) {
@@ -283,7 +332,7 @@ function normaliseRaw(raw) {
 export function resolveConfig(raw = {}, { env = process.env } = {}) {
   const input = normaliseRaw(raw);
 
-  for (const group of ['retrieval', 'context', 'temp', 'decay', 'activeSet', 'identity']) {
+  for (const group of ['retrieval', 'context', 'temp', 'decay', 'activeSet', 'raw', 'delete', 'review', 'migration', 'identity']) {
     if (group in input && input[group] !== undefined && !isPlainObject(input[group])) {
       throw configError(ErrorCodes.CONFIG_INVALID_TYPE, `config.${group} must be an object`, { key: group });
     }
@@ -392,6 +441,67 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     { min: 100, max: 1000 },
   );
 
+  // ---- raw-turn retention (forensic trail, gated + capped) ------------------
+  const rawIn = input.raw ?? {};
+  const rawMode = requireEnum(rawIn.mode ?? defaults.raw.mode, 'raw.mode', RAW_MODES);
+  const rawMinSalience = requireNumberInRange(
+    rawIn.minSalience === undefined ? defaults.raw.minSalience : rawIn.minSalience,
+    'raw.minSalience',
+    { min: 0, max: 1 },
+  );
+  const rawMaxTurnKb = requireInteger(
+    rawIn.maxTurnKb === undefined ? defaults.raw.maxTurnKb : rawIn.maxTurnKb,
+    'raw.maxTurnKb',
+    { min: 8, max: 1024 },
+  );
+  const rawMaxBytesPerDay = requireInteger(
+    rawIn.maxBytesPerDay === undefined ? defaults.raw.maxBytesPerDay : rawIn.maxBytesPerDay,
+    'raw.maxBytesPerDay',
+    { min: 1, max: 128 },
+  );
+  const rawMaxTotalMb = requireInteger(
+    rawIn.maxTotalMb === undefined ? defaults.raw.maxTotalMb : rawIn.maxTotalMb,
+    'raw.maxTotalMb',
+    { min: 16, max: 4096 },
+  );
+  const rawRetentionDays = requireInteger(
+    rawIn.retentionDays === undefined ? defaults.raw.retentionDays : rawIn.retentionDays,
+    'raw.retentionDays',
+    { min: 1, max: 365 },
+  );
+  const rawMaxScanMb = requireInteger(
+    rawIn.maxScanMb === undefined ? defaults.raw.maxScanMb : rawIn.maxScanMb,
+    'raw.maxScanMb',
+    { min: 1, max: 256 },
+  );
+
+  // ---- two-phase delete ----------------------------------------------------
+  const deleteIn = input.delete ?? {};
+  const deleteGraceHours = requireInteger(
+    deleteIn.graceHours === undefined ? defaults.delete.graceHours : deleteIn.graceHours,
+    'delete.graceHours',
+    { min: 0, max: 168 },
+  );
+
+  // ---- spaced repetition ---------------------------------------------------
+  const reviewIn = input.review ?? {};
+  const reviewEnabled = requireBoolean(
+    reviewIn.enabled === undefined ? defaults.review.enabled : reviewIn.enabled,
+    'review.enabled',
+  );
+  const reviewIntervals = requireIntervals(
+    reviewIn.intervals === undefined ? defaults.review.intervals : reviewIn.intervals,
+    'review.intervals',
+  );
+
+  // ---- migration -----------------------------------------------------------
+  const migrationIn = input.migration ?? {};
+  const migrationTimeoutMs = requireInteger(
+    migrationIn.timeoutMs === undefined ? defaults.migration.timeoutMs : migrationIn.timeoutMs,
+    'migration.timeoutMs',
+    { min: 10_000, max: 3_600_000 },
+  );
+
   const policyIn = input.policy === undefined ? {} : input.policy;
   if (!isPlainObject(policyIn)) {
     throw configError(ErrorCodes.CONFIG_INVALID_TYPE, 'config.policy must be an object', { key: 'policy' });
@@ -468,6 +578,18 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     temp: { ttlDays: tempTtlDays, promotionWindowDays: tempPromotionWindowDays },
     decay: { halfLifeDays: decayHalfLifeDays },
     activeSet: { cap: activeSetCap },
+    raw: {
+      mode: rawMode,
+      minSalience: rawMinSalience,
+      maxTurnKb: rawMaxTurnKb,
+      maxBytesPerDay: rawMaxBytesPerDay,
+      maxTotalMb: rawMaxTotalMb,
+      retentionDays: rawRetentionDays,
+      maxScanMb: rawMaxScanMb,
+    },
+    delete: { graceHours: deleteGraceHours },
+    review: { enabled: reviewEnabled, intervals: reviewIntervals },
+    migration: { timeoutMs: migrationTimeoutMs },
     identity: { eventTimePolicy },
     policy: policyIn,
   };
@@ -485,6 +607,9 @@ export function toMemoryOptions(config) {
   policy.temp = { ...(policy.temp ?? {}), ttlDays: config.temp.ttlDays, promotionWindowDays: config.temp.promotionWindowDays };
   policy.decay = { ...(policy.decay ?? {}), halfLifeDays: config.decay.halfLifeDays };
   policy.activeSet = { ...(policy.activeSet ?? {}), cap: config.activeSet.cap };
+  // Two-phase delete + review schedule are policy values with config names.
+  policy.delete = { ...(policy.delete ?? {}), graceHours: config.delete.graceHours };
+  policy.review = { ...(policy.review ?? {}), enabled: config.review.enabled, intervals: config.review.intervals };
   return {
     dataDir: config.dataDir,
     policy,
@@ -494,6 +619,10 @@ export function toMemoryOptions(config) {
       temp: config.temp,
       identity: config.identity,
       graphMaxEdges: config.graphMaxEdges,
+      raw: config.raw,
+      delete: config.delete,
+      review: config.review,
+      migration: config.migration,
     },
   };
 }
