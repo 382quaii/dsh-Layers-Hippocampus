@@ -1,21 +1,22 @@
 /**
- * Raw-turn store — the forensic layer behind `episode`.
+ * Raw-turn store — the black box.
  *
- * Deliberately NOT part of the L1 event log: raw turns are never indexed, never
- * loaded at boot, and never scanned by normal recall. They live in day-sharded
- * JSONL files and are only read by `deep_raw` (bounded scan) and by maintenance
- * (retention), which keeps the "offline recompute, online minimal" rule intact.
+ * A raw record is four fields and nothing else:
+ *   { turn_id, timestamp, role, content }
  *
- * Growth is bounded by four independent limits:
- *   maxTurnKb        one turn (head+tail truncation beyond it)
- *   maxBytesPerDay   one shard's budget
- *   maxTotalMb       the whole raw directory
- *   retentionDays    age-based pruning (code/error shards get 90 days)
+ * No tags, salience, decay, event ids, graph links or metadata: all derived data
+ * lives in `log/` (L1) and `index/`. Addressing is by (day file, line number) —
+ * append-only makes line numbers stable, the only lawful exception to the
+ * no-line-pointers rule.
  *
- * Gating (`raw.mode`):
- *   off       nothing is stored
- *   salience  only high-salience turns, code, stack traces, tool output, or force
- *   all       every turn (still capped and deduped)
+ * Defense properties:
+ *   - writes are queued and flushed in batches (10 records or 1s), never sync;
+ *   - secrets are redacted on READ (deep_raw snippets), disk keeps plaintext;
+ *   - forget appends `{ type: 'raw_tombstone', hash, timestamp }` and scans skip
+ *     any tombstoned content hash;
+ *   - retention prunes whole day files strictly older than the cutoff (the file
+ *     being written today is never deleted);
+ *   - deep_raw has a token budget and says so when it truncates.
  */
 
 import fs from 'node:fs';
@@ -23,24 +24,32 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { createHash } from 'node:crypto';
 import { MemoryError, ErrorCodes } from './errors.js';
-import { dayKey, ensureDir, readJson, sha256, writeJsonAtomic } from './util.js';
+import { dayKey, ensureDir, sha256 } from './util.js';
 
 export const RAW_DIR = 'raw';
-export const RAW_SCHEMA = 1;
-/** Hard ceiling for one deep_raw call (turns). */
-export const MAX_SCAN_TURNS = 5000;
-/** Bytes kept from head and tail of an oversized turn. */
+/** Records queued before a forced flush. */
+export const FLUSH_BATCH = 10;
+/** Milliseconds before a queued record is flushed. */
+export const FLUSH_DELAY_MS = 1000;
+/** Head/tail bytes kept when one turn exceeds raw.maxTurnKb. */
 export const TRUNCATE_KEEP_BYTES = 8 * 1024;
-/** Shards containing code/errors are kept longer than chat shards. */
-export const CODE_RETENTION_DAYS = 90;
-/** Long base64-ish runs and obvious secrets are redacted before writing. */
+/** Marker appended to size-truncated content. */
+export const TRUNCATE_MARKER = '…[truncated]…';
+/** Appended when the result is cut for the token budget. */
+export const TOKEN_TRUNCATION_NOTE = '由于预算限制，部分原始记录已被截断';
+/** Characters per token estimate for the result budget. */
+const CHARS_PER_TOKEN = 4;
+
+const RUNTIME_CONTEXT_MARKER = /^Current runtime context\./i;
 const SECRET_PATTERNS = [
   /(?:bearer\s+)[A-Za-z0-9._~+/=-]{16,}/gi,
   /(?:sk-|ghp_|xox[baprs]-)[A-Za-z0-9_\-]{16,}/g,
   /[A-Za-z0-9+/]{120,}={0,2}/g,
 ];
 
-function redact(text) {
+/** Redact obvious secrets from a string. Used on READ, never on write. */
+export function redactSecrets(text) {
+  if (typeof text !== 'string') return { text: '', redactions: 0 };
   let redactions = 0;
   let out = text;
   for (const pattern of SECRET_PATTERNS) {
@@ -67,8 +76,12 @@ export class RawStore {
     this.dir = path.join(dataDir, RAW_DIR);
     this.clock = clock;
     this.getConfig = getConfig;
+    this.queue = [];
+    this._flushTimer = null;
+    this._flushChain = Promise.resolve();
     this._hashes = new Map(); // day -> Set(sha256)
     this._dayBytes = new Map(); // day -> bytes
+    this._tombstones = null; // Set(sha256), loaded lazily
     this._total = null;
   }
 
@@ -95,12 +108,13 @@ export class RawStore {
     if (fs.existsSync(file)) {
       for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
         if (!line) continue;
+        let record;
         try {
-          const record = JSON.parse(line);
-          if (record.sha256) set.add(record.sha256);
+          record = JSON.parse(line);
         } catch {
-          // A torn line is ignored; the shard is still append-only.
+          continue;
         }
+        if (typeof record.turn_id === 'string' && typeof record.content === 'string') set.add(sha256(record.content));
       }
     }
     this._hashes.set(day, set);
@@ -109,13 +123,11 @@ export class RawStore {
 
   _dayBytesFor(day) {
     if (this._dayBytes.has(day)) return this._dayBytes.get(day);
-    const file = this.dayFile(day);
-    const bytes = fs.existsSync(file) ? fs.statSync(file).size : 0;
+    const bytes = fs.existsSync(this.dayFile(day)) ? fs.statSync(this.dayFile(day)).size : 0;
     this._dayBytes.set(day, bytes);
     return bytes;
   }
 
-  /** Total raw bytes; cached and refreshed by writes/prunes. */
   totalBytes() {
     if (this._total !== null) return this._total;
     let total = 0;
@@ -123,14 +135,14 @@ export class RawStore {
       try {
         total += fs.statSync(path.join(this.dir, name)).size;
       } catch {
-        // A shard removed mid-scan does not count.
+        /* removed mid-scan */
       }
     }
     this._total = total;
     return total;
   }
 
-  /** Whether this turn is allowed to take disk space. */
+  /** Append-side gate (manual captures only; auto-capture passes force). */
   gate({ mode, salience, kind, text, force }) {
     const config = this.config();
     const effective = mode ?? config.mode ?? 'salience';
@@ -146,10 +158,10 @@ export class RawStore {
   }
 
   /**
-   * Capture one raw turn. Returns a verdict instead of throwing for gated turns;
-   * a real I/O failure throws (never a silent drop).
+   * Queue one raw turn. Returns a verdict synchronously (dedupe/budget/gate);
+   * the bytes land on disk via the background flush.
    */
-  async capture(turn = {}) {
+  capture(turn = {}) {
     const config = this.config();
     const text = typeof turn.content === 'string' ? turn.content : '';
     if (!text.trim()) throw new MemoryError(ErrorCodes.INVALID_INPUT, 'raw turn content must be a non-empty string');
@@ -163,58 +175,123 @@ export class RawStore {
     if (hashes.has(hash)) return { stored: false, reason: 'duplicate', sha256: hash };
 
     const maxBytes = Math.max(1024, (config.maxTurnKb ?? 64) * 1024);
-    let body = text;
-    let truncated = false;
-    if (Buffer.byteLength(body, 'utf8') > maxBytes) {
-      const head = body.slice(0, TRUNCATE_KEEP_BYTES);
-      const tail = body.slice(-TRUNCATE_KEEP_BYTES);
-      body = `${head}\n…[truncated ${body.length - head.length - tail.length} chars]…\n${tail}`;
-      truncated = true;
+    let content = text;
+    if (Buffer.byteLength(content, 'utf8') > maxBytes) {
+      const head = content.slice(0, TRUNCATE_KEEP_BYTES);
+      const tail = content.slice(-TRUNCATE_KEEP_BYTES);
+      content = `${head}\n${TRUNCATE_MARKER}\n${tail}`;
     }
-    const redacted = redact(body);
-    const bytes = Buffer.byteLength(redacted.text, 'utf8') + 512;
-
+    const record = {
+      turn_id: turn.turnId ?? `turn_${hash.slice(0, 16)}`,
+      timestamp: Number.isFinite(turn.at) ? turn.at : now,
+      role: turn.role === 'assistant' || turn.role === 'tool' ? turn.role : 'user',
+      content,
+    };
+    const bytes = Buffer.byteLength(JSON.stringify(record), 'utf8') + 1;
     const perDayLimit = Math.max(1024, (config.maxBytesPerDay ?? 8) * 1024 * 1024);
     if (this._dayBytesFor(day) + bytes > perDayLimit) return { stored: false, reason: 'daily-budget', limit: perDayLimit };
-    const totalLimit = Math.max(1, (config.maxTotalMb ?? 256)) * 1024 * 1024;
+    const totalLimit = Math.max(1, config.maxTotalMb ?? 256) * 1024 * 1024;
     if (this.totalBytes() + bytes > totalLimit) return { stored: false, reason: 'total-budget', limit: totalLimit };
 
-    ensureDir(this.dir);
-    const record = {
-      schema: RAW_SCHEMA,
-      turn_id: turn.turnId ?? `turn_${hash.slice(0, 16)}`,
-      at: Number.isFinite(turn.at) ? turn.at : now,
-      session_id: turn.sessionId ?? null,
-      role: turn.role ?? 'unknown',
-      kind: turn.kind ?? 'chat',
-      content: redacted.text,
-      bytes,
-      sha256: hash,
-      truncated,
-      redactions: redacted.redactions,
-      salience: Number.isFinite(turn.salience) ? turn.salience : null,
-      tags: Array.isArray(turn.tags) ? turn.tags.slice(0, 20) : [],
-      ref_event_id: turn.refEventId ?? null,
-      gated_by: decision.reason,
-    };
-    await fs.promises.appendFile(this.dayFile(day), `${JSON.stringify(record)}\n`, 'utf8');
     hashes.add(hash);
     this._dayBytes.set(day, this._dayBytesFor(day) + bytes);
     if (this._total !== null) this._total += bytes;
-    return { stored: true, sha256: hash, bytes, day, truncated, redactions: redacted.redactions, gatedBy: decision.reason, file: this.dayFile(day) };
+    this.queue.push({ day, line: JSON.stringify(record) });
+    if (this.queue.length >= FLUSH_BATCH) {
+      this.flush().catch(() => {});
+    } else {
+      this._scheduleFlush();
+    }
+    return { stored: true, queued: true, sha256: hash, turnId: record.turn_id, day };
+  }
+
+  _scheduleFlush() {
+    if (this._flushTimer) return;
+    this._flushTimer = setTimeout(() => {
+      this._flushTimer = null;
+      this.flush().catch(() => {});
+    }, FLUSH_DELAY_MS);
+    this._flushTimer.unref?.();
+  }
+
+  /** Flush every queued record. Awaited by scans, maintenance and tests. */
+  flush() {
+    this._flushChain = this._flushChain.then(async () => {
+      if (this.queue.length === 0) return;
+      const pending = this.queue.splice(0, this.queue.length);
+      ensureDir(this.dir);
+      const byDay = new Map();
+      for (const item of pending) {
+        if (!byDay.has(item.day)) byDay.set(item.day, []);
+        byDay.get(item.day).push(item.line);
+      }
+      for (const [day, lines] of byDay) {
+        await fs.promises.appendFile(this.dayFile(day), `${lines.join('\n')}\n`, 'utf8');
+      }
+    });
+    return this._flushChain;
+  }
+
+  /** Tombstone content hashes at the raw layer (called after a purge). */
+  async tombstone(hashes = [], { at = this.clock.now() } = {}) {
+    const unique = [...new Set(hashes)].filter(Boolean);
+    if (unique.length === 0) return { tombstoned: 0 };
+    ensureDir(this.dir);
+    const day = dayKey(at);
+    const lines = unique.map((hash) => JSON.stringify({ type: 'raw_tombstone', hash, timestamp: at }));
+    await fs.promises.appendFile(this.dayFile(day), `${lines.join('\n')}\n`, 'utf8');
+    if (this._tombstones) for (const hash of unique) this._tombstones.add(hash);
+    this._total = null;
+    this._dayBytes.delete(day);
+    return { tombstoned: unique.length };
+  }
+
+  _loadTombstones() {
+    if (this._tombstones) return this._tombstones;
+    const set = new Set();
+    for (const name of this.listShards()) {
+      let text = '';
+      try {
+        text = fs.readFileSync(path.join(this.dir, name), 'utf8');
+      } catch {
+        continue;
+      }
+      for (const line of text.split('\n')) {
+        if (!line.includes('"raw_tombstone"')) continue;
+        try {
+          const record = JSON.parse(line);
+          if (record.type === 'raw_tombstone' && record.hash) set.add(record.hash);
+        } catch {
+          /* torn line */
+        }
+      }
+    }
+    this._tombstones = set;
+    return set;
   }
 
   /**
-   * Bounded deep scan. Never claims completeness: when the budget runs out the
-   * caller gets `truncated: true` and the numbers that prove it.
+   * Bounded deep scan with a mandatory time window (enforced by the caller) and
+   * a token budget. Returns redacted snippets; disk remains plaintext.
    */
-  async scan({ text = '', timeFrom = null, timeTo = null, limit = 20, regex = false, isTombstoned = null } = {}) {
+  async scan({ text = '', startTime, endTime, limit = 20, regex = false, maxTokens } = {}) {
     const config = this.config();
     if (!config || config.mode === 'off') {
       throw new MemoryError(ErrorCodes.RAW_DISABLED, 'raw storage is disabled (raw.mode=off); enable it to use deep_raw', {
         mode: config?.mode ?? 'off',
       });
     }
+    if (!Number.isFinite(startTime) || !Number.isFinite(endTime)) {
+      throw new MemoryError(ErrorCodes.INVALID_INPUT, 'deep_raw requires start_time and end_time (epoch ms)', {
+        startTime: startTime ?? null,
+        endTime: endTime ?? null,
+      });
+    }
+    if (endTime < startTime) {
+      throw new MemoryError(ErrorCodes.INVALID_INPUT, 'end_time must be >= start_time', { startTime, endTime });
+    }
+    await this.flush();
+    const tombstones = this._loadTombstones();
     const needle = String(text ?? '');
     let matcher;
     if (regex) {
@@ -227,29 +304,29 @@ export class RawStore {
       matcher = { test: (value) => value.toLowerCase().includes(needle.toLowerCase()) };
     }
     const maxBytes = Math.max(1, config.maxScanMb ?? 16) * 1024 * 1024;
-    const maxTurns = Math.min(MAX_SCAN_TURNS, (config.maxScanTurns ?? MAX_SCAN_TURNS));
+    const maxTurns = Math.min(5000, config.maxScanTurns ?? 5000);
+    const tokenBudget = Math.max(1, Number(maxTokens ?? config.maxResultTokens ?? 1000));
     const shards = this.listShards()
       .filter((name) => {
         const day = name.replace('.jsonl', '');
-        if (timeFrom !== null && day < dayKey(timeFrom)) return false;
-        if (timeTo !== null && day > dayKey(timeTo)) return false;
-        return true;
+        return day >= dayKey(startTime) && day <= dayKey(endTime);
       })
       .reverse();
 
     const hits = [];
-    const scanned = { turns: 0, bytes: 0, shards: 0 };
+    const scanned = { turns: 0, bytes: 0, shards: 0, tombstonesSkipped: 0 };
     let truncated = false;
+    let tokensUsed = 0;
     for (const name of shards) {
       if (truncated) break;
       const file = path.join(this.dir, name);
       scanned.shards += 1;
       const stream = fs.createReadStream(file, { encoding: 'utf8' });
       const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
-      let offset = 0;
+      let lineNumber = 0;
       for await (const line of lines) {
+        lineNumber += 1;
         const lineBytes = Buffer.byteLength(line, 'utf8') + 1;
-        offset += lineBytes;
         scanned.bytes += lineBytes;
         if (scanned.bytes > maxBytes || scanned.turns >= maxTurns) {
           truncated = true;
@@ -262,75 +339,81 @@ export class RawStore {
         } catch {
           continue;
         }
-        if (record.tombstoned === true) continue;
-        if (record.ref_event_id && typeof isTombstoned === 'function' && isTombstoned(record.ref_event_id)) continue;
-        const haystack = `${record.content ?? ''}`;
+        if (record.type === 'raw_tombstone') continue;
+        // A raw turn carries no `type`: the four-field shape is the record.
+        if (typeof record.turn_id !== 'string' || typeof record.content !== 'string') continue;
+        if (record.timestamp < startTime || record.timestamp > endTime) continue;
+        if (tombstones.has(sha256(record.content))) {
+          scanned.tombstonesSkipped += 1;
+          continue;
+        }
+        const haystack = record.content;
         if (!matcher.test(haystack)) continue;
         const index = needle ? haystack.toLowerCase().indexOf(needle.toLowerCase()) : 0;
         const at = index >= 0 ? index : 0;
+        const snippet = redactSecrets(haystack.slice(Math.max(0, at - 120), at + 120 + needle.length));
+        const snippetTokens = Math.ceil(snippet.text.length / CHARS_PER_TOKEN);
+        if (tokensUsed + snippetTokens > tokenBudget) {
+          truncated = true;
+          break;
+        }
+        tokensUsed += snippetTokens;
         hits.push({
           turnId: record.turn_id,
-          at: record.at,
+          timestamp: record.timestamp,
           role: record.role,
-          kind: record.kind,
-          snippet: haystack.slice(Math.max(0, at - 120), at + 120 + needle.length),
-          byteOffset: offset - lineBytes,
-          sha256: record.sha256,
-          refEventId: record.ref_event_id ?? null,
-          truncated: record.truncated === true,
+          snippet: snippet.text,
+          redactions: snippet.redactions,
           shard: name,
+          line: lineNumber,
         });
         if (hits.length >= limit) break;
       }
       lines.close();
       stream.destroy();
     }
+    const notes = [];
+    const notesTruncated = truncated || hits.length >= limit;
+    if (notesTruncated) notes.push(TOKEN_TRUNCATION_NOTE);
     return {
       mode: 'deep_raw',
       hits,
       scanned,
-      truncated: truncated || hits.length >= limit,
-      budget: { maxBytes, maxTurns },
-      notes: truncated ? [`scan-budget-exhausted:${maxBytes} bytes / ${maxTurns} turns`] : [],
+      truncated: notesTruncated,
+      budget: { maxBytes, maxTurns, maxTokens: tokenBudget, tokensUsed },
+      notes,
     };
   }
 
-  /** Retention + cap enforcement. Called by maintenance only. */
+  /** TTL: delete whole shards strictly older than `today - retentionDays`. */
   async prune({ now = this.clock.now() } = {}) {
     const config = this.config();
     const retention = Math.max(1, config.retentionDays ?? 30);
-    const cutoffChat = now - retention * 86_400_000;
-    const cutoffCode = now - Math.max(retention, CODE_RETENTION_DAYS) * 86_400_000;
+    const today = dayKey(now);
+    const cutoff = dayKey(now - retention * 86_400_000);
     const removed = [];
     let freed = 0;
     for (const name of this.listShards()) {
-      const file = path.join(this.dir, name);
       const day = name.replace('.jsonl', '');
-      const dayMs = Date.parse(`${day}T00:00:00.000Z`);
-      if (!Number.isFinite(dayMs)) continue;
-      let keepCode = false;
+      if (day === today) continue; // the file being written today is never deleted
+      if (day >= cutoff) continue;
       try {
-        keepCode = fs.readFileSync(file, 'utf8').includes('"kind":"code"');
-      } catch {
-        keepCode = false;
-      }
-      const cutoff = keepCode ? cutoffCode : cutoffChat;
-      if (dayMs >= cutoff) continue;
-      try {
+        const file = path.join(this.dir, name);
         const size = fs.statSync(file).size;
         fs.rmSync(file, { force: true });
         freed += size;
         removed.push(day);
       } catch {
-        // A shard already removed by another pass is not an error.
+        /* already gone */
       }
     }
     if (removed.length > 0) {
       this._total = null;
       this._hashes.clear();
       this._dayBytes.clear();
+      this._tombstones = null;
     }
-    return { removed, freedBytes: freed, retentionDays: retention };
+    return { removed, freedBytes: freed, retentionDays: retention, today };
   }
 
   stats() {
@@ -340,6 +423,7 @@ export class RawStore {
       bytes: this.totalBytes(),
       newest: shards.at(-1) ?? null,
       oldest: shards[0] ?? null,
+      tombstones: this._loadTombstones().size,
     };
   }
 }

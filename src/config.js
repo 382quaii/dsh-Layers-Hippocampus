@@ -113,12 +113,17 @@ export const DEFAULT_CONFIG = Object.freeze({
   // would lose the forensic trail, so the default keeps high-value turns only.
   raw: Object.freeze({
     mode: 'salience',
+    autoCapture: true,
+    captureTools: false,
     minSalience: 0.6,
     maxTurnKb: 64,
     maxBytesPerDay: 8,
     maxTotalMb: 256,
     retentionDays: 30,
     maxScanMb: 16,
+    // Result token budget: deep_raw truncates and says so instead of flooding
+    // the model's context with raw records.
+    maxResultTokens: 1000,
   }),
   // Two-phase delete: forget parks the event for this long before the pipeline runs.
   delete: Object.freeze({ graceHours: 24 }),
@@ -474,7 +479,22 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     'raw.maxScanMb',
     { min: 1, max: 256 },
   );
-
+  const rawMaxResultTokens = requireInteger(
+    rawIn.maxResultTokens === undefined ? defaults.raw.maxResultTokens : rawIn.maxResultTokens,
+    'raw.maxResultTokens',
+    { min: 50, max: 20_000 },
+  );
+  // Automatic capture: subscribe to `session/event` so every surface message is
+  // offered to the raw store (still gated and budgeted per turn).
+  const rawAutoCapture = requireBoolean(
+    rawIn.autoCapture === undefined ? defaults.raw.autoCapture : rawIn.autoCapture,
+    'raw.autoCapture',
+  );
+  // Tool output is the noisiest stream: off by default, opt-in per deployment.
+  const rawCaptureTools = requireBoolean(
+    rawIn.captureTools === undefined ? defaults.raw.captureTools : rawIn.captureTools,
+    'raw.captureTools',
+  );
   // ---- two-phase delete ----------------------------------------------------
   const deleteIn = input.delete ?? {};
   const deleteGraceHours = requireInteger(
@@ -580,12 +600,15 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     activeSet: { cap: activeSetCap },
     raw: {
       mode: rawMode,
+      autoCapture: rawAutoCapture,
+      captureTools: rawCaptureTools,
       minSalience: rawMinSalience,
       maxTurnKb: rawMaxTurnKb,
       maxBytesPerDay: rawMaxBytesPerDay,
       maxTotalMb: rawMaxTotalMb,
       retentionDays: rawRetentionDays,
       maxScanMb: rawMaxScanMb,
+      maxResultTokens: rawMaxResultTokens,
     },
     delete: { graceHours: deleteGraceHours },
     review: { enabled: reviewEnabled, intervals: reviewIntervals },

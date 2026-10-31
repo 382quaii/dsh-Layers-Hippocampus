@@ -751,6 +751,28 @@ export async function apply(ctx, rawConfig = {}) {
     const register = (definition) => {
       disposers.push(ctx.tools.register(definition));
     };
+
+    // ---- automatic raw capture: every surface message, verbatim ------------
+    // `dsh-session` publishes `session/event` as (session, event). Subscribing at
+    // the root context is what reaches sessions created by the agent's fiber; the
+    // raw store's own gating/budgets still decide what lands on disk.
+    const captureListener = (session, event) => {
+      if (!runtime.memory || runtime.phase !== 'ready') return;
+      runtime.memory
+        .captureSessionEvent(session, event)
+        .then((result) => {
+          if (result?.stored) runtime.logger?.debug?.(`hippocampus: raw ${result.role ?? 'turn'} stored (${result.bytes}B)`);
+        })
+        .catch((error) => {
+          runtime.logger?.warn?.(`hippocampus: raw capture failed: ${asMemoryError(error).code}: ${error?.message ?? error}`);
+        });
+    };
+    const bus = ctx.root ?? ctx;
+    if (typeof bus.on === 'function') {
+      bus.on('session/event', captureListener);
+      disposers.push(() => bus.off?.('session/event', captureListener));
+    }
+
     const guard = (operation) => {
       if (runtime.phase === 'ready') return null;
       if (operation === 'recall' && runtime.legacy) return null; // served from legacy
@@ -866,8 +888,9 @@ export async function apply(ctx, rawConfig = {}) {
             enum: ['auto', 'deep_raw'],
             description: 'auto (default) = indexed recall; deep_raw = bounded scan over raw turn shards',
           },
-          time_from: { type: 'string', description: 'deep_raw only: ISO 8601 / epoch ms lower bound' },
-          time_to: { type: 'string', description: 'deep_raw only: ISO 8601 / epoch ms upper bound' },
+          start_time: { type: 'string', description: 'deep_raw ONLY (required): ISO 8601 / epoch ms lower bound' },
+          end_time: { type: 'string', description: 'deep_raw ONLY (required): ISO 8601 / epoch ms upper bound' },
+          max_tokens: { type: 'number', description: 'deep_raw only: result token budget, default from raw.maxResultTokens' },
           regex: { type: 'boolean', description: 'deep_raw only: treat text as a restricted regular expression' },
         },
         output: { schema: { type: 'string' }, render: (_args, value) => toolResult(value) },
@@ -875,13 +898,23 @@ export async function apply(ctx, rawConfig = {}) {
           stillStarting('recall', async () => {
             if (args.mode === 'deep_raw') {
               if (runtime.phase !== 'ready') return errorJson(runtime.notReady('deep_raw'));
+              if (args.start_time === undefined || args.end_time === undefined) {
+                return errorJson(
+                  new MemoryError(
+                    ErrorCodes.INVALID_INPUT,
+                    'deep_raw requires start_time and end_time (fail-fast: an unbounded raw scan is not allowed)',
+                    { missing: ['start_time', 'end_time'].filter((key) => args[key] === undefined) },
+                  ),
+                );
+              }
               const limit = Math.max(1, Math.min(Number(args.top_k) || 20, config.maxRecallTopK));
               const result = await runtime.memory.deepRaw({
                 text: args.text ?? '',
-                timeFrom: args.time_from === undefined ? null : toEpoch(args.time_from),
-                timeTo: args.time_to === undefined ? null : toEpoch(args.time_to),
+                startTime: toEpoch(args.start_time),
+                endTime: toEpoch(args.end_time),
                 limit,
                 regex: args.regex === true,
+                maxTokens: args.max_tokens,
               });
               runtime.touch();
               runtime.recordToolCall({ landed: (result.hits ?? []).length > 0 });

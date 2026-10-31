@@ -65,10 +65,15 @@ node scripts/wait-for-routes.mjs
 
 ### 原始回合留存（raw）与 `deep_raw`
 
-- 独立日分片 `raw/YYYY-MM-DD.jsonl`，**不进主日志、不进索引、启动不加载**；只有 `deep_raw` 和 `maintain()` 的淘汰会读它。
-- 门控 `raw.mode`：`salience`（默认，高显著度 / 代码 / 堆栈 / 工具输出才留）、`all`、`off`；`force: true` 可单条强留。
-- 四道闸：单轮 `maxTurnKb`（超出存 head+tail 各 8KB）、每日 `maxBytesPerDay`、总量 `maxTotalMb`、保留期 `retentionDays`（代码分片保留 90 天）；内容哈希去重、密钥类长串 redaction。
-- `memory_recall mode="deep_raw"` 从新到旧扫描，预算 `raw.maxScanMb` / 5000 轮；预算耗尽返回 `truncated: true` 与扫描量，**不假装全量**；raw 关闭时返回 `MEM_E_RAW_DISABLED`。
+- **极简黑匣子**：每行恰为 `{ turn_id, timestamp, role, content }`；不写 tags / salience / decay / event_id / 图谱关系 / metadata。寻址用 `(日期文件, 行号)`——append-only 保证行号稳定（这是“禁止行号指针”在 raw 层的唯一合法例外）。
+- 独立日分片 `raw/YYYY-MM-DD.jsonl`，**不进主日志、不进索引、启动不加载**；只有 `deep_raw` 和 `maintain()` 的 TTL 会读它。
+- **异步写盘**：捕获只入内存队列，每 10 条或 1 秒批量 `appendFile`，绝不阻塞 `session/event` 回调。
+- **明文存储 + 读出脱敏**：落盘保留 100% 原文（黑匣子完整性）；`deep_raw` 返回前对 snippet 做脱敏（Bearer、`sk-`、长 base64 串 → `[redacted]`），防止密钥进入云端 prompt。**注意：本地磁盘为明文。**
+- **墓碑**：`forget` 真正执行 purge 后，按内容 hash 追加 `{ type: "raw_tombstone", hash, timestamp }`；扫描时命中墓碑的记录直接跳过（防死灰复燃）。
+- **强制时间窗**：`memory_recall mode="deep_raw"` 必须同时给 `start_time` 与 `end_time`，缺失直接 `MEM_E_INVALID_INPUT`。
+- **Token 预算**：结果上限 `raw.maxResultTokens`（默认 1000），超出截断并在 `notes` 末尾注明「由于预算限制，部分原始记录已被截断」。
+- **TTL**：`maintain()` 删除文件名日期早于 `今天 - retentionDays` 的整文件；**今天正在写的文件绝不删**。raw 体积计入 Dashboard 存储环（`panel.storage.rawBytes` + 总 `diskBytes`）。
+- 自动捕获：订阅 `session/event`，只收 user/assistant 原文（剥离宿主注入的 `Current runtime context.` 段），工具输出默认不收、但 `isError` 的失败结果强制入库。
 
 ### 两阶段删除与间隔重复
 
@@ -139,8 +144,11 @@ node scripts/wait-for-routes.mjs
 | `raw.maxTurnKb` | `64` | 8 – 1024 |
 | `raw.maxBytesPerDay` | `8` | 1 – 128 MB |
 | `raw.maxTotalMb` | `256` | 16 – 4096 MB |
-| `raw.retentionDays` | `30` | 1 – 365（code 分片保留 90 天） |
+| `raw.retentionDays` | `30` | 1 – 365（按文件日期整文件清理） |
 | `raw.maxScanMb` | `16` | 1 – 256 MB |
+| `raw.maxResultTokens` | `1000` | 50 – 20000 |
+| `raw.autoCapture` | `true` | 布尔 |
+| `raw.captureTools` | `false` | 布尔（`isError` 工具结果始终捕获） |
 | `delete.graceHours` | `24` | 0 – 168（0 = 立即执行） |
 | `review.enabled` | `true` | 布尔 |
 | `migration.timeoutMs` | `600000` | 10000 – 3600000 |
@@ -237,7 +245,7 @@ Cron **和** 空闲 Dream 触发调用同一个入口 `runtime.runMaintenance(so
 ## 开发与验证
 
 ```bash
-npm test      # node test/run.mjs —— 142 个进程内用例，30 秒看门狗
+npm test      # node test/run.mjs —— 149 个进程内用例，30 秒看门狗
 npm run check # 语法检查 + 全量测试
 ```
 

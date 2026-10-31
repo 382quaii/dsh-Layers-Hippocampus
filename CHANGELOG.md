@@ -31,6 +31,29 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   keeps the old store authoritative; the source is never deleted.
 - New config groups: `raw.*`, `delete.graceHours`, `review.enabled`,
   `migration.timeoutMs` (all fail-fast validators, UI tooltips included).
+- **Raw-turn black box (minimal schema)**: each line is exactly
+  `{turn_id, timestamp, role, content}` — no tags, salience, decay, event ids,
+  graph links, session ids or metadata. Addressing is by `(day file, line number)`;
+  append-only keeps lines stable (the one lawful line-pointer exception).
+  Writes are queued and flushed in batches (10 records / 1s), never sync.
+- **Read-side redaction**: the shard keeps 100% plaintext (forensic integrity);
+  secrets are redacted when `deep_raw` returns snippets, before any text reaches a
+  model prompt. README states local storage is plaintext.
+- **Tombstones**: a committed purge appends `raw_tombstone {hash, timestamp}`;
+  scans skip tombstoned content hashes (no resurrection).
+- **deep_raw constraints**: `start_time` and `end_time` are mandatory (missing →
+  `MEM_E_INVALID_INPUT`), results are capped by `raw.maxResultTokens` (default
+  1000) and carry the truncation notice when cut.
+- **TTL**: maintenance deletes whole day files strictly older than
+  `today - raw.retentionDays`; today's shard is never touched. Raw bytes are
+  surfaced as `panel.storage.rawBytes` and counted in the dashboard ring.
+- **Automatic raw capture**: the plugin subscribes to `dsh-session`'s
+  `session/event` and stores every user/assistant surface message verbatim
+  (`raw.autoCapture: true`). The Host-injected `Current runtime context.` block is
+  stripped out of `content` and kept (truncated) in `metadata.runtimeContext`, so
+  `deep_raw` stays signal-clean. Tool output is opt-in (`raw.captureTools: false`),
+  **except failed tool results** (`isError`), which are always captured as
+  `kind: "error"`. Budgets, dedupe and retention still apply.
 
 ### Changed
 

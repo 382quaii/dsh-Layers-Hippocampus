@@ -37,7 +37,7 @@ test('the status panel has the full documented shape', async () => {
       'cumulativeSavedTokens',
       'evictedBlocks',
     ]);
-    assert.deepEqual(Object.keys(panel.storage).sort(), ['dataDir', 'diskBytes']);
+    assert.deepEqual(Object.keys(panel.storage).sort(), ['budgetMb', 'dataDir', 'diskBytes', 'rawBytes']);
     assert.deepEqual(Object.keys(panel.maintenance).sort(), [
       'lastSuccessAt',
       'maintenanceCron',

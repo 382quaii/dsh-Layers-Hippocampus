@@ -143,6 +143,58 @@ export function validateMedia(mediaUrl, mediaType) {
 }
 
 /** Names mentioned as @handle or Capitalised-Latin runs — cheap, deterministic. */
+/**
+ * Project one `session/event` payload onto a raw turn. Only the three surface
+ * message types carry user/assistant/tool text; everything else is ignored.
+ *
+ * The Host injects a `Current runtime context.` block into user messages (cwd,
+ * policy, model, …). Those parts are REPEATED every turn, so they are dropped —
+ * they are neither user speech nor useful forensic content. A message that
+ * carries nothing but that block yields a `contextOnly` marker and is skipped.
+ */
+export function turnFromSessionEvent(event) {
+  const type = event?.type;
+  if (type !== 'user/message' && type !== 'assistant/message' && type !== 'tool/result') return null;
+  const extracted = extractEventText(event?.data ?? {});
+  if (!extracted) return null;
+  const text = extracted.text.trim();
+  if (!text) return { role: 'user', kind: 'chat', text: '', contextOnly: extracted.context === true };
+  if (type === 'user/message') return { role: 'user', kind: 'chat', text };
+  if (type === 'tool/result') return { role: 'tool', kind: 'tool_output', text };
+  return { role: 'assistant', kind: /```|(^|\n)\s{4}\S/.test(text) ? 'code' : 'chat', text };
+}
+
+const RUNTIME_CONTEXT_MARKER = /^Current runtime context\./i;
+
+/** Text of a message event: provider parts, plain text, or a nested result. */
+function extractEventText(data) {
+  const partsOf = (parts) => {
+    if (typeof parts === 'string') return [parts];
+    if (!Array.isArray(parts)) return [];
+    return parts
+      .map((part) => (typeof part === 'string' ? part : part?.type === 'text' ? part.text : null))
+      .filter((part) => typeof part === 'string' && part.length > 0);
+  };
+  const candidates = [data.content, data.message?.content, data.result?.content];
+  let parts = [];
+  for (const candidate of candidates) {
+    parts = partsOf(candidate);
+    if (parts.length > 0) break;
+  }
+  if (parts.length === 0) {
+    if (typeof data.text === 'string' && data.text.trim()) parts = [data.text];
+    else return null;
+  }
+  const bodyParts = [];
+  const contextParts = [];
+  for (const part of parts) {
+    if (RUNTIME_CONTEXT_MARKER.test(part.trimStart())) contextParts.push(part.trim());
+    else bodyParts.push(part);
+  }
+  const text = bodyParts.join('\n').trim();
+  return { text, context: contextParts.length > 0 };
+}
+
 function extractNames(text) {
   const found = new Set();
   for (const match of String(text).matchAll(/@([\w\u4e00-\u9fa5]{2,20})/g)) found.add(match[1]);
@@ -586,6 +638,9 @@ export class Memory {
     if (missing.length > 0) {
       throw new MemoryError(ErrorCodes.NOT_FOUND, 'cannot delete unknown event ids', { missing });
     }
+    // Tombstones for the raw layer are derived from the episode content BEFORE
+    // the purge removes it; they are appended only once the delete commits.
+    const contentHashes = ids.map((id) => sha256(snapshot.records.find((record) => record.event_id === id)?.content ?? '')).filter(Boolean);
     const graceHours = this.policy.delete?.graceHours ?? 24;
     if (graceHours > 0) {
       // Phase 0: park it. Nothing is tombstoned yet; `restore` just cancels.
@@ -599,6 +654,7 @@ export class Memory {
       };
     }
     const job = await this.deletePipeline.request({ eventIds: ids, mode, reason });
+    if (mode === 'purge') await this.raw.tombstone(contentHashes, { at: this.clock.now() });
     const maintenance = await this.maintenance.run({ reason: `forget:${job.id}` });
     return { state: 'deleted', job: this.publicJob(job), maintenance: this.publicMaintenance(maintenance) };
   }
@@ -689,11 +745,53 @@ export class Memory {
     return this.raw.capture(turn);
   }
 
-  /** Bounded deep scan over raw shards; never claims completeness. */
+  /** Bounded deep scan over raw shards; time window and token budget required. */
   async deepRaw(query = {}) {
     this.assertOpen();
-    const tombstones = new Set(this.tombstones.ids());
-    return this.raw.scan({ ...query, isTombstoned: (eventId) => tombstones.has(eventId) });
+    if (!Number.isFinite(query.startTime) || !Number.isFinite(query.endTime)) {
+      throw new MemoryError(ErrorCodes.INVALID_INPUT, 'deep_raw requires start_time and end_time (epoch ms)', {
+        startTime: query.startTime ?? null,
+        endTime: query.endTime ?? null,
+      });
+    }
+    return this.raw.scan({
+      text: query.text,
+      startTime: query.startTime,
+      endTime: query.endTime,
+      limit: query.limit,
+      regex: query.regex,
+      maxTokens: query.maxTokens,
+    });
+  }
+
+  /**
+   * Automatic raw capture from the session log (`session/event`). Surface
+   * messages are captured verbatim — details must survive even when the episode
+   * was distilled — but only while `raw.mode != off` and `raw.autoCapture`, and
+   * every write still goes through the turn/day/total budgets and dedupe.
+   */
+  async captureSessionEvent(session, event) {
+    this.assertOpen();
+    const raw = this.config?.raw ?? {};
+    if (raw.autoCapture !== true) return { skipped: 'auto-capture-off' };
+    if ((raw.mode ?? 'salience') === 'off') return { skipped: 'raw-off' };
+    const turn = turnFromSessionEvent(event);
+    if (!turn) return { skipped: 'not-a-surface-message' };
+    if (turn.contextOnly === true) return { skipped: 'runtime-context-only' };
+    // Tool chatter is opt-in, but a FAILED tool call is exactly the detail worth
+    // keeping: error results bypass the opt-in (budgets still apply).
+    const isError = event?.data?.isError === true || event?.data?.error !== undefined || event?.data?.message?.isError === true;
+    if (event?.type === 'tool/result' && raw.captureTools !== true && !isError) return { skipped: 'tool-output-off' };
+    return this.raw.capture({
+      content: turn.text,
+      role: turn.role,
+      kind: event?.type === 'tool/result' && isError ? 'error' : turn.kind,
+      sessionId: session?.id ?? session?.sessionId ?? null,
+      turnId: `turn_${event?.seq ?? 'x'}_${turn.role}`,
+      at: Number.isFinite(event?.time) ? event.time : undefined,
+      salience: 1,
+      force: true,
+    });
   }
 
   /**
@@ -771,7 +869,12 @@ export class Memory {
       const due = this.pendingDeletes.due(this.clock.now());
       const promoted = [];
       for (const item of due) {
+        const snapshot = await this.logStore.snapshot();
+        const hashes = item.eventIds
+          .map((id) => sha256(snapshot.records.find((record) => record.event_id === id)?.content ?? ''))
+          .filter(Boolean);
         await this.deletePipeline.request({ eventIds: item.eventIds, mode: item.mode, reason: item.reason });
+        if (item.mode === 'purge') await this.raw.tombstone(hashes, { at: this.clock.now() });
         this.pendingDeletes.remove(item.id);
         promoted.push({ id: item.id, events: item.eventIds.length });
       }
@@ -990,7 +1093,10 @@ export class Memory {
         },
         storage: {
           dataDir: this.dataDir,
+          // The ring includes raw: diskBytes walks the whole dataDir.
           diskBytes: diskUsage(this.dataDir),
+          rawBytes: this.raw.stats().bytes,
+          budgetMb: this.config?.storageBudgetMb ?? 50,
         },
         maintenance: {
           lastSuccessAt: report?.finishedAt ?? null,
