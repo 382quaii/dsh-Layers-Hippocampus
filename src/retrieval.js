@@ -57,6 +57,30 @@ function uniqueSorted(values) {
  * @param {object[]} [input.semantic] folded semantic summaries
  * @param {object[]} [input.tempSemantic] folded L2.5 quarantine entries
  */
+export const MIN_INJECT_CONFIDENCE = 0.6;
+
+/**
+ * Confidence pass: a hit far below the best score is not worth injecting in full.
+ * Low-confidence hits keep their id/score but swap the body for a one-line hint,
+ * and the reason is reported so the caller can explain itself.
+ */
+export function applyConfidence(hits = [], min = MIN_INJECT_CONFIDENCE) {
+  if (!Array.isArray(hits) || hits.length === 0) return { hits: [], notes: [] };
+  const max = Math.max(1e-9, ...hits.map((hit) => Number(hit.score) || 0));
+  const out = hits.map((hit) => {
+    const confidence = Math.min(1, Math.max(0, (Number(hit.score) || 0) / max));
+    if (confidence >= min) return { ...hit, confidence };
+    return {
+      ...hit,
+      confidence,
+      snippet: '[低置信 ' + confidence.toFixed(2) + '] 相关但不确定；建议换关键词，或 deep_raw + 时间窗查原话',
+      lowConfidence: true,
+    };
+  });
+  const low = out.filter((hit) => hit.lowConfidence === true).length;
+  return { hits: out, notes: low > 0 ? [`low-confidence-hints:${low}`] : [] };
+}
+
 export function recall({ index, query = {}, policy, now, semantic = [], tempSemantic = [], associations = [] }) {
   const topK = Math.round(clamp(Number(query.topK) || policy.candidates.topK, 1, policy.candidates.maxTopK));
   const text = typeof query.text === 'string' ? query.text.trim() : '';

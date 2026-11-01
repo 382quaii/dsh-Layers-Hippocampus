@@ -4,6 +4,32 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.4.1] — 2026-11-01
+
+### Added
+
+- **Prompt discipline (soft interception)**: a static `memory:policy` section tells
+  the model to prefer `memory_recall` for history/files/system facts, and to treat
+  a `[Slimmed]` response as an invitation to answer from the summary unless the
+  `recovery_hash` must be dereferenced.
+- **Own-tool output slimming**: `memory_recall`/`memory_admin` responses over the
+  budget (default 2000 tokens) are captured to raw first, then returned as
+  `{slimmed, summary, topics, key_entities, recovery_hash, hint}`; the hint points
+  at `memory_recall(mode="deep_raw", hash=…)`, which restores the exact payload.
+- **Retrieval confidence**: hits below `context.minInjectConfidence` (default 0.6)
+  carry a short hint instead of their full body, plus a `low-confidence-hints:N` note.
+- **Write flood guard**: writes above 80% of `storageBudgetMb` throw
+  `MEM_E_WRITE_FLOOD`; `memory.bulkIngest` chunks 50 items per await and ships as
+  `memory_bulk_ingest`.
+- **raw.captureRatio** (0 | 0.5 | 1): deterministic sampling by content hash;
+  ratio 0 disables capture and `deep_raw` returns an explicit warning.
+
+### Changed
+
+- `memory_recall` gains `hash` (exact raw restore) and confidence fields; deep_raw
+  results honour the token budget before returning.
+- `promptLayout` composes stable rules → memory map → `[Memory Blocks]` tail.
+
 ## [1.4.0] — 2026-10-31
 
 ### Added

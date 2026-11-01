@@ -284,6 +284,44 @@ test('forget parks for the grace period; restore cancels; maintenance purges aft
 
 // ---- migration -------------------------------------------------------------
 
+test('stale "running" migration state is reconciled to done on boot', async () => {
+  const { createRuntime } = await import('../index.js');
+  const { toMemoryOptions } = await import('../src/config.js');
+  const { FakeClock } = await import('./helpers.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-reconcile-'));
+  try {
+    fs.mkdirSync(path.join(dir, 'state'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'state', 'migration.json'),
+      JSON.stringify({
+        schema: 1,
+        id: 'mig_old',
+        status: 'running',
+        phase: 'copying',
+        from: 'C:/old',
+        to: dir,
+        copiedBytes: 0,
+        totalBytes: 10,
+        startedAt: NOW,
+        error: null,
+      }),
+    );
+    const config = resolveConfig({ dataDir: dir }, { env: { DSH_HOME: 'C:/dsh' } });
+    const runtime = createRuntime({ config, options: toMemoryOptions(config), clock: new FakeClock(NOW) });
+    try {
+      const migration = runtime.migrationStatus();
+      assert.equal(migration.status, 'ready', 'a copy that landed is not an in-flight job');
+      assert.equal(migration.phase, 'done');
+      const persisted = JSON.parse(fs.readFileSync(path.join(dir, 'state', 'migration.json'), 'utf8'));
+      assert.equal(persisted.status, 'ready', 'the reconciled state is written back');
+    } finally {
+      runtime.memory?.close?.();
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('migration path validation rejects relative, equal, and nested targets', () => {
   assert.throws(() => validateMigrationPaths({ from: 'C:/a', to: 'relative/dir' }), (error) => error.code === 'MEM_E_MIGRATION_PATH');
   assert.throws(() => validateMigrationPaths({ from: 'C:/a', to: 'C:/a' }), (error) => error.code === 'MEM_E_MIGRATION_PATH');

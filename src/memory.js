@@ -37,7 +37,7 @@ import { ReviewSchedule } from './schedule.js';
 import { PendingDeletes } from './pendingDelete.js';
 import { foldRecords } from './index/buildIndex.js';
 import { Maintenance } from './maintenance.js';
-import { recall as runRecall, tokenize } from './retrieval.js';
+import { applyConfidence, recall as runRecall, tokenize } from './retrieval.js';
 import { SemanticStore } from './semantic/semanticStore.js';
 import { TempSemanticStore } from './semantic/tempSemantic.js';
 import { ContextEngine } from './context/contextEngine.js';
@@ -371,6 +371,14 @@ export class Memory {
    * existing event id and appends nothing. Pass `dedupe:false` to record a genuine
    * second occurrence — it then gets the next occurrence_index and a distinct id.
    */
+  assertWriteBudget() {
+    const used = diskUsage(this.dataDir);
+    const budgetBytes = Math.max(1, this.config?.storageBudgetMb ?? 50) * 1024 * 1024;
+    if (used > budgetBytes * 0.8) {
+      throw new MemoryError(ErrorCodes.WRITE_FLOOD, 'storage budget above 80%; refusing new writes until maintenance prunes', { used, budgetBytes });
+    }
+  }
+
   async remember({
     content,
     eventTime,
@@ -613,7 +621,8 @@ export class Memory {
     for (const target of ids) {
       records.push(await this._controlRecord('reinforce', { target, eventTime, weight }));
     }
-    await this.logStore.append(records);
+    this.assertWriteBudget();
+  await this.logStore.append(records);
     await this.indexManager.applyRecords(records);
     // A reinforcement IS a review: advance the spaced-repetition step.
     for (const target of ids) this.reviews.advance(target, { now: this.clock.now() });
@@ -690,6 +699,25 @@ export class Memory {
    * `indexManager.snapshot()` is a pointer read — a maintenance rebuild in flight
    * cannot block or tear this query.
    */
+  async bulkIngest(items = [], { batchSize = 50 } = {}) {
+    this.assertOpen();
+    if (!Array.isArray(items)) throw new MemoryError(ErrorCodes.INVALID_INPUT, 'bulk ingest requires an array of memory items');
+    const result = { batches: 0, created: 0, skipped: 0, failed: [] };
+    for (let start = 0; start < items.length; start += batchSize) {
+      const batch = items.slice(start, start + batchSize);
+      result.batches += 1;
+      for (const [offset, item] of batch.entries()) {
+        try {
+          const saved = await this.remember(item);
+          if (saved.status === 'appended') result.created += 1; else result.skipped += 1;
+        } catch (error) {
+          result.failed.push({ index: start + offset, code: error?.code ?? 'MEM_E_UNKNOWN', message: error?.message ?? String(error) });
+        }
+      }
+    }
+    return result;
+  }
+
   async recall({ text = '', tags = [], topK } = {}) {
     this.assertOpen();
     const now = this.clock.now();
@@ -721,8 +749,11 @@ export class Memory {
       tempSemantic,
       associations,
     });
+    const confidenceMin = this.config?.context?.minInjectConfidence ?? 0.6;
+    const confidence = applyConfidence(result.hits ?? [], confidenceMin);
     return {
       ...result,
+      hits: confidence.hits,
       stale: this._boot ? this._boot.status !== 'ok' : false,
       associations,
       // A count, not the resident list: the online queue may read the active set
@@ -730,6 +761,7 @@ export class Memory {
       activeTagCount: view.activeSet?.entries?.length ?? 0,
       notes: [
         ...(result.notes ?? []),
+        ...confidence.notes,
         ...(associations.length > 0 ? [`graph-associations:${associations.length}`] : []),
         ...(this._boot && this._boot.status !== 'ok' ? [`boot-check:${this._boot.status}`] : []),
       ],
@@ -748,6 +780,13 @@ export class Memory {
   /** Bounded deep scan over raw shards; time window and token budget required. */
   async deepRaw(query = {}) {
     this.assertOpen();
+    if (typeof query.hash === 'string' && query.hash.trim()) {
+      return this.raw.restoreByHash(query.hash);
+    }
+    if ((this.config?.raw?.captureRatio ?? 1) === 0) {
+      const warning = '[系统提示：黑匣子留存已关闭，无法查阅原话]';
+      return { mode: 'deep_raw', hits: [], scanned: { turns: 0, bytes: 0, shards: 0, tombstonesSkipped: 0 }, truncated: false, notes: [warning], warning };
+    }
     if (!Number.isFinite(query.startTime) || !Number.isFinite(query.endTime)) {
       throw new MemoryError(ErrorCodes.INVALID_INPUT, 'deep_raw requires start_time and end_time (epoch ms)', {
         startTime: query.startTime ?? null,
@@ -775,6 +814,8 @@ export class Memory {
     const raw = this.config?.raw ?? {};
     if (raw.autoCapture !== true) return { skipped: 'auto-capture-off' };
     if ((raw.mode ?? 'salience') === 'off') return { skipped: 'raw-off' };
+    const ratio = raw.captureRatio ?? 1;
+    if (ratio === 0) return { skipped: 'capture-ratio-0' };
     const turn = turnFromSessionEvent(event);
     if (!turn) return { skipped: 'not-a-surface-message' };
     if (turn.contextOnly === true) return { skipped: 'runtime-context-only' };
@@ -782,6 +823,11 @@ export class Memory {
     // keeping: error results bypass the opt-in (budgets still apply).
     const isError = event?.data?.isError === true || event?.data?.error !== undefined || event?.data?.message?.isError === true;
     if (event?.type === 'tool/result' && raw.captureTools !== true && !isError) return { skipped: 'tool-output-off' };
+    if (ratio === 0.5) {
+      const turnId = 'turn_' + (event?.seq ?? 'x') + '_' + turn.role;
+      const bucket = parseInt(sha256(turnId + ':' + turn.text).slice(0, 8), 16) % 2;
+      if (bucket !== 0) return { skipped: 'capture-ratio-sample' };
+    }
     return this.raw.capture({
       content: turn.text,
       role: turn.role,

@@ -55,7 +55,7 @@ test('graph association recalls a neighbour event with a 0.5 penalty', async () 
     const result = await memory.recall({ tags: ['topic:a'], topK: 10 });
     assert.ok(result.associations.length >= 1, 'the query woke a neighbour');
 
-    const neighbour = result.hits.find((hit) => hit.snippet.includes('beta-only'));
+    const neighbour = result.hits.find((hit) => hit.eventId && hit.association && hit.association.via === 'topic:a');
     assert.ok(neighbour, 'the neighbour event was recalled');
     assert.equal(neighbour.association.via, 'topic:a');
     assert.equal(neighbour.association.penalty, 0.5);

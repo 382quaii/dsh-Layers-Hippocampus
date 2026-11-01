@@ -116,18 +116,19 @@ test('an invalid policy is rejected at activation, before any store is created',
   }
 });
 
-test('apply registers seven tools and both prompt layers, and dispose removes them', async () => {
+test('apply registers eight tools and both prompt layers, and dispose removes them', async () => {
   const dir = tempDir('ctx');
   const ctx = fakeCtx();
   try {
     assert.deepEqual(inject, ['tools', 'systemPrompt']);
     await apply(ctx, { dataDir: dir, maintenanceCron: '0 */6 * * *', autoMaintainOnBoot: false });
-    assert.equal(ctx.toolsMap.size, 7, 'the tool surface exists immediately, before the store is ready');
+    assert.equal(ctx.toolsMap.size, 8, 'the tool surface exists immediately, before the store is ready');
     // Startup is asynchronous; await it the way a caller would.
     await getRuntime(ctx).ready;
 
     assert.deepEqual([...ctx.toolsMap.keys()].sort(), [
       'memory_admin',
+      'memory_bulk_ingest',
       'memory_capture',
       'memory_checkpoint',
       'memory_forget',

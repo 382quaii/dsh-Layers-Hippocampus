@@ -4,7 +4,7 @@
 
 | | |
 | --- | --- |
-| 版本 | **1.4.0** |
+| 版本 | **1.4.1** |
 | 包名 | `dsh-layers-hippocampus`（npm 只允许小写；仓库名保留 `dsh-Layers-Hippocampus`，*Hippocampus* 双 **p**） |
 | 仓库 | <https://github.com/382quaii/dsh-Layers-Hippocampus> |
 | 许可证 | MIT |
@@ -18,7 +18,7 @@
 ### 从 GitHub
 
 ```bash
-pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.4.0"
+pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.4.1"
 ```
 
 ### 从 npm
@@ -85,6 +85,12 @@ node scripts/wait-for-routes.mjs
 设置页 `dataDir` 可编辑：保存后返回 **202 + state=migrating**，后台 `fs.promises.cp` 拷贝、两端 `recordCount` 校验、写入 `.migration-complete` 后才切换 `dataDir` 并重开存储；校验失败删除目标、旧目录仍权威；源目录保留为备份。并发请求由 `.migration.lock` 阻断（`MEM_E_MIGRATION_LOCKED`），面板显示进度条。
 
 `active_task` 直查底层索引，**不受活跃集合 cap 200 限制**；写入新 checkpoint 会降级旧记录，7 天未刷新由 `maintain()` 自动降级，模型的 `forget` 只是 happy path。
+
+### 提示词软引导与自有工具瘦身
+
+- 系统提示新增 `memory:policy`（静态段，保持前缀缓存稳定）：要求模型在需要回忆历史、查阅文件、获取系统信息时**优先调用 `memory_recall`**，禁止盲目读取外部超长文件或让原生工具输出全文。
+- 本插件工具返回超长 JSON（默认 >2000 tokens）时，由 `slimToolPayload` 先**把完整内容写入 raw**，再返回带 `[Slimmed]` 的瘦身版：保留 `summary` / `topics` / `key_entities` / `recovery_hash`。
+- 恢复原文：`memory_recall(mode="deep_raw", hash="…")`，按内容 sha256 精确返回；这是"软拦截"能覆盖的最大范围——其他插件的工具输出仍由宿主投射，插件无法改写。
 
 ### 多模态与防爆仓
 
@@ -245,7 +251,7 @@ Cron **和** 空闲 Dream 触发调用同一个入口 `runtime.runMaintenance(so
 ## 开发与验证
 
 ```bash
-npm test      # node test/run.mjs —— 149 个进程内用例，30 秒看门狗
+npm test      # node test/run.mjs —— 160 个进程内用例，30 秒看门狗
 npm run check # 语法检查 + 全量测试
 ```
 
@@ -256,6 +262,14 @@ npm run check # 语法检查 + 全量测试
 ```bash
 node scripts/wait-for-routes.mjs            # 自动找端口
 node scripts/wait-for-routes.mjs 55879      # 指定端口
+```
+
+raw 黑匣子整理（旧 15 字段记录 → 四字段 schema，剔除 tool 噪音 / 注入段落 / 测试残留，按内容去重）：
+
+```bash
+node scripts/compact-raw.mjs                 # 干跑，只打印计划
+node scripts/compact-raw.mjs --apply         # 先备份到 raw/.backup-<ts>/ 再原地重写
+node scripts/compact-raw.mjs --data-dir "D:\Users\86135\memory" --apply
 ```
 
 绑定/注册体检（检查 package.json 名、patch 行名、profile 依赖、Junction 与实时路由）：

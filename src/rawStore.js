@@ -385,6 +385,28 @@ export class RawStore {
     };
   }
 
+  async restoreByHash(hash) {
+    await this.flush();
+    const wanted = String(hash).replace(/^hash_/, '');
+    const tombstones = this._loadTombstones();
+    const hits = [];
+    for (const name of this.listShards().reverse()) {
+      let text = '';
+      try { text = fs.readFileSync(path.join(this.dir, name), 'utf8'); } catch { continue; }
+      let line = 0;
+      for (const raw of text.split(/\r?\n/)) {
+        if (!raw.trim()) continue;
+        line += 1;
+        let record; try { record = JSON.parse(raw); } catch { continue; }
+        if (record.type === 'raw_tombstone' || typeof record.content !== 'string') continue;
+        const digest = sha256(record.content);
+        if (!digest.startsWith(wanted) || tombstones.has(digest)) continue;
+        hits.push({ turnId: record.turn_id, timestamp: record.timestamp, role: record.role, content: record.content, hash: digest, shard: name, line, restored: true });
+      }
+    }
+    return { mode: 'deep_raw', hits: hits.slice(0, 5), truncated: hits.length > 5, notes: hits.length === 0 ? ['hash not found'] : [], restored: hits.length > 0 };
+  }
+
   /** TTL: delete whole shards strictly older than `today - retentionDays`. */
   async prune({ now = this.clock.now() } = {}) {
     const config = this.config();

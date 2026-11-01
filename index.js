@@ -29,6 +29,7 @@
 
 import path from 'node:path';
 import { resolveConfig, toMemoryOptions, DEFAULT_CONFIG } from './src/config.js';
+import { extractEntities } from './src/utils/RegexExtractor.js';
 import { migrateDataDir } from './src/migration.js';
 import { MigrationRunner } from './src/migrationRunner.js';
 import { CronScheduler } from './src/scheduler.js';
@@ -54,6 +55,32 @@ const RUNTIMES = new WeakMap();
 
 /** Must match package.json — the Loader row and the client module id use it too. */
 const PACKAGE_NAME = 'dsh-layers-hippocampus';
+/**
+ * Soft-interception slim: the model already asked OUR tool, so this is the one
+ * place we can shrink a response before it reaches the prompt. The full payload is
+ * written to raw first, so the [Slimmed] recovery hash is always resolvable.
+ */
+export async function slimToolPayload(runtime, payload, { budgetTokens = 2000, capture = null } = {}) {
+  const full = JSON.stringify(payload);
+  const budgetChars = Math.max(500, budgetTokens * 4);
+  if (full.length <= budgetChars) return full;
+  const sink = capture ?? ((text) => runtime.memory.captureRaw({ content: text, role: 'tool', kind: 'tool_output', force: true, salience: 1, turnId: 'tool:' + Date.now() }));
+  const captured = await sink(full);
+  const hash = captured && captured.sha256 ? captured.sha256 : null;
+  const entities = extractEntities(full).entities.slice(0, 8).map((entity) => entity.value);
+  const hits = Array.isArray(payload.hits) ? payload.hits : [];
+  const summary = hits.length > 0 ? hits.slice(0, 3).map((hit) => hit.snippet || hit.content || '').join(' ').slice(0, 800) : full.slice(0, 400);
+  return JSON.stringify({
+    ok: payload.ok !== false,
+    slimmed: true,
+    summary,
+    topics: payload.candidateTags || payload.activeTags || [],
+    key_entities: entities,
+    recovery_hash: hash ? 'hash_' + hash.slice(0, 12) : null,
+    hint: '[Slimmed] 内容过长已裁剪。恢复原话请调用 memory_recall(mode="deep_raw", hash="' + (hash ? hash.slice(0, 12) : '') + '")',
+  });
+}
+
 
 /** The runtime created by `apply()` for this context, or null before activation. */
 export function getRuntime(ctx) {
@@ -117,7 +144,9 @@ export function compileParameters(parameters = {}) {
 }
 
 /** ToolDefinition with a schema that is valid by construction. */
-export function defineTool(definition) {
+export 
+
+function defineTool(definition) {
   return { ...definition, parameters: compileParameters(definition.parameters) };
 }
 
@@ -161,6 +190,23 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
   });
   runtime.migrationRunner = migrationRunner;
   runtime.migration = migrationRunner.read();
+  // Reconciliation: a successful migration leaves a "running" snapshot inside the
+  // copied state/ file (the copy snapshots the runner's own record). If the live
+  // dataDir already equals that snapshot's target, the job is done — mark it so
+  // the UI never shows a phantom in-flight migration.
+  if (
+    runtime.migration &&
+    runtime.migration.status === 'running' &&
+    runtime.migration.to &&
+    path.resolve(config.dataDir) === path.resolve(runtime.migration.to)
+  ) {
+    runtime.migration = { ...runtime.migration, status: 'ready', phase: 'done', finishedAt: clock ? clock.now() : Date.now() };
+    try {
+      migrationRunner.write(runtime.migration);
+    } catch {
+      /* best effort: the in-memory value is what the UI reads */
+    }
+  }
 
   let resolveReady;
   let rejectReady;
@@ -535,7 +581,12 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
     runtime.rawConfig = merged;
     await memory.init();
     if (runtime.scheduler) memory.attachScheduler(runtime.scheduler);
-    runtime.migration = job;
+    // The runner still points at the OLD state file; rebase it on the new dataDir
+    // and record the victory there, so the next boot does not read a stale copy.
+    migrationRunner.stateFile = path.join(next.dataDir, 'state', 'migration.json');
+    const finished = { ...job, status: 'ready', phase: 'done', finishedAt: memory.clock.now(), error: null };
+    migrationRunner.write(finished);
+    runtime.migration = finished;
     runtime.phase = 'ready';
     runtime.readyAt = memory.clock.now();
     emit({ type: 'migration', migration: job });
@@ -545,7 +596,25 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
 
   runtime.migrationStatus = () => {
     const latest = migrationRunner.read();
-    if (latest) runtime.migration = latest;
+    if (latest) {
+      // Same reconciliation as boot, for the window before the reload completes.
+      if (
+        latest.status === 'running' &&
+        runtime.phase === 'ready' &&
+        latest.to &&
+        path.resolve(runtime.config.dataDir) === path.resolve(latest.to)
+      ) {
+        runtime.migration = { ...latest, status: 'ready', phase: 'done', finishedAt: memory.clock.now(), error: null };
+        try {
+          migrationRunner.stateFile = path.join(runtime.config.dataDir, 'state', 'migration.json');
+          migrationRunner.write(runtime.migration);
+        } catch {
+          /* the in-memory value is authoritative for this call */
+        }
+        return runtime.migration;
+      }
+      runtime.migration = latest;
+    }
     return runtime.migration;
   };
 
@@ -891,6 +960,7 @@ export async function apply(ctx, rawConfig = {}) {
           start_time: { type: 'string', description: 'deep_raw ONLY (required): ISO 8601 / epoch ms lower bound' },
           end_time: { type: 'string', description: 'deep_raw ONLY (required): ISO 8601 / epoch ms upper bound' },
           max_tokens: { type: 'number', description: 'deep_raw only: result token budget, default from raw.maxResultTokens' },
+          hash: { type: 'string', description: 'deep_raw only: restore one raw turn verbatim by sha256 (from [Slimmed] hash_…)' },
           regex: { type: 'boolean', description: 'deep_raw only: treat text as a restricted regular expression' },
         },
         output: { schema: { type: 'string' }, render: (_args, value) => toolResult(value) },
@@ -898,6 +968,10 @@ export async function apply(ctx, rawConfig = {}) {
           stillStarting('recall', async () => {
             if (args.mode === 'deep_raw') {
               if (runtime.phase !== 'ready') return errorJson(runtime.notReady('deep_raw'));
+              if (typeof args.hash === 'string' && args.hash.trim()) {
+                const restored = await runtime.memory.deepRaw({ hash: args.hash.trim() });
+                return JSON.stringify({ ok: true, ...restored });
+              }
               if (args.start_time === undefined || args.end_time === undefined) {
                 return errorJson(
                   new MemoryError(
@@ -918,7 +992,7 @@ export async function apply(ctx, rawConfig = {}) {
               });
               runtime.touch();
               runtime.recordToolCall({ landed: (result.hits ?? []).length > 0 });
-              return JSON.stringify({ ok: true, ...result });
+              return slimToolPayload(runtime, { ok: true, ...result });
             }
             const result = await runtime.recall({
               text: args.text ?? '',
@@ -929,7 +1003,7 @@ export async function apply(ctx, rawConfig = {}) {
             if (runtime.phase === 'ready' && config.context.injectPrompt) {
               injectRecall(runtime, result);
             }
-            return JSON.stringify({ ok: true, ...result });
+            return slimToolPayload(runtime, { ok: true, ...result });
           }),
       }),
     );
@@ -970,6 +1044,23 @@ export async function apply(ctx, rawConfig = {}) {
             });
             runtime.recordToolCall({ landed: result.stored === true });
             return JSON.stringify({ ok: true, ...result });
+          }),
+      }),
+    );
+
+    register(
+      defineTool({
+        name: `${config.toolPrefix}_bulk_ingest`,
+        description: 'Batch-ingest memories in chunks of 50 with sequential awaits (prevents OOM). Returns per-item failures instead of aborting the whole batch.',
+        parameters: {
+          items: { type: 'array', items: { type: 'object', additionalProperties: true }, description: 'Array of remember() payloads', required: true },
+        },
+        output: { schema: { type: 'string' }, render: (_args, value) => toolResult(value) },
+        execute: async (args = {}) =>
+          stillStarting('bulk_ingest', async () => {
+            runtime.touch();
+            const result = await runtime.memory.bulkIngest(args.items ?? []);
+            return JSON.stringify({ ok: result.failed.length === 0, ...result });
           }),
       }),
     );
@@ -1139,6 +1230,18 @@ export async function apply(ctx, rawConfig = {}) {
               `- ${config.toolPrefix}_admin: status / maintain / active_tags / semantic / active_task / reviews / pending_deletes.`,
               'Memory is NOT the session transcript: store durable facts, not turn-by-turn narration.',
               'If a memory call fails, report the error code instead of inventing a result.',
+            ].join('\n'),
+        }),
+      );
+      // Static discipline (cache-safe: no dynamic content in this section).
+      disposers.push(
+        ctx.systemPrompt.section({
+          name: 'memory:policy',
+          order: 2455,
+          text: () =>
+            [
+              `【读取与检索纪律】当需要回忆历史、查阅文件、获取系统信息时，**必须优先调用 ${config.toolPrefix}_recall 工具**，严禁直接盲目读取外部超长文件或调用其他原生工具输出全文。`,
+              `若 ${config.toolPrefix}_recall 返回了 [Slimmed] 标记，说明内容已被智能瘦身：如无绝对必要，请基于瘦身摘要和关键实体回答；若确实需要全文，请通过返回的 recovery_hash 指针再次向海马体请求原文（${config.toolPrefix}_recall mode="deep_raw", hash=...）。`,
             ].join('\n'),
         }),
       );

@@ -70,6 +70,7 @@ export const CONFIG_KEYS = Object.freeze([
   'delete',
   'review',
   'migration',
+  'tagTree',
   'identity',
   'policy',
 ]);
@@ -103,7 +104,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   storageBudgetMb: 50,
   maxRecallTopK: 100,
   retrieval: Object.freeze({ topK: 20 }),
-  context: Object.freeze({ maxTokens: 4000, threshold: 0.85, target: 0.7, injectPrompt: true }),
+  context: Object.freeze({ maxTokens: 4000, threshold: 0.85, target: 0.7, injectPrompt: true, minInjectConfidence: 0.6 }),
   temp: Object.freeze({ ttlDays: 30, promotionWindowDays: 20 }),
   // Decay curve and active-set size are policy knobs, but they are also first-class
   // config: the UI edits them, so they must be declared and validated here.
@@ -115,6 +116,8 @@ export const DEFAULT_CONFIG = Object.freeze({
     mode: 'salience',
     autoCapture: true,
     captureTools: false,
+    // 0 = never, 0.5 = deterministic half sampling, 1 = every surface turn.
+    captureRatio: 1,
     minSalience: 0.6,
     maxTurnKb: 64,
     maxBytesPerDay: 8,
@@ -130,6 +133,9 @@ export const DEFAULT_CONFIG = Object.freeze({
   // Spaced repetition schedule (days between reviews).
   review: Object.freeze({ enabled: true, intervals: [1, 2, 4, 7, 15, 30] }),
   migration: Object.freeze({ timeoutMs: 600_000 }),
+  // L1.5 lifecycle knobs are user-facing on purpose (charter v3.0): no silent
+  // hard-coded half-lives. leafDecayFloor 0 keeps the strict forget-driven mode.
+  tagTree: Object.freeze({ midHalfLifeMultiplier: 3.0, midGracePeriodDays: 30, pruneBatchSize: 100, leafDecayFloor: 0 }),
   identity: Object.freeze({ eventTimePolicy: 'content' }),
   policy: Object.freeze({}),
 });
@@ -411,6 +417,11 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
   }
   const contextInjectPrompt =
     contextIn.injectPrompt === undefined ? defaults.context.injectPrompt : requireBoolean(contextIn.injectPrompt, 'context.injectPrompt');
+  const contextMinInjectConfidence = requireNumberInRange(
+    contextIn.minInjectConfidence === undefined ? defaults.context.minInjectConfidence : contextIn.minInjectConfidence,
+    'context.minInjectConfidence',
+    { min: 0, max: 1 },
+  );
 
   const tempIn = input.temp ?? {};
   const tempTtlDays = requireInteger(
@@ -449,6 +460,16 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
   // ---- raw-turn retention (forensic trail, gated + capped) ------------------
   const rawIn = input.raw ?? {};
   const rawMode = requireEnum(rawIn.mode ?? defaults.raw.mode, 'raw.mode', RAW_MODES);
+  const rawCaptureRatio = (() => {
+    const value = rawIn.captureRatio === undefined ? defaults.raw.captureRatio : Number(rawIn.captureRatio);
+    if (value !== 0 && value !== 0.5 && value !== 1) {
+      throw configError(ErrorCodes.CONFIG_OUT_OF_RANGE, 'config.raw.captureRatio must be 0, 0.5 or 1', {
+        key: 'raw.captureRatio',
+        got: rawIn.captureRatio,
+      });
+    }
+    return value;
+  })();
   const rawMinSalience = requireNumberInRange(
     rawIn.minSalience === undefined ? defaults.raw.minSalience : rawIn.minSalience,
     'raw.minSalience',
@@ -522,6 +543,26 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     { min: 10_000, max: 3_600_000 },
   );
 
+  const treeIn = input.tagTree ?? {};
+  const treeNumber = (key, fallback, min, max) => {
+    const value = treeIn[key] === undefined ? fallback : Number(treeIn[key]);
+    if (!Number.isFinite(value) || value < min || value > max) {
+      throw configError(ErrorCodes.CONFIG_OUT_OF_RANGE, `config.tagTree.${key} must be in [${min}, ${max}]`, {
+        key: `tagTree.${key}`,
+        got: treeIn[key],
+        min,
+        max,
+      });
+    }
+    return value;
+  };
+  const tagTreeConfig = {
+    midHalfLifeMultiplier: treeNumber('midHalfLifeMultiplier', defaults.tagTree.midHalfLifeMultiplier, 1, 10),
+    midGracePeriodDays: treeNumber('midGracePeriodDays', defaults.tagTree.midGracePeriodDays, 7, 180),
+    pruneBatchSize: treeNumber('pruneBatchSize', defaults.tagTree.pruneBatchSize, 10, 500),
+    leafDecayFloor: treeNumber('leafDecayFloor', defaults.tagTree.leafDecayFloor, 0, 1),
+  };
+
   const policyIn = input.policy === undefined ? {} : input.policy;
   if (!isPlainObject(policyIn)) {
     throw configError(ErrorCodes.CONFIG_INVALID_TYPE, 'config.policy must be an object', { key: 'policy' });
@@ -594,6 +635,7 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
       threshold: contextThreshold,
       target: contextTarget,
       injectPrompt: contextInjectPrompt,
+      minInjectConfidence: contextMinInjectConfidence,
     },
     temp: { ttlDays: tempTtlDays, promotionWindowDays: tempPromotionWindowDays },
     decay: { halfLifeDays: decayHalfLifeDays },
@@ -602,6 +644,7 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
       mode: rawMode,
       autoCapture: rawAutoCapture,
       captureTools: rawCaptureTools,
+      captureRatio: rawCaptureRatio,
       minSalience: rawMinSalience,
       maxTurnKb: rawMaxTurnKb,
       maxBytesPerDay: rawMaxBytesPerDay,
@@ -613,6 +656,7 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     delete: { graceHours: deleteGraceHours },
     review: { enabled: reviewEnabled, intervals: reviewIntervals },
     migration: { timeoutMs: migrationTimeoutMs },
+    tagTree: tagTreeConfig,
     identity: { eventTimePolicy },
     policy: policyIn,
   };

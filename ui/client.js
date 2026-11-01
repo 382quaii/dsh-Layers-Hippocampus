@@ -157,6 +157,9 @@
           attempts: 0,
         });
         const bootAtRef = React.useRef(Date.now());
+        // Tracks the served dataDir: a background migration changes it without a
+        // config POST, so the settings page and graph must be told to refetch.
+        const dataDirRef = React.useRef(null);
 
         React.useEffect(() => {
           let alive = true;
@@ -186,6 +189,12 @@
               });
               miss = decision.miss;
               if (decision.kind === 'ready') {
+                const servedDir = (body && body.config && body.config.dataDir) || null;
+                if (dataDirRef.current !== null && servedDir !== dataDirRef.current) {
+                  // Migration finished in the background: refresh config + graph.
+                  announce('config-changed');
+                }
+                dataDirRef.current = servedDir;
                 setState({ loading: false, payload: body, error: null, state: 'ready', gaveUp: false, attempts: 0 });
               } else if (decision.kind === 'pending') {
                 const reported = hasJson && body.state ? body.state : 'pending';
@@ -320,9 +329,13 @@
               });
           };
           load();
+          // A background migration swaps dataDir without a POST from this page;
+          // poll so the form (address field, raw limits) converges on the truth.
+          const timer = setInterval(load, 3000);
           bus.addEventListener('config-changed', load);
           return () => {
             alive = false;
+            clearInterval(timer);
             bus.removeEventListener('config-changed', load);
           };
         }, []);
