@@ -37,6 +37,8 @@ import {
 import { parseRecord, serialiseRecord } from './records.js';
 
 const LOG_MANIFEST = 'manifest.json';
+/** Max interval between manifest/fsync checkpoints on the append hot path. */
+const FLUSH_INTERVAL_MS = 200;
 
 function segmentName(index) {
   return `seg-${String(index).padStart(6, '0')}.jsonl`;
@@ -55,7 +57,78 @@ export class LogStore {
     this.maxSegmentRecords = maxSegmentRecords;
     this._mutex = new Mutex();
     this._manifestCache = new Map(); // gen -> manifest
+    // Hot-path append state: one open handle, one deferred manifest checkpoint.
+    // Records land in the OS page cache synchronously (visible to every reader in
+    // this process); fsync + manifest are checkpointed at most every
+    // FLUSH_INTERVAL_MS, on close(), and before any rewrite/compaction.
+    this._appendFd = null;
+    this._appendHandleKey = null;
+    this._manifestDirty = false;
+    this._flushTimer = null;
     ensureDir(root);
+  }
+
+  _closeAppendHandle() {
+    if (this._appendFd !== null) {
+      try {
+        fs.closeSync(this._appendFd);
+      } catch {
+        /* already closed */
+      }
+      this._appendFd = null;
+    }
+    this._appendHandleKey = null;
+  }
+
+  _appendChunk(gen, segment, chunk) {
+    const key = `${gen}/${segment}`;
+    if (this._appendHandleKey !== key) {
+      this._closeAppendHandle();
+      this._appendFd = fs.openSync(path.join(this.generationPath(gen), segment), 'a');
+      this._appendHandleKey = key;
+    }
+    fs.writeSync(this._appendFd, chunk);
+  }
+
+  /** Durability checkpoint: fsync the open segment and publish the manifest. */
+  flushSync() {
+    if (this._flushTimer) {
+      clearTimeout(this._flushTimer);
+      this._flushTimer = null;
+    }
+    if (this._appendFd !== null) {
+      try {
+        fs.fsyncSync(this._appendFd);
+      } catch {
+        /* best effort: a read-only or vanished handle must not break the append path */
+      }
+    }
+    if (!this._manifestDirty) return;
+    const gen = this.currentGeneration();
+    if (!gen) return;
+    const manifest = this._manifestCache.get(gen) ?? readJson(path.join(this.generationPath(gen), LOG_MANIFEST), null);
+    if (!manifest) return;
+    writeJsonAtomic(path.join(this.generationPath(gen), LOG_MANIFEST), manifest);
+    this._manifestDirty = false;
+  }
+
+  _scheduleManifestFlush() {
+    if (this._flushTimer) return;
+    this._flushTimer = setTimeout(() => {
+      this._flushTimer = null;
+      try {
+        this.flushSync();
+      } catch {
+        /* the next append or close retries */
+      }
+    }, FLUSH_INTERVAL_MS);
+    this._flushTimer.unref?.();
+  }
+
+  /** Sync shutdown: checkpoint everything the buffered append path still owns. */
+  close() {
+    this.flushSync();
+    this._closeAppendHandle();
   }
 
   currentGeneration() {
@@ -131,7 +204,7 @@ export class LogStore {
         const line = `${serialiseRecord(record)}\n`;
         if (segment.records + chunkRecords + 1 > this.maxSegmentRecords) {
           // finalise the current segment, then start a new one
-          appendLineDurable(path.join(this.generationPath(gen), segment.name), chunk);
+          this._appendChunk(gen, segment.name, chunk);
           segment.bytes += Buffer.byteLength(chunk);
           segment.sha256 = null;
           const next = { name: segmentName(manifest.segments.length + 1), records: 0, bytes: 0, sha256: null };
@@ -144,7 +217,7 @@ export class LogStore {
         chunkRecords += 1;
       }
       if (chunk) {
-        appendLineDurable(path.join(this.generationPath(gen), segment.name), chunk);
+        this._appendChunk(gen, segment.name, chunk);
         segment.bytes += Buffer.byteLength(chunk);
       }
       segment.records += chunkRecords;
@@ -155,9 +228,12 @@ export class LogStore {
       manifest.lastLogTime = last.log_time;
       manifest.updatedAt = last.log_time;
       if (manifest.createdAt === null) manifest.createdAt = records[0].log_time;
-      // stamp generation id into every record's index position: no, records are immutable.
-      writeJsonAtomic(path.join(this.generationPath(gen), LOG_MANIFEST), manifest);
+      // The manifest is a checkpoint, not a per-append commit: publish it on the
+      // flush timer / close() / before a rewrite. The log lines themselves are
+      // already written, so nothing a reader needs is waiting on this.
       this._manifestCache.set(gen, manifest);
+      this._manifestDirty = true;
+      this._scheduleManifestFlush();
       return { gen, appended: records.length, recordCount: manifest.recordCount };
     });
   }
@@ -249,6 +325,10 @@ export class LogStore {
    */
   async rewrite({ keep, reason = 'rewrite' }) {
     return this._mutex.run(async () => {
+      // A rewrite replaces the generation a buffered append handle points at:
+      // checkpoint and close it FIRST, or pending bytes could land in a retired file.
+      this.flushSync();
+      this._closeAppendHandle();
       const snapshot = await this.snapshot();
       const kept = [];
       const dropped = [];
@@ -289,6 +369,7 @@ export class LogStore {
       fsyncDir(this.root);
       this._manifestCache.set(gen, manifest);
       this._manifestCache.delete(snapshot.gen);
+      this._manifestDirty = false;
       return {
         gen,
         previousGen: snapshot.gen,
@@ -318,9 +399,21 @@ export class LogStore {
 
   async status() {
     const gen = this.currentGeneration();
-    if (!gen) return { gen: null, recordCount: 0, segments: 0 };
+    if (!gen) return { gen: null, recordCount: 0, segments: 0, unflushedBytes: 0 };
     const manifest = this.readManifest(gen);
     const generations = listGenerations(this.root);
+    // Crash visibility: bytes appended to a segment but not yet checkpointed into
+    // the manifest are only detectable by size. bootCheck treats them as stale, so
+    // an unclean shutdown can never hide records behind an "up to date" index.
+    let unflushedBytes = 0;
+    for (const segment of manifest.segments) {
+      try {
+        const size = fs.statSync(path.join(this.generationPath(gen), segment.name)).size;
+        if (size > (segment.bytes ?? 0)) unflushedBytes += size - segment.bytes;
+      } catch {
+        /* a missing segment is a corruption case handled by snapshot() */
+      }
+    }
     return {
       gen,
       recordCount: manifest.recordCount,
@@ -328,6 +421,7 @@ export class LogStore {
       lastLogTime: manifest.lastLogTime,
       generationCount: generations.length,
       latestGenerationNumber: genNumber(generations[generations.length - 1] ?? 'gen-000000'),
+      unflushedBytes,
     };
   }
 }

@@ -179,6 +179,25 @@ state/tag-tree.json              L1.5 标签层级树 + 幽灵宽限 + 待修剪
 - 在线候选 `top-k = 20`（上限 100）；只读活跃集合，不裁决。
 - 活跃集为空 → `mode:"degraded"`，扫**最近** `degradedRecentBlocks=3` 个日记块 + 标签前缀匹配，并写 `degraded:empty-active-set:recentBlocks=3`；绝不静默返回空、绝不全量扫。
 
+## 写入路径（1.4.3：stage → commitMany / 缓冲 / 崩溃可见）
+
+顺序写入曾经只有 ~100 条/秒：每条 `remember` 都重写 ledger、重写日志 manifest，并**整表重建索引**（O(n²)）。现在的纪律：
+
+- **`stage()` → `commitMany()`**：`remember` 先 stage（校验 + 身份解析 + 构造记录，只改内存 ledger，不碰日志/索引），再 commitMany（**一次** append + **一次** ledger checkpoint + **一次** lazy 索引 delta + **一次** briefing 失效）。`bulkIngest` 每 50 条调用一次 commitMany，所以一个 chunk 是一次真实写入，而不是 50 次。
+- **日志追加缓冲**：热路径保留一个 append 句柄，`fs.writeSync` 落 page cache（本进程立即可读）；fsync + manifest 由 200ms 定时器、`close()`、以及任何 `rewrite()/compact()` 前的 `flushSync()` 完成。跨进程崩溃最多丢/滞后 **200ms** 的 checkpoint，不会丢已写的日志行。
+- **崩溃可见**：`LogStore.status().unflushedBytes` = 分片文件大小 − manifest 计数字节。boot check 见到它 > 0 就判 `stale` 并重建索引——否则崩溃前的尾记录会被"计数恰好相等"的假象藏起来。
+- **ledger 延迟 checkpoint**（500ms / close）：它是可从日志重建的启动提示，不是真相源，所以不需要每条都 O(n) 重写。
+- **索引追加惰性化**：`applyRecords` 只拼接 `_records` 并置 `_dirty`；下一次 `snapshot()` 一次折叠。读路径的 `snapshot()` 是同步纯函数折叠，因此"await 完 remember 立刻 recall"仍然读得到；N 次写只付一次建索引成本。
+- **briefing 脏标记**：写只置脏，下一次 `briefing()`/面板轮询才重算一次。
+- **实测**：顺序 `remember` ×1000 **119/s → 9104/s**（8.4s → 110ms），10⁵ 事件的回归测试仍全绿。
+
+## 原始回合取证：`deep_raw` 扫描顺序（1.4.3）
+
+- **最新优先**：分片内从尾部倒序扫描（先 newest shard、再 newest line），时间窗仍是硬约束。旧实现从文件头正序扫描，5000 回合预算永远花在最旧的数据上——10k 分片里最新的记录根本查不到，这是黑匣子语义的反转。单分片大小本身由 `raw.maxBytesPerDay` 约束（默认 8MB），整片读入是有界的。
+- **预算来自 config**：`raw.maxScanTurns`（默认 5000，范围 500–50 000，UI 可调），不再使用隐藏常量；`raw.maxScanMb` 仍限制累计字节。命中超出任一预算 → `truncated: true` + `notes` 说明，绝不静默假装"没有"。
+- **⚠ 尾扫偏置（明确的已知代价）**：单分片超过 `maxScanTurns` 时，一次调用只覆盖该分片**最新的 N 条**；更早的历史需要 ① 调大 `raw.maxScanTurns`（上限 50 000），或 ② 按时间窗分页（逐步前移 `end_time`，多次查询不同窗口）。这是"查新优先"的直接代价，返回体用 `truncated: true` + notes 明确告知未扫完；不存在静默的空结果。
+- 回归护栏：四字段 schema、tombstone 跳过、read-side 脱敏、token 预算、`hash_` 精确恢复全部不变。
+
 ## L2.5 趋势隔离层（晋升 / 淘汰）
 
 大语料喂出来的模型会把**语料统计热词**（梗、一时流行语、群体腔调）当成用户特质，于是变成"不正经"的助手：它学的是人群，不是这个人。所以趋势不得直接成为特质。
@@ -202,6 +221,55 @@ state/tag-tree.json              L1.5 标签层级树 + 幽灵宽限 + 待修剪
 - **carry-forward**：纯重建只看活事件，一个只剩死亡的子树会在同一次 rebuild 里整体消失，宽限/幽灵就永远观察不到。因此维护把上一份缓存里"失去全部活引用"的节点以 `refCount=0` 接回（**孤儿直接丢弃，不伪造根**），再走同一套 prune。这使 `tag-tree.json` 成为与 `graph.json` 同级的派生缓存：可删，代价仅是幽灵历史。
 - **反幻觉降级（`memory_recall`）**：只经由宽限 mid 到达的命中，其正文（`snippet`/`content`/`score`）被**整条移除**，改为一组元数据 `ghostHints[]`：`mid / path / count / graceUntil / graceDaysLeft / window / hint`；`hint` 引导 `deep_raw` 并给出时间窗（取 `day`＝anchorTime 的日界，而非可能由内容哈希推导的 `event_time`）。查询点名宽限 mid 而索引无实体命中时返回 `count:0` 的同一提示，绝不静默空答。语义层（L3）**豁免**：它是蒸馏出的模式而非模糊的实例，"用户以前做前端"不是幻觉。
 - **UI 历史视图**：图谱路由同响应带 `tagTree.ghosts`（渲染上限 **50** 条 + `totalGhosts/truncated`；图谱是 O(n²) 力导向，历史全量灌进去就是 UI 性能风暴）；前端把幽灵画成半透明虚线圆节点、挂在父 `root` 下，用 CSS `opacity 420ms` 做"仅活跃 / 历史全貌"的淡入淡出，布局键不含开关状态，切换不重排。
+
+## 大标签治理（1.5.0，防 OOM / 防上下文爆炸）
+
+海量数据下"标签爆炸"会把倒排索引与上下文同时撑爆。1.5.0 在**物理层**加三道闸门，全部只增不减地保留日志真相：
+
+- **索引截断**：`deriveTagTable` 每个标签最多保留 `index.maxPostingsPerTag`（默认 500）个 postings。超限时保留序为 `salience desc → eventTime desc → eventId asc`，再按检索序 `eventTime desc` 重排；`eventCount` / `mass` / `lastSeen` 仍按**全部事件**聚合（降级提示里的 N 才是真实总数），被丢弃的只是内存指针。标签带 `postingsLimit/postingsTruncated/postingsDropped`，索引 `stats` 带汇总。重建与惰性折叠（`_ensureFresh`）走同一条上限（`IndexManager.getMaxPostingsPerTag` 实时读配置）。
+- **检索降级**：显式 `tags` 命中 `eventCount > 50`（`TAG_OVERFLOW_THRESHOLD`）时不展开候选、不唤醒图关联、也抑制 coarse-block 回退；返回一条 `oversizedTagHints`（含该标签 postings 的时间窗）与固定提示文案。调用方"坚持"（同标签再次查询，进程内记录）时只返回最近 3 条摘要（`OVERSIZED_TAG_RECENT`），绝不返回全量列表。
+- **深层检索时间窗**：`deep_raw` 命中关联数 > 500（`SUPER_TAG_THRESHOLD`）的标签时**必须**给时间窗，缺失抛 `MEM_E_TIME_RANGE_REQUIRED`；非超级标签保持原 `MEM_E_INVALID_INPUT`。判定只在引擎一处，工具不再前置校验。
+
+## 多空间路由与会话交接（1.5.0，纯物理层）
+
+权限编排留给未来的 Orchestrator 插件；海马体只做物理路由与上下文记账。
+
+- **空间 = 独立存储目录**：`default` 复用原 dataDir（旧行为字节不变），`<dataDir>/spaces/<spaceId>/` 是子空间（各自 log/index/state/semantic/raw）。`remember`/`recall` 的 `targetSpaceId` 由 `SpaceRouter` 解析；id 即目录名，故强校验 `^[a-z0-9][a-z0-9._-]{0,63}$`，非法直接 `MEM_E_INVALID_INPUT`，绝不静默落默认空间。
+- **每空间一条 FIFO 锁**：同空间操作串行、跨空间并发（`SpaceRouter.run` 每 id 一条 promise 链）。单一全局锁会把两个独立空间变回一条队列，正是要消除的跨空间停顿；`runMany` 按 id 排序嵌套加锁，避免 ABBA 死锁。
+- **原生保真 / 分层折叠**：`ContextEngine.nativeState()` 有效占用 = `max(块表 token, 会话 token)`；`< nativeTokenLimit` 为 `native` 模式（Qwen：逐字保留，**绝不折叠**），`>=` 为 `layered`（允许 L1.5 折叠）。旧 `maxTokens` 分页阈值与淘汰算法完全未动，`enforce()` 只是**新增** `native-force` 分支。
+- **自动交接（转生）**：有效占用达到 `autoRolloverThreshold × nativeTokenLimit` 时，`Memory.checkHandoff()` 把窗口末尾（或最新索引事件）提炼为**一条** L1.5 摘要（`status:handoff`，含 `status:folded` 标记），写 `state/handoff.json`（含 tokenSource/sessionId/ratio/summaryEventId），`runtime.promptState()` 在**易变尾部**追加 `[交接标记]`。幂等：marker 已 active 不再重复提炼；新会话（`observeSessionTokens` 检测到新 id）消费 marker（`active:false, consumedBy`）。会话 token 由 `session/event` 逐轮估算，**独立于 raw 门控**，raw 关闭也能交接。
+- **关闭交接**：不写 marker；`enforce()` 在 95% 时强制驱逐到 `min(target×maxTokens, target×nativeTokenLimit)`，返回 `reason:"native-force"`。
+- **状态面**：`panel.session`（mode/tokens/nativeTokenLimit/threshold/remainingTokens/rolloverEnabled/handoffActive…）与 `panel.spaces`（current/ids/open）是 UI 状态栏与空间面板的数据源。
+
+## 跨空间安全迁移（1.5.0）与显式用户授权闸门（1.5.1）
+
+`memory_space_transfer` / `memory_transfer_to_global` / `POST /api/hippocampus/transfer` → `Memory.transferEvents` → `transferBetweenSpaces`：
+
+- **SECURITY：迁移 = 数据外发，模型绝无自主权**（1.5.1）。`context.requireExplicitConsentForTransfer`（默认 **true**）为真时，`Memory.transferEvents` 在**校验空间 id、打开存储、读取内容、挂起待删之前**检查 `userApproved === true`；缺失即抛 `MEM_E_REQUIRE_USER_CONSENT`（固定文案 `[系统拦截] 跨空间传递需要用户明确授权。请向用户确认后再试。`），被拒绝的调用零副作用。工具层只把模型显式给出的 `user_approved:true` 传下去；模型看到拦截必须停下、向用户确认后才能重试。
+- **两条通道严格分离**：Agent 工具 → 引擎闸门（需 `user_approved`）；浏览器面板 → `POST /api/hippocampus/transfer`，该路由是**人类通道**，自身标记 `userApproved:true`（同源已鉴权浏览器请求）。Agent 半边无法访问 HTTP 路由，因此不存在“模型自己点按钮”的绕过路径；面板“最近记忆”每行的「分享/转移」按钮走的就是这条通道。
+- **提示词层红线**：`memory:policy` 常驻 `【🚨最高安全红线】` 静态段，点名两个工具、禁止自行判断/同情心/“更好地跨端共享”触发、唯一允许条件与不确定时的询问话术，并说明 `MEM_E_REQUIRE_USER_CONSENT` 的重试协议（且明令不可自我批准）。
+- **先校验、再读、后写**：mode ∈ {copy, move}；id 必须存在（墓碑事件按缺失处理）；**隐私安检**命中身份证/手机号/银行卡/邮箱/凭据赋值/PEM 私钥时整批 `MEM_E_PRIVACY_BLOCKED`，目标与源都不写、不挂删除，`details.ids/categories` 绝不回传命中原文；`meta` 深拷贝并剥离 `raw_turn/rawTurn/raw_*`。
+- **身份重生**：目标空间用 `remember({dedupe:false})` 重新分配 `event_id`（绝不复用源 id），并打 `transferred:from:<src>` / `transferred:to:<dst>` 标签。
+- **copy vs move**：`copy` 源保持 `retained`；`move` 仅在**全部目标写入成功后**调用 `source.pendingDeletes.request({graceHours ≥ 1})`，源进入两阶段删除（可 `restore` 取消），**绝不直接物理删除**；目标部分失败则源完全不动。
+- **`GET /api/hippocampus/memories`**（1.5.1）：只读最近记忆投影（`limit`/`space`，索引快照排序，不发全文），供面板逐条展示与人工触发迁移。
+
+## UI 架构纠偏（1.5.2）：物理迁移与业务迁移解耦 + 全局空间选择器
+
+纠偏前的 UI 把两件无关的事混在一个面板：`dataDir` 物理换盘迁移 与 业务 `event_ids` 跨空间复制/剪切；且让用户手填 `target_space_id`。1.5.2 重构为三条互不共享状态的链路：
+
+- **物理迁移（系统级）**：`StorageMigratorUI`（设置页底部独立 Section）→ `POST /config { dataDir }` → `runtime.startMigration` → `MigrationRunner`（A/B 双缓冲、`state=migrating`、复制→校验→切换、旧目录保留为备份）。与业务迁移**不共享队列、不共享状态、不共享 UI**：失败不会产生 `pending_delete`，被拒绝的迁移也不碰任何记忆。Fail-Fast 在 `validateMigrationPaths` 同步完成：空/相对/等于当前/位于当前内/磁盘根 → `MEM_E_MIGRATION_PATH`；目标存在且非空 → `MEM_E_MIGRATION_TARGET_BUSY`；目标存在但不是目录 → `MEM_E_MIGRATION_PATH`。全部发生在返回 202、启动后台任务之前。
+- **全局空间选择器（SpaceSelector）**：面板 Header 一个 `<select>`（默认/工作/私人/全局 + `＋ 新建空间`），选中即全局状态（`spaceStore` + `space-changed` bus），面板与设置页共用。所有读取 hook 追加 `?space=<id>`：`stats` / `graph` / `memories`；后端 `runtime.uiPayload(spaceId)` / `graphPayload(spaceId)` 调用 `Memory.status({targetSpaceId})` / `Memory.graphForSpace({targetSpaceId})`，命名空间走各自子存储与独立锁。因此记忆列表、图谱、L1 日志/索引、L2.5、L3、L1.5 标签树与会话状态栏全部是**选中空间的数据**，切换不串流（`panel.spaces.current` 也报告选中空间，不再恒为 default）。`POST /spaces { space_id }` 创建**空**空间，绝不是复制。
+- **业务迁移（受控流程）**：面板勾选记忆 → `移动到…` → 第一步 `即将向 [目标空间] 发起迁移请求` → 第二步 `二次确认 · 安全红线`（剪切另有警告）→ 才发送 `user_approved: true`。目标空间来自下拉，**没有 `target_space_id` 文本输入**。HTTP 路由不再自行标记授权：缺失 `user_approved` 与 AI 工具调用一样被引擎闸门拦截（`MEM_E_REQUIRE_USER_CONSENT`），所以“底层 API 绕 UI”也被堵死。
+
+## 自动交接状态机加固（1.5.4）
+
+交接已从"尽力而为的摘要"升级为**不可死锁的状态机**：
+
+- `checkHandoff()` 永不 reject：摘要抛错、蒸馏超时（默认 5s，可注入测试）或 marker 写入失败，都会降级为 `state:"failed"` 的 active marker（含 `summaryError`），并立即返回；新会话照常启动。
+- `observeSessionTokens()`：新 session id **立即建立自己的基线**、消费不属于本 session 的 marker、释放 `_handoffInFlight`；同 key 但 token 估计腰斩视为重启，同样重置。
+- `_distillHandoffTail()`：按 `status:handoff` 标签与 `交接摘要` 文本前缀双重过滤（索引回退路径同样过滤），输出硬上限 1200 字符，杜绝"摘要套娃"。
+- `status:handoff` 摘要在普通 recall 中按 **2% 权重**排序、永不进入普通记忆列表；真实事实优先。
+- 逃生舱：`resetSessionState()`、`memory_admin action=reset_session`、`POST /api/hippocampus/session/reset`、设置页按钮；脏数据由 `repairHandoffSummaries()` / `scripts/repair-handoff.mjs` 默认 dry-run 后进入两阶段待删队列。
 
 ## 上下文窗口分页（模块 3，引擎驱动）
 
@@ -301,7 +369,9 @@ pending ──start()──▶ in_progress ──(打开日志/迁移/引导索�
 ## 提示注入按需（不预加载）
 
 - `memory` 段（order 2450）只讲工具契约与写入纪律，不拼接历史。
-- `memory-state` 段（order 220）每次装配时读 `runtime.promptState()`，只渲染**当前上下文窗口**的存活块，没有历史快照。
+- `memory-state` 段（order 220）每次装配时读 `runtime.promptState()`，由 `composePrompt()` 按**缓存稳定顺序**拼装：
+  `[稳定规则] → [Memory Map]（活跃标签+计数，慢变） → [Memory Blocks]（存活块，唯一的每轮易变尾巴）`。
+  前缀（规则+地图）在配置/标签集合不变时逐字节稳定，只有尾巴随召回块变化；旧的"一行 briefing 直接返回"已废弃（那行含 `events=`，每次写入都会击穿前缀缓存）。回归测试在 `test/plugin.test.js`：同一次会话内召回前后，前缀必须完全相等。
 - `memory:reflection` 段默认不注册内容：只有连续工具调用达到 `REFLECTION_THRESHOLD`（12）次，才在 `text()` 里返回反思提示；`enableReflection:false` 时整段不注册。
 
 ## UI：Client 插件 + Slot 注册
@@ -366,7 +436,7 @@ window.__ModuleLoader__.load({
 
 - 未知键 → `400 MEM_E_CONFIG_UNKNOWN_KEY`；值越界 → `400 MEM_E_CONFIG_OUT_OF_RANGE`；坏 JSON → `400 MEM_E_INVALID_INPUT`；非 GET/POST → `405`。
 - **生效与持久化分离**：`runtime.updateConfig(patch)` 先 `resolveConfig` 校验再原子替换运行配置（失败则运行配置不动）；持久化走 `configEditor.entries()/edit()`（Loader 自己的写配置路径）。没有 `configEditor` 时返回 `persisted:false` 与 `note`，前端如实显示"已生效，重启前不持久"。
-- 热更新的落地字段：`context.maxTokens/threshold/target` 直接写 `ContextEngine` 的 override（下一次 `enforce()` 即生效）；`dreamIdleMinutes/enableDream/enableReflection` 由 runtime 每 tick 读取；其余分组（`raw.*`、`tagTree.*`、`delete.*`、`context.minInjectConfidence` 等）由 `applyConfig` 投影到运行中的 `Memory.config`，下一个使用点/下一次维护即生效——设置页"保存后立即生效"不是口号。
+- 热更新的落地字段：`context.maxTokens/threshold/target` 直接写 `ContextEngine` 的 override（下一次 `enforce()` 即生效）；`dreamIdleMinutes/enableDream/enableReflection` 由 runtime 每 tick 读取；其余分组（`raw.*`、`tagTree.*`、`delete.*`、`context.*` 的运行时旋钮等）由 `applyConfig` 投影到运行中的 `Memory.config`，下一个使用点/下一次维护即生效——设置页"保存后立即生效"不是口号。`context.minInjectConfidence` 已于 1.5.3 移除，旧配置带该键会 fail-fast。
 
 ### 错误码表
 
@@ -391,6 +461,12 @@ window.__ModuleLoader__.load({
 | `MEM_E_ALREADY_PURGED` | 对已物理删除的事件再次操作 | 无需处理 |
 | `MEM_E_CONSOLIDATION_REQUIRED` | `consolidationMode:"strict"` 需人工确认 | 先 `action=semantic` 再推进 |
 | `MEM_E_NOT_READY` | 插件尚在 `pending`/`in_progress`（或已 `failed`），读或写被拒 | 等 `ready`；迁移窗口读旧目录，写仍拒 |
+| `MEM_E_TIME_RANGE_REQUIRED` | `deep_raw` 命中超级大标签（>500 关联）但缺 `start_time`/`end_time`（1.5.0） | 补时间窗（或改用窄查询） |
+| `MEM_E_PRIVACY_BLOCKED` | 跨空间迁移命中隐私敏感内容，整批被拦（1.5.0） | 先脱敏/移除该事件再迁移 |
+| `MEM_E_REQUIRE_USER_CONSENT` | 模型侧迁移调用缺 `user_approved:true` 且 `context.requireExplicitConsentForTransfer` 为真（1.5.1） | 停下向用户确认，用户同意后带 `user_approved:true` 重试（UI 人工通道不受影响） |
+| `MEM_E_SPACE_INVALID` | 新建空间名非法/保留/已存在/路径冲突（1.5.3），写盘前拦截 | 换一个合法且未占用的空间名（小写字母/数字开头，a-z 0-9 . _ -，≤64） |
+| `MEM_E_INVALID_TOOL_NAME` | `tools.disabled` 含未知工具名（如 `remeber`）、核心工具（remember/recall/admin）或重复项（1.5.3） | 只写无 `toolPrefix` 的后缀名；核心工具不可关闭 |
+| `MEM_E_HANDOFF_FAILED` | 自动交接摘要生成失败/超时/写 marker 失败（1.5.4）；引擎已降级放行新会话 | 用设置页逃生舱或 `memory_admin action=reset_session` 清状态；不阻塞新会话 |
 | `MEM_E_WRITER_BUSY` | 写者互斥争用 | 重试 |
 | `MEM_E_CLOCK_INVALID` / `MEM_E_IO` | 时钟回退 / 磁盘错误 | 检查环境 |
 
@@ -403,9 +479,9 @@ window.__ModuleLoader__.load({
 # 加长看门狗：$env:MEM_TEST_TIMEOUT_MS='120000'
 ```
 
-运行器带**看门狗**：默认 **30s**（`MEM_TEST_TIMEOUT_MS` 可调）仍未退出，就打印**卡住时正在导入/执行的文件、最后完成的测试名与完成数、活动资源、尚未触发的定时器**，然后 `process.exit(1)`。它不会用 `process.exit(0)` 掩盖超时——挂起即失败。`MEM_TEST_TRACE=1` 可看文件级进度，`MEM_TEST_ONLY=<子串>` 只跑一组。
+运行器带**看门狗**：默认 **60s**（`MEM_TEST_TIMEOUT_MS` 可调）仍未退出，就打印**卡住时正在导入/执行的文件、最后完成的测试名与完成数、活动资源、尚未触发的定时器**，然后 `process.exit(1)`。它不会用 `process.exit(0)` 掩盖超时——挂起即失败。`MEM_TEST_TRACE=1` 可看文件级进度，`MEM_TEST_ONLY=<子串>` 只跑一组。
 
-189 个用例（27 个文件）覆盖：
+295 个用例（40 个文件）覆盖：
 
 - 索引与标签：重建 digest 一致、行号漂移防护（eventId 不变、行号变）、同义合并、活跃集 cap 挤出、规则变更不改清单、空活跃集降级、top-k 有界有序去重。
 - 衰减与删除：30 天半衰期、reinforce 移动锚点（不存字段）、仅文本粗筛、标签过滤、维护代切换且旧代可读、boot 检查、压缩不丢记录、并发维护串行化、四阶段删除、archive 可回滚 vs purge 不可、strict 巩固暂停与恢复、任务重放幂等、错误 id 零变更。
@@ -419,7 +495,16 @@ window.__ModuleLoader__.load({
 - Client 包（`test/clientSlot.test.js`，19 个用例）：`__ModuleLoader__` 工厂纯度、`inject:['slots']`、三个注册的 id/key 与顺序、dispose 全部执行、图标是纯 SVG、`index.js` 不含 React/DOM、设置页覆盖全部键、L1.5 滑块+数字框+Tooltip、幽灵节点与"仅活跃/历史全貌"淡入淡出（并锁定布局键不含开关状态）；`ghostGraphParts()` 纯函数直接断言幽灵节点/root 锚点/边。
 - L1.5 标签树（`test/tagTree.test.js` 11 + `test/tagTreeMaintenance.test.js` 8）：纯函数（层级解析、实时衰减重算、release 队列、carry-forward、孤儿丢弃、配置半衰期）；集成（原子发布/来源代/顺序稳定、leaf→ghost→mid 死亡级联、复活、25 死叶分批 10/10/5/0、损坏缓存自愈、删缓存只丢幽灵、`tagTreeView` 只发幽灵元数据）。
 - 反幻觉召回（`test/ghostRecall.test.js`，3 个用例 + `test/retrieval.test.js` 单元）：宽限 mid 命中正文被物理移除、按 mid 聚合计数、点名宽限 mid 无命中时 `count:0` 提示、维护复活后正文恢复、`panel.tagTree.ghostCount` 跟随。
+- 写入路径与 `deep_raw`（`test/v143.test.js`，9 个用例）：`stage` 不写日志、`commitMany` 一次写、`bulkIngest` 分块/幂等/失败隔离、briefing 脏刷新、日志 `close()` checkpoint、崩溃可见字节、**200ms 窗口内被 kill 后重启检测 stale 并重建尾索引**、`raw.maxScanTurns` 默认值/范围/HTTP 可编辑、最新优先扫描与预算截断。
+- 全链路接线（`test/plugin.test.js` 新增 2 个用例）：`memory-state` 由 `composePrompt` 输出 `规则 → [Memory Map] → [Memory Blocks]`，召回注入后**前缀逐字节不变**、尾巴出现召回块；`memory_admin maintain` 真正落盘 `state/tag-tree.json`，`memory_forget`+maintain 后工具层 `memory_recall` 只返回 `ghostHints`（正文不泄漏、含 `deep_raw` 提示），`memory_admin status` 的 `panel.tagTree.ghostCount` 与缓存一致。
 - 面板：`status().panel` 形状快照（键全集，防漏字段）+ 值快照；写入后 `events/activeTags` 跟随；`cumulativeSavedTokens` 跨 reopen 保持（`state/context.json`）；`queuedDeletes` 取自删除流水线而非独立计数器；`indexGeneration` 每次 rebuild 恰好 +1。
+- v1.5.0 六组新用例：`v150.index.test.js`（截断保序/真实计数/降级→坚持 3 条/超级标签时间窗）；`v150.space.test.js`（跨空间并发 vs 同空间 FIFO/目录隔离/非法 id/native 边界/95% 强驱逐/旧阈值回归）；`v150.transfer.test.js`（copy 保留、move 两阶段、隐私拦截、raw_turn 剥离、新 id、部分失败不改源）；`v150.ui.test.js`（bundle 契约、状态栏/过滤/软跟随纯函数、无防抖、Footer 文案、transfer 路由）；`v150.lifecycle.test.js`（Qwen 原生折叠门、阈值交接+标记注入+新会话消费、空间隔离、第九工具）；`v150.config.test.js`（两个新组默认值/范围/HTTP 可编辑）。
+- v1.5.1 安全补丁（`test/v151.consent.test.js`，9 个用例）：默认开闸 + 布尔 fail-fast；闸门先于校验/IO（非法目标也先回 CONSENT、不挂待删、源不变）；工具无 `user_approved` 被拦、带 `user_approved:true` 成功；`memory_transfer_to_global` 同契约并落到 `global`；显式关闭配置后才放行；`Memory.transferEvents` 引擎层同契约；`memory:policy` 红线文案标记；HTTP 路由不再伪造授权（缺 `user_approved` 与工具同拦）；面板使用 SpaceSelector + 勾选 `移动到…` 流程，手动 id 文本框已删除。
+- v1.5.2 架构纠偏（`test/v152.refactor.test.js`，7 个用例）：`dataDir` 校验矩阵（空/相对/相同/内部/根/非空/非目录）与 `startMigration` fail-fast（旧目录完好）；`?space=` 下 stats/graph/memories/session/recall 逐项隔离不串流；`ensureSpace` 创建空空间 + `/spaces` 路由；未授权迁移在引擎与 HTTP 双点被拦、显式授权通过；UI 接线（SpaceSelector 挂载、勾选流程、无手动输入、StorageMigratorUI 独立）。
+- v1.5.3 空间创建热修（`test/v153.spaces.test.js`，7 个用例）：客户端 `API` 常量表与后端 `MEMORY_API`/注册路由逐路径相等（路由漂移锁，防再次 404）；用客户端真实路径对注册表派发 POST 并断言 handler 应答 201（不是 router 404）；`validateNewSpaceId` 非法/保留矩阵（空、字符集、`..`、尾点、Windows 设备名、超长）；`Memory.createSpace` 冲突/路径冲突在写盘前抛 `MEM_E_SPACE_INVALID`；HTTP `POST /spaces` 成功 201、重复/非法 400 + `capabilities` 握手；客户端错误映射（404/网络 → 固定人话，绝不泄漏 `HTTP 404`）与能力握手降级（旧宿主显示版本提示而非发请求）。
+- v1.5.3 工具裁剪（`test/v155.tools.test.js`，7 个用例）：`tools.disabled` 默认空数组、后缀词表闭集；`remeber`/带前缀名/核心工具/重复项全部 `MEM_E_INVALID_TOOL_NAME`；HTTP 可编辑并走同一校验器；默认 10 个工具零回归；`disabled:["capture","bulk_ingest"]` 时注册表与 `memory` 提示段同时剔除这两个工具；非法名称在 `apply()` 阶段阻断激活且零工具注册。
+- v1.5.4 交接状态机加固（`test/v156.handoff.test.js`，9 个用例）：递归摘要同时按 tag 与 `交接摘要` 前缀过滤且输出硬上限 1200 字符；蒸馏抛错/挂起（timeout 可注入）时 `checkHandoff` 不 reject、写 `failed` 降级 marker；新会话必然重置 token 基线、消费旧 marker、释放 in-flight；`status:handoff` 在 recall 中 2% 权重且不进普通列表；`resetSessionState`/admin 工具/HTTP 逃生舱；`repairHandoffSummaries` dry-run 与 pending_delete 归档。
+- v1.5.3 发布卫生（`test/v154.release.test.js`，3 个用例）：`minInjectConfidence` 端到端移除（配置 fail-fast、不在 HTTP 白名单、retrieval 无导出、recall 无 confidence/low-confidence 注解、UI 无该键与旧文案）；多空间固定开销（N=10：建空间/写入耗时、每空间字节数 max/min≤1.35、总字节随 N 线性、单空间固定开销<256KB、逐空间冷启动中位耗时<500ms、根启动不 eager 打开子空间 `spaces.open=[]`）；基准协议 `scripts/bench-protocol.mjs` 独立临时库 + 同进程预热 + 5 次取中位数，报告必须带离散度。
 
 
 ## SLO / 容量
@@ -431,7 +516,9 @@ window.__ModuleLoader__.load({
 | 日记块 | 1 天/块；每块 `maxSegmentRecords` 事件上限 5000 |
 | recall P99 | < 50 ms @ 10⁵ 事件 / 5 年日记（索引常驻内存，A/B 双缓冲，切换为单次指针赋值） |
 | maintain | 10⁵ 事件 < 3 s，且**不阻塞** recall（写新代，读旧代） |
-| 单次 append | < 5 ms（fsync 每次追加，可选批量） |
+| 顺序写入 | 1000 条 ≈ 110 ms（实测 9104 条/s；stage 无 I/O，commit 一次 append） |
+| 单次 append | < 1 ms 到 page cache；fsync + manifest 每 200ms checkpoint，close()/rewrite() 强制 |
+| deep_raw | 分片内最新优先，回合预算 `raw.maxScanTurns`（默认 5000），超出即 `truncated:true` |
 | L2.5 隔离条目 | ≤ 500 条（`temp.maxEntries`，超限拒绝新条目并回报 `over-cap`） |
 | 上下文窗口 | 4000 token 预算，0.85 触发 / 0.7 收敛；每次召回注入 ≤ `context.blockTopK=8` 块 |
 
@@ -467,6 +554,7 @@ window.__ModuleLoader__.load({
 5. 上下文分页的 token 数是 `ceil(len/4)` 估算，不是真实 tokenizer：预算偏保守（少注入比溢出安全），接真实 tokenizer 只需替换 `estimateTokens()`。
 6. `event_time` 默认由内容推导意味着"日期是内容的函数、不是现实的函数"：这换来可重放的身份，但把日期当新鲜度用会失真。因此**检索新鲜度不用它**：`time_source==='content'` 的事件用 `log_time` 做 recency anchor（见"评分与预算"），推导日期只作为身份坐标与展示。调用方知道真实发生时间时仍应传 `happened_at`——它会把 `time_source` 变成 `explicit`，从而锚点也换成真实时间。
 7. **幽灵历史不是日志的纯函数**：L1.5 的活树可由索引逐字节重建，但"宽限中的 mid"依赖**死亡被观察到的时刻**。因此 `state/tag-tree.json` 采用 carry-forward，与 `graph.json` 同级视为派生缓存：删掉它 = 丢历史幽灵、保活树，不丢任何真相。这是为"不扫全量日志"付出的唯一代价，并且已被测试锁定。
+8. **写入路径用 200ms 的 checkpoint 窗口换吞吐**：日志行 `writeSync` 后立刻可读，但 fsync 与 manifest 发布是延迟的（200ms / close / rewrite）。这换来 ~90× 的顺序写入提升；跨进程崩溃最多让最后 200ms 的 checkpoint 滞后，而 `unflushedBytes` + boot check 保证这种滞后会被识别为 stale 并重建，而不是被隐藏。代价与检测手段同时写进了 `test/v143.test.js`。
 
 ## 身份、幂等与双缓冲（v2）
 

@@ -40,6 +40,29 @@ export function validateMigrationPaths({ from, to }) {
   if (/^([A-Za-z]:[\\/]?)$/.test(target) || target === path.parse(target).root) {
     throw new MemoryError(ErrorCodes.MIGRATION_PATH, 'refusing to use a filesystem root as dataDir', { target });
   }
+  // FAIL-FAST (architecture charter: no clamp, no silent fallback): "absolute path
+  // + EMPTY target" is enforced HERE, synchronously, before a 202 is returned. A
+  // non-empty target is rejected with MIGRATION_TARGET_BUSY instead of starting a
+  // job that would only fail inside the background state machine.
+  let targetStat = null;
+  try {
+    targetStat = fs.statSync(target);
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw new MemoryError(ErrorCodes.MIGRATION_PATH, `target directory cannot be inspected: ${error.code}`, { target });
+    }
+  }
+  if (targetStat) {
+    if (!targetStat.isDirectory()) {
+      throw new MemoryError(ErrorCodes.MIGRATION_PATH, 'target exists and is not a directory', { target });
+    }
+    if (dataDirHasData(target)) {
+      throw new MemoryError(ErrorCodes.MIGRATION_TARGET_BUSY, 'target directory is not empty', {
+        target,
+        hint: 'choose a brand-new/empty directory; the old directory is kept as a backup',
+      });
+    }
+  }
   return { source, target };
 }
 

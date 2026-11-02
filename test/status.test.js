@@ -22,6 +22,10 @@ const PANEL_KEYS = [
   'raw',
   'reviews',
   'pendingDeletes',
+  // v1.5.0: the status bar ("[当前: 原生模式 | 剩余 X Tokens 触发交接]") and the
+  // space panel read these two groups; they are part of the UI contract.
+  'session',
+  'spaces',
 ].sort();
 
 test('the status panel has the full documented shape', async () => {

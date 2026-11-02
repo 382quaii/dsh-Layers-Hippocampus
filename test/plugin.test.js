@@ -7,7 +7,8 @@
  */
 
 import assert from 'node:assert/strict';
-import { rmSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 import { apply, getRuntime, inject, resolveConfig } from '../index.js';
 import { tempDir } from './helpers.js';
@@ -116,13 +117,13 @@ test('an invalid policy is rejected at activation, before any store is created',
   }
 });
 
-test('apply registers eight tools and both prompt layers, and dispose removes them', async () => {
+test('apply registers ten tools and both prompt layers, and dispose removes them', async () => {
   const dir = tempDir('ctx');
   const ctx = fakeCtx();
   try {
     assert.deepEqual(inject, ['tools', 'systemPrompt']);
     await apply(ctx, { dataDir: dir, maintenanceCron: '0 */6 * * *', autoMaintainOnBoot: false });
-    assert.equal(ctx.toolsMap.size, 8, 'the tool surface exists immediately, before the store is ready');
+    assert.equal(ctx.toolsMap.size, 10, 'the tool surface exists immediately, before the store is ready');
     // Startup is asynchronous; await it the way a caller would.
     await getRuntime(ctx).ready;
 
@@ -135,10 +136,16 @@ test('apply registers eight tools and both prompt layers, and dispose removes th
       'memory_recall',
       'memory_reinforce',
       'memory_remember',
+      // v1.5.0: atomic cross-space migration.
+      'memory_space_transfer',
+      // v1.5.1: global-space migration alias, same consent gate.
+      'memory_transfer_to_global',
     ]);
     assert.ok(ctx.sections.has('memory'));
     assert.ok(ctx.contexts.has('memory-state'));
-    assert.match(ctx.contexts.get('memory-state').text(), /Memory gen=/);
+    const stateText = ctx.contexts.get('memory-state').text();
+    assert.ok(stateText.includes('[Memory Blocks]'), 'the state section is a composed prompt, not a bare briefing line');
+    assert.ok(stateText.includes('Memory state (live)'), 'the stable rules head is rendered');
   } finally {
     await ctx.dispose();
     assert.equal(ctx.toolsMap.size, 0, 'dispose unregisters every tool');
@@ -219,6 +226,108 @@ test('a failing tool returns a structured error instead of throwing', async () =
     const missing = await ctx.call('memory_forget', { event_ids: ['ev_nope_0_zzzz'] });
     assert.equal(missing.error.code, 'MEM_E_NOT_FOUND');
     assert.deepEqual(missing.error.details.missing, ['ev_nope_0_zzzz']);
+  } finally {
+    await ctx.dispose();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the memory-state prompt is composed live: stable rules + map + volatile block tail', async () => {
+  const dir = tempDir('prompt-compose');
+  const ctx = fakeCtx();
+  try {
+    await apply(ctx, {
+      dataDir: dir,
+      maintenanceCron: '0 */6 * * *',
+      autoMaintainOnBoot: false,
+      policy: { activeSet: { minEvents: 1, minMass: 0.01 } },
+    });
+    await getRuntime(ctx).ready;
+    await ctx.call('memory_remember', {
+      content: 'use pnpm -r build before publishing',
+      tags: ['habit:release'],
+      salience: 0.8,
+      happened_at: '2026-11-02T00:00:00.000Z',
+    });
+    await ctx.call('memory_admin', { action: 'maintain' });
+
+    const stateDefinition = ctx.contexts.get('memory-state');
+    const before = stateDefinition.text();
+    assert.ok(before.includes('[Memory Map]'), 'the map section is rendered');
+    assert.ok(before.includes('[Memory Blocks]'), 'the volatile tail marker is rendered');
+    assert.ok(before.indexOf('[Memory Map]') < before.indexOf('[Memory Blocks]'), 'map before blocks');
+    assert.match(before, /habit:release\(\d+\)/, 'the map carries tag + count, never bodies');
+
+    // A recall injects a live block: the tail changes, the cacheable prefix does not.
+    const mapEnd = before.indexOf('[Memory Blocks]');
+    const prefixBefore = before.slice(0, mapEnd);
+    const recalled = await ctx.call('memory_recall', { text: 'pnpm build', tags: ['habit:release'], top_k: 3 });
+    assert.ok(recalled.hits.length >= 1);
+    const after = stateDefinition.text();
+    assert.ok(after.includes('pnpm -r build'), 'the recalled block is rendered into the tail');
+    assert.equal(after.slice(0, after.indexOf('[Memory Blocks]')), prefixBefore, 'prefix cache survives block changes');
+  } finally {
+    await ctx.dispose();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('maintain() feeds the tag tree and memory_recall degrades a fading mid end-to-end', async () => {
+  const dir = tempDir('ghost-chain');
+  const ctx = fakeCtx();
+  try {
+    await apply(ctx, {
+      dataDir: dir,
+      maintenanceCron: '0 */6 * * *',
+      autoMaintainOnBoot: false,
+      delete: { graceHours: 0 },
+      policy: { activeSet: { minEvents: 1, minMass: 0.01 } },
+    });
+    await getRuntime(ctx).ready;
+
+    const saved = await ctx.call('memory_remember', {
+      content: 'vue notes live',
+      tags: ['tech/frontend/vue3'],
+      salience: 0.8,
+      happened_at: '2026-11-02T00:00:00.000Z',
+    });
+    assert.equal(saved.status, 'appended');
+    await ctx.call('memory_admin', { action: 'maintain' });
+
+    // Full chain: maintain() actually publishes the tag tree cache to disk.
+    const treePath = path.join(dir, 'state', 'tag-tree.json');
+    assert.ok(existsSync(treePath), 'maintain() writes state/tag-tree.json');
+    const tree = JSON.parse(readFileSync(treePath, 'utf8'));
+    assert.equal(tree.schema, 1);
+    assert.ok(tree.nodes.some((node) => node.id === 'mid:frontend'), 'the live mid is in the tree');
+    assert.ok(tree.nodes.some((node) => node.id === 'leaf:vue3'), 'the live leaf is in the tree');
+
+    // Purge the only leaf, then maintain again: the mid must become a ghost.
+    const forgotten = await ctx.call('memory_forget', { event_ids: [saved.eventId], mode: 'purge', reason: 'ghost-chain' });
+    assert.equal(forgotten.state, 'deleted');
+    await ctx.call('memory_admin', { action: 'maintain' });
+    assert.equal(getRuntime(ctx).memory.ghostHints().length, 1, 'the mid is inside its grace window');
+    const ghostTree = JSON.parse(readFileSync(treePath, 'utf8'));
+    assert.deepEqual(ghostTree.ghosts.map((ghost) => ghost.id), ['mid:frontend']);
+
+    // Full chain through the TOOL surface: metadata only, no body leak, deep_raw hint.
+    const recalled = await ctx.call('memory_recall', { tags: ['tech/frontend'], text: 'vue', top_k: 5 });
+    assert.equal(recalled.ok, true);
+    assert.deepEqual(recalled.hits, [], 'no concrete hit is served for a ghost mid');
+    assert.equal(recalled.ghostHints.length, 1);
+    assert.equal(recalled.ghostHints[0].mid, 'frontend');
+    assert.equal(recalled.ghostHints[0].path, 'tech/frontend');
+    assert.match(recalled.ghostHints[0].hint, /deep_raw/);
+    // The episode body must be physically removed from the HIT surface. L3 semantic
+    // summaries are a separate, deliberately exempt layer (a distilled pattern is
+    // not a faded instance), so only hits + ghost hints are checked here.
+    assert.equal(JSON.stringify(recalled.hits).includes('vue notes live'), false);
+    assert.equal(JSON.stringify(recalled.ghostHints).includes('vue notes live'), false);
+    assert.ok(recalled.notes.includes('ghost-hints:1') || recalled.notes.includes('ghost-degraded:1:mids=1'));
+
+    // The panel surface agrees with the same cache.
+    const status = await ctx.call('memory_admin', { action: 'status' });
+    assert.equal(status.panel.tagTree.ghostCount, 1);
   } finally {
     await ctx.dispose();
     rmSync(dir, { recursive: true, force: true });

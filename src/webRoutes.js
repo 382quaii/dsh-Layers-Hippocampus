@@ -7,9 +7,12 @@
  * `memory_admin action=status` uses — so the panel and the tool can never
  * disagree.
  *
- *   GET  /api/memory/stats   -> { ok, phase, panel, briefing, config }
- *   GET  /api/memory/config  -> { ok, config }
- *   POST /api/memory/config  -> { ok, config, persisted, note? }
+ *   GET  /api/hippocampus/stats    -> { ok, phase, panel, briefing, config }
+ *   GET  /api/hippocampus/config   -> { ok, config }
+ *   POST /api/hippocampus/config   -> { ok, config, persisted, note? }
+ *   GET  /api/hippocampus/graph    -> { ok, graph, tagTree }
+ *   POST /api/hippocampus/retry    -> { ok, ... }
+ *   POST /api/hippocampus/transfer -> { ok, ...transferResult }
  *
  * Contract notes:
  *   - Not ready is a `503`, not a `200` with zeros: the UI must be able to tell
@@ -28,6 +31,13 @@ export const MEMORY_API = Object.freeze({
   config: '/api/hippocampus/config',
   graph: '/api/hippocampus/graph',
   retry: '/api/hippocampus/retry',
+  transfer: '/api/hippocampus/transfer',
+  // Per-memory projection for the panel's human-initiated 分享/转移 button.
+  memories: '/api/hippocampus/memories',
+  // Global SpaceSelector: list/create the physical spaces the UI may switch to.
+  spaces: '/api/hippocampus/spaces',
+  // Escape hatch (v1.5.4): clear a wedged rollover/handoff state from the UI.
+  sessionReset: '/api/hippocampus/session/reset',
 });
 
 /** Only these keys may change over HTTP; anything else is rejected, not dropped. */
@@ -48,7 +58,21 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   'context.threshold',
   'context.target',
   'context.injectPrompt',
-  'context.minInjectConfidence',
+  // REMOVED v1.5.3: 'context.minInjectConfidence' (dead token knob). It is no
+  // longer editable — the config validator rejects it loudly on profile load.
+  // v1.5.0 multi-space routing + session handoff. Pure physical layer: these
+  // only move data between spaces and track the native context window.
+  'context.autoSpaceFollow',
+  'context.autoRolloverEnabled',
+  'context.autoRolloverThreshold',
+  'context.nativeTokenLimit',
+  // Security red line (v1.5.1): the operator decides whether model-initiated
+  // cross-space transfer needs an explicit per-call user approval. Default true.
+  'context.requireExplicitConsentForTransfer',
+  'index.maxPostingsPerTag',
+  // Tool schema pruning (v1.5.3): array of suffixes; the engine validates names
+  // fail-fast (core tools are rejected), the UI renders a checkbox catalog.
+  'tools.disabled',
   'temp.ttlDays',
   'temp.promotionWindowDays',
   'decay.halfLifeDays',
@@ -62,6 +86,7 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   'raw.maxTotalMb',
   'raw.retentionDays',
   'raw.maxScanMb',
+  'raw.maxScanTurns',
   'raw.maxResultTokens',
   'raw.captureRatio',
   'delete.graceHours',
@@ -169,6 +194,61 @@ function fail(res, status, error, runtime) {
 }
 
 /**
+ * Transfer body -> the exact shape `runtime.transferEvents()` expects.
+ *
+ * The wire uses snake_case (`event_ids`, `target_space_id`, `transfer_mode`,
+ * `source_space_id`) because this is also the agent-tool boundary; inside the
+ * plugin it is camelCase. Validation is deliberately strict: an empty id list or
+ * an unknown mode is a 400 with MEM_E_INVALID_INPUT, never a silent no-op, so a
+ * UI that renders "已转移" always corresponds to a real engine call.
+ */
+function normaliseTransferInput(body) {
+  const raw = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+  const input = raw.patch ?? raw;
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw invalidInput('transfer body must be an object', { got: input === null ? 'null' : typeof input });
+  }
+
+  if (!Array.isArray(input.event_ids) || input.event_ids.length === 0) {
+    throw invalidInput('event_ids must be a non-empty array of event ids', { field: 'event_ids' });
+  }
+  const eventIds = input.event_ids.map((id) => (typeof id === 'string' ? id.trim() : ''));
+  if (eventIds.some((id) => id === '')) {
+    throw invalidInput('event_ids must contain only non-empty strings', { field: 'event_ids' });
+  }
+
+  if (typeof input.target_space_id !== 'string' || input.target_space_id.trim() === '') {
+    throw invalidInput('target_space_id must be a non-empty string', { field: 'target_space_id' });
+  }
+
+  // Default is the safe one: a copy never removes anything from the source space.
+  const transferMode = input.transfer_mode === undefined || input.transfer_mode === null ? 'copy' : input.transfer_mode;
+  if (transferMode !== 'copy' && transferMode !== 'move') {
+    throw invalidInput("transfer_mode must be 'copy' or 'move'", { field: 'transfer_mode', got: transferMode });
+  }
+
+  let sourceSpaceId;
+  if (input.source_space_id !== undefined && input.source_space_id !== null) {
+    if (typeof input.source_space_id !== 'string' || input.source_space_id.trim() === '') {
+      throw invalidInput('source_space_id must be a non-empty string when provided', { field: 'source_space_id' });
+    }
+    sourceSpaceId = input.source_space_id.trim();
+  }
+
+  return {
+    eventIds,
+    targetSpaceId: input.target_space_id.trim(),
+    transferMode,
+    sourceSpaceId,
+    // SECURITY (v1.5.2): the browser must state the human approval explicitly.
+    // A request that omits it is refused by the ENGINE gate
+    // (MEM_E_REQUIRE_USER_CONSENT), exactly like the agent tool path. The HTTP
+    // route is not a consent-granting master key.
+    userApproved: input.user_approved === true,
+  };
+}
+
+/**
  * @param {object} options
  * @param {object} options.runtime        createRuntime() result
  * @param {Function|null} options.persist async (patch) => {persisted, note?}
@@ -184,13 +264,27 @@ export function createMemoryRoutes({ runtime, persist = null, logger = null }) {
     }
   };
 
+  /**
+   * The SpaceSelector routing hook: every read route accepts `?space=<id>` and the
+   * runtime resolves it to that physical store. A missing/blank value means the
+   * default space (single-space behaviour stays byte-identical).
+   */
+  const requestedSpace = (req) => {
+    try {
+      const value = new URL(String(req.url ?? '/'), 'http://localhost').searchParams.get('space');
+      return value && value.trim() ? value.trim() : null;
+    } catch {
+      return null;
+    }
+  };
+
   const statsHandler = async (req, res) => {
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       sendState(res, 405, runtime, { ok: false, error: { code: 'MEM_E_INVALID_INPUT', message: 'use GET' } });
       return;
     }
     try {
-      const payload = await runtime.uiPayload();
+      const payload = await runtime.uiPayload(requestedSpace(req));
       sendState(res, payload.ok ? 200 : 503, runtime, payload);
     } catch (error) {
       log(`stats failed: ${error?.message ?? error}`);
@@ -269,7 +363,7 @@ export function createMemoryRoutes({ runtime, persist = null, logger = null }) {
       return;
     }
     try {
-      const view = await runtime.graphPayload();
+      const view = await runtime.graphPayload(requestedSpace(req));
       sendState(res, view.ok ? 200 : 503, runtime, view);
     } catch (error) {
       log(`graph failed: ${error?.message ?? error}`);
@@ -293,11 +387,138 @@ export function createMemoryRoutes({ runtime, persist = null, logger = null }) {
     }
   };
 
+  // Recent memories: bounded read-only projection. This is what the panel's
+  // per-memory detail rows render before the human clicks 分享/转移. No writes, no
+  // log scan: `Memory.recentMemories` sorts the live index snapshot.
+  const memoriesHandler = async (req, res) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      sendState(res, 405, runtime, { ok: false, error: { code: 'MEM_E_INVALID_INPUT', message: 'use GET' } });
+      return;
+    }
+    try {
+      const url = new URL(String(req.url ?? MEMORY_API.memories), 'http://localhost');
+      const limitRaw = Number(url.searchParams.get('limit'));
+      const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(Math.round(limitRaw), 200) : 20;
+      const space = url.searchParams.get('space') || undefined;
+      if (stateOf(runtime) !== 'ready') {
+        sendState(res, 503, runtime, { ok: false, error: asMemoryError(runtime.notReady('memories')).toJSON() });
+        return;
+      }
+      const result = await runtime.recentMemories({ limit, targetSpaceId: space });
+      sendState(res, 200, runtime, { ok: true, ...result });
+    } catch (error) {
+      log(`memories failed: ${error?.message ?? error}`);
+      fail(res, 400, error, runtime);
+    }
+  };
+
+  // Global SpaceSelector data source. GET lists every physical space (root router);
+  // POST creates a NEW empty space (201). A missing route is exactly what produced
+  // `MEM_E_SPACES: HTTP 404` in the field (new client bundle + old host process):
+  // the stats payload now carries `capabilities.spaces`, so the client checks the
+  // handshake BEFORE calling this route and degrades with human-readable copy if
+  // the host is stale.
+  const spacesHandler = async (req, res) => {
+    if (req.method === 'GET' || req.method === 'HEAD') {
+      sendState(res, 200, runtime, {
+        ok: true,
+        spaces: runtime.spaceList(),
+        defaultSpaceId: 'default',
+        capabilities: runtime.capabilities ?? null,
+      });
+      return;
+    }
+    if (req.method !== 'POST') {
+      sendState(res, 405, runtime, { ok: false, error: { code: 'MEM_E_INVALID_INPUT', message: 'use GET or POST' } });
+      return;
+    }
+    try {
+      if (stateOf(runtime) !== 'ready') {
+        sendState(res, 409, runtime, { ok: false, error: asMemoryError(runtime.notReady('spaces')).toJSON() });
+        return;
+      }
+      const body = await readJsonBody(req);
+      const raw = body && typeof body === 'object' ? (body.patch ?? body) : {};
+      const spaceId = typeof raw.space_id === 'string' ? raw.space_id : typeof raw.spaceId === 'string' ? raw.spaceId : '';
+      // The strict validator lives in the ENGINE (validateNewSpaceId): malformed /
+      // reserved / existing ids throw MEM_E_SPACE_INVALID and land in the catch as
+      // a clean 400 — nothing is written, no raw FS error is exposed.
+      const result = await runtime.createSpace(spaceId);
+      sendState(res, 201, runtime, {
+        ok: true,
+        spaceId: result.spaceId,
+        created: result.created === true,
+        spaces: result.spaces.ids,
+        capabilities: runtime.capabilities ?? null,
+      });
+    } catch (error) {
+      log(`spaces failed: ${error?.message ?? error}`);
+      fail(res, 400, error, runtime);
+    }
+  };
+
+  // Transfer: copy/move events between spaces. The runtime owns the engine
+  // (privacy screen, fresh target ids, two-phase pending-delete queue for move);
+  // this handler only normalises the wire shape and maps every failure to 400.
+  //
+  // SECURITY (v1.5.2): the route FORWARDS the browser's explicit user_approved
+  // flag; it does NOT fabricate consent. A request that skips the UI's second
+  // confirmation (no `user_approved:true`) hits the same engine gate as an agent
+  // tool call and answers MEM_E_REQUIRE_USER_CONSENT. The agent half cannot reach
+  // HTTP routes at all, so "bottom API bypasses the UI" is blocked twice.
+  const transferHandler = async (req, res) => {
+    if (req.method !== 'POST') {
+      sendState(res, 405, runtime, { ok: false, error: { code: 'MEM_E_INVALID_INPUT', message: 'use POST' } });
+      return;
+    }
+    try {
+      const body = await readJsonBody(req);
+      const payload = normaliseTransferInput(body);
+      const result = await runtime.transferEvents(payload);
+      sendState(res, 200, runtime, { ok: true, ...(result && typeof result === 'object' ? result : {}) });
+    } catch (error) {
+      log(`transfer failed: ${error?.message ?? error}`);
+      fail(res, 400, error, runtime);
+    }
+  };
+
+  // Escape hatch (v1.5.4): a user whose session is wedged by a handoff can POST
+  // here (settings page button) to clear the token baseline, in-flight guard and
+  // marker. It touches only state/, never durable memories.
+  const sessionResetHandler = async (req, res) => {
+    if (req.method !== 'POST') {
+      sendState(res, 405, runtime, { ok: false, error: { code: 'MEM_E_INVALID_INPUT', message: 'use POST' } });
+      return;
+    }
+    try {
+      if (stateOf(runtime) !== 'ready') {
+        sendState(res, 409, runtime, { ok: false, error: asMemoryError(runtime.notReady('reset_session')).toJSON() });
+        return;
+      }
+      let reason = 'ui_escape_hatch';
+      try {
+        const body = await readJsonBody(req);
+        if (body && typeof body.reason === 'string' && body.reason.trim()) reason = body.reason.trim().slice(0, 120);
+      } catch {
+        /* an empty/invalid body still resets: this is the recovery path */
+      }
+      const result = await runtime.resetSessionState({ reason });
+      sendState(res, 200, runtime, { ok: true, ...result });
+    } catch (error) {
+      log(`session reset failed: ${error?.message ?? error}`);
+      fail(res, 500, error, runtime);
+    }
+  };
+
   return [
     { kind: 'exact', path: MEMORY_API.stats, handler: statsHandler },
     { kind: 'exact', path: MEMORY_API.config, handler: configHandler },
     { kind: 'exact', path: MEMORY_API.graph, handler: graphHandler },
     { kind: 'exact', path: MEMORY_API.retry, handler: retryHandler },
+    { kind: 'exact', path: MEMORY_API.transfer, handler: transferHandler },
+    { kind: 'exact', path: MEMORY_API.memories, handler: memoriesHandler },
+    { kind: 'exact', path: MEMORY_API.spaces, handler: spacesHandler },
+    { kind: 'exact', path: MEMORY_API.sessionReset, handler: sessionResetHandler },
   ];
 }
 

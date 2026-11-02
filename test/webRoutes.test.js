@@ -225,6 +225,7 @@ test('validatePatch rejects non-objects and accepts only the editable set', () =
     'enableReflection',
     'graphMaxEdges',
     'identity',
+    'index',
     'maintenanceCron',
     'maxRecallTopK',
     'promptSection',
@@ -234,6 +235,8 @@ test('validatePatch rejects non-objects and accepts only the editable set', () =
     'storageBudgetMb',
     'tagTree',
     'temp',
+    // v1.5.3 tool schema pruning: tools.disabled nests under its own group.
+    'tools',
   ]);
 });
 
@@ -284,10 +287,31 @@ test('registerMemoryRoutes registers the full route table and disposes it, or re
   };
   const result = registerMemoryRoutes(host, { runtime });
   assert.equal(result.registered, true);
-  assert.deepEqual(result.paths, [MEMORY_API.stats, MEMORY_API.config, MEMORY_API.graph, MEMORY_API.retry]);
-  assert.deepEqual(registered.map((route) => route.kind), ['exact', 'exact', 'exact', 'exact']);
+  assert.deepEqual(result.paths, [
+    MEMORY_API.stats,
+    MEMORY_API.config,
+    MEMORY_API.graph,
+    MEMORY_API.retry,
+    MEMORY_API.transfer,
+    MEMORY_API.memories,
+    MEMORY_API.spaces,
+    MEMORY_API.sessionReset,
+  ]);
+  assert.deepEqual(registered.map((route) => route.kind), ['exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact']);
   result.dispose();
-  assert.deepEqual(disposed.sort(), [MEMORY_API.config, MEMORY_API.graph, MEMORY_API.retry, MEMORY_API.stats].sort());
+  assert.deepEqual(
+    disposed.sort(),
+    [
+      MEMORY_API.config,
+      MEMORY_API.graph,
+      MEMORY_API.memories,
+      MEMORY_API.retry,
+      MEMORY_API.sessionReset,
+      MEMORY_API.spaces,
+      MEMORY_API.stats,
+      MEMORY_API.transfer,
+    ].sort(),
+  );
 
   const missing = registerMemoryRoutes({ get: () => null }, { runtime });
   assert.equal(missing.registered, false);

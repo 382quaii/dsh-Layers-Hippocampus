@@ -22,7 +22,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const HANG_TIMEOUT_MS = Number(process.env.MEM_TEST_TIMEOUT_MS ?? 30_000);
+// Watchdog for a real HANG, not for a slow-but-progressing suite: the in-process
+// suite now boots several real stores/spaces and can legitimately take ~15-35s on
+// a cold/AV-scanned filesystem. MEM_TEST_TIMEOUT_MS still overrides both ways.
+const HANG_TIMEOUT_MS = Number(process.env.MEM_TEST_TIMEOUT_MS ?? 60_000);
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
 const only = process.env.MEM_TEST_ONLY;

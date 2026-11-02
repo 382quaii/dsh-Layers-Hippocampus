@@ -26,7 +26,34 @@ const TOKEN_RE = /[a-z0-9]{2,}|[\u4e00-\u9fff]{1,}/gi;
 const ASSOCIATION_PENALTY = 0.5;
 /** Monthly memos never decay, and win ties on fuzzy historical queries. */
 const MONTHLY_TAG = 'status:monthly';
+/**
+ * Handoff summaries are state-machine bookkeeping, not memories a user asks for.
+ * They are ranked at 2% weight (v1.5.4) so real facts always outrank them; they
+ * remain reachable if a query explicitly names their tags.
+ */
+const HANDOFF_INTERNAL_TAG = 'status:handoff';
+const HANDOFF_INTERNAL_PENALTY = 0.02;
 const FUZZY_TIME_RE = /(上个月|本月|这个月|去年|前年|今年|月度|monthly|\d{4}\s*[-年/]\s*\d{1,2})/i;
+
+/**
+ * Tag-explosion defence (v1.5.0): three thresholds, three layers.
+ *
+ * A tag mentioned by hundreds of episodes is not a filter, it is a dump. Expanding
+ * its posting list floods the candidate pool and pushes the one precise memory out of
+ * the top-k — the model then answers from noise. The same flood exists one layer down
+ * in deep_raw, so the numbers are shared vocabulary, not per-call tuning knobs:
+ *
+ *   - TAG_OVERFLOW_THRESHOLD: an EXPLICIT query tag above this size is not expanded
+ *     into candidates at all; recall returns a structured hint asking for a precise
+ *     time window instead.
+ *   - OVERSIZED_TAG_RECENT: if the caller insists on that tag, it gets this many of
+ *     the most recent events — a bounded preview, never the full posting list.
+ *   - SUPER_TAG_THRESHOLD: a tag this large makes deep_raw require a time window,
+ *     because an unbounded forensic scan is the same explosion with raw turns.
+ */
+export const TAG_OVERFLOW_THRESHOLD = 50;
+export const OVERSIZED_TAG_RECENT = 3;
+export const SUPER_TAG_THRESHOLD = 500;
 
 export function tokenize(text) {
   if (typeof text !== 'string' || !text) return [];
@@ -58,29 +85,12 @@ function uniqueSorted(values) {
  * @param {object[]} [input.semantic] folded semantic summaries
  * @param {object[]} [input.tempSemantic] folded L2.5 quarantine entries
  */
-export const MIN_INJECT_CONFIDENCE = 0.6;
 
-/**
- * Confidence pass: a hit far below the best score is not worth injecting in full.
- * Low-confidence hits keep their id/score but swap the body for a one-line hint,
- * and the reason is reported so the caller can explain itself.
- */
-export function applyConfidence(hits = [], min = MIN_INJECT_CONFIDENCE) {
-  if (!Array.isArray(hits) || hits.length === 0) return { hits: [], notes: [] };
-  const max = Math.max(1e-9, ...hits.map((hit) => Number(hit.score) || 0));
-  const out = hits.map((hit) => {
-    const confidence = Math.min(1, Math.max(0, (Number(hit.score) || 0) / max));
-    if (confidence >= min) return { ...hit, confidence };
-    return {
-      ...hit,
-      confidence,
-      snippet: '[低置信 ' + confidence.toFixed(2) + '] 相关但不确定；建议换关键词，或 deep_raw + 时间窗查原话',
-      lowConfidence: true,
-    };
-  });
-  const low = out.filter((hit) => hit.lowConfidence === true).length;
-  return { hits: out, notes: low > 0 ? [`low-confidence-hints:${low}`] : [] };
-}
+// NOTE (v1.5.3): the `minInjectConfidence` / `applyConfidence` pass was REMOVED.
+// It never demonstrably saved tokens (0.6 and 0 produced byte-identical output on
+// homogeneous corpora) while every added hit-shaping pass is permanent token tax
+// and a misleading config knob. Recall now returns ranked hits as-is; the only
+// payload reduction is the token-budget slimmer, which has a measured effect.
 
 function isoTimestamp(epochMs) {
   return new Date(epochMs).toISOString();
@@ -239,6 +249,58 @@ export function degradeGhostHits(hits = [], ghosts = [], { now = 0, queryTags = 
   };
 }
 
+/**
+ * Event-time span of a tag's postings, so an oversized-tag hint can hand the caller
+ * a range that actually contains data. Postings store the anchor time (recency
+ * coordinate), matching what decay uses.
+ */
+function postingsWindow(postings) {
+  if (!Array.isArray(postings) || postings.length === 0) return null;
+  let start = Infinity;
+  let end = -Infinity;
+  for (const posting of postings) {
+    const at = posting?.eventTime;
+    if (!Number.isFinite(at)) continue;
+    if (at < start) start = at;
+    if (at > end) end = at;
+  }
+  return start === Infinity ? null : { start, end };
+}
+
+/**
+ * The refusal must be actionable: it says how big the tag is AND the two ways out
+ * (a precise window, or deep_raw for the verbatim turns). Silence would look like an
+ * empty memory; an unbounded dump would look like a working one.
+ */
+function oversizedTagHint(tag, total, window, { recent = false } = {}) {
+  return {
+    tag,
+    total,
+    code: 'MEM_E_TAG_OVERFLOW',
+    hint: `[系统提示] 发现关于 [${tag}] 的记忆共 ${total} 条，数据量过大。请提供更精确的 startTime/endTime 或使用 deep_raw 查阅。`,
+    window,
+    ...(recent ? { recent: true } : {}),
+  };
+}
+
+/**
+ * The N most recent events carrying one tag, scanned from the event list rather than
+ * from `index.tags[tag].postings`: the posting list is physically capped, so the
+ * newest events are exactly what a salience-ranked cap may have dropped.
+ */
+function recentEventsForTag(events, tag, limit) {
+  const matches = [];
+  for (const event of events) {
+    if (!Array.isArray(event?.tags)) continue;
+    if (event.tags.some((item) => (item?.tag ?? item) === tag)) matches.push(event);
+  }
+  matches.sort(
+    (a, b) =>
+      (b.anchorTime ?? b.eventTime) - (a.anchorTime ?? a.eventTime) || a.eventId.localeCompare(b.eventId),
+  );
+  return matches.slice(0, limit);
+}
+
 export function recall({ index, query = {}, policy, now, semantic = [], tempSemantic = [], associations = [] }) {
   const topK = Math.round(clamp(Number(query.topK) || policy.candidates.topK, 1, policy.candidates.maxTopK));
   const text = typeof query.text === 'string' ? query.text.trim() : '';
@@ -256,6 +318,8 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
     generation: index?.generation ?? null,
     builtAt: index?.builtAt ?? null,
     notes: [],
+    // Always present, possibly empty: a caller reads this field, not a maybe-key.
+    oversizedTagHints: [],
   };
 
   // Semantic recall is independent of episode lifetime: an empty (or fully
@@ -286,6 +350,37 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
   const activeTags = new Set(active.map((entry) => entry.tag));
   const eventById = new Map(index.events.map((event) => [event.eventId, event]));
 
+  // ---- oversized explicit tags (v1.5.0) -----------------------------------
+  // Only EXPLICIT query tags are guarded: a free-text token or a graph neighbour
+  // reaching a big tag still narrows a real question, but a literal `tags: ['big']`
+  // over the threshold means "dump that tag", and expanding it would crowd every
+  // precise hit out of the top-k.
+  const oversizedTagHints = [];
+  const oversizedTags = new Set();
+  const oversizedRecentIds = new Set();
+  let insensitiveOversizedTags = 0;
+  for (const tag of queryTags) {
+    const entry = index.tags[tag];
+    if (!entry || !(Number(entry.eventCount) > TAG_OVERFLOW_THRESHOLD)) continue;
+    oversizedTags.add(tag);
+    const window = postingsWindow(entry.postings);
+    if (query.allowOversizedTags === true) {
+      // The caller insisted. Honour the intent but bound the damage: a fixed preview
+      // of the newest events read from the event list, never the whole posting list.
+      const recent = recentEventsForTag(index.events, tag, OVERSIZED_TAG_RECENT);
+      for (const event of recent) oversizedRecentIds.add(event.eventId);
+      oversizedTagHints.push(oversizedTagHint(tag, entry.eventCount, window, { recent: true }));
+      base.notes.push(`oversized-tag-recent:${recent.length}`);
+    } else {
+      insensitiveOversizedTags += 1;
+      oversizedTagHints.push(oversizedTagHint(tag, entry.eventCount, window));
+    }
+    // No exact hit, no posting accumulation and no prefix/child expansion for this
+    // tag: children are a broadening of the same overloaded subject and would
+    // silently bypass the guard.
+  }
+  if (insensitiveOversizedTags > 0) base.notes.push(`oversized-tag:${insensitiveOversizedTags}`);
+
   // ---- tag matching (exact, hierarchical, then prefix) ---------------------
   /** @type {Map<string, number>} tag -> match weight */
   const tagHits = new Map();
@@ -295,6 +390,7 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
   };
 
   for (const tag of queryTags) {
+    if (oversizedTags.has(tag)) continue;
     addHit(tag, 1);
     for (const candidate of Object.keys(index.tags)) {
       if (candidate === tag) continue;
@@ -331,6 +427,10 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
   for (const association of associations) {
     const tag = association?.tag;
     if (!tag || !index.tags[tag]) continue;
+    // The graph must not smuggle an oversized tag's postings back into the pool:
+    // the explicit-tag guard above is worthless if a neighbour re-expands it.
+    if (oversizedTags.has(tag)) continue;
+    if (Number(index.tags[tag].eventCount) > TAG_OVERFLOW_THRESHOLD) continue;
     const penalty = Number.isFinite(association.penalty) ? association.penalty : ASSOCIATION_PENALTY;
     for (const posting of index.tags[tag].postings) {
       affinity.set(posting.eventId, (affinity.get(posting.eventId) ?? 0) + posting.strength * penalty);
@@ -349,9 +449,16 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
 
   /** @type {Set<string>} */
   const candidates = new Set(affinity.keys());
-  if (candidates.size === 0 && !degraded) {
+  // The insist preview is a candidate even though its tag's postings were not
+  // expanded — these ids came straight from the event list.
+  for (const eventId of oversizedRecentIds) candidates.add(eventId);
+  if (candidates.size === 0 && !degraded && oversizedTagHints.length === 0) {
     // Stage 1 coarse recall in the normal path: no tag hit at all -> rank day
     // blocks by decayed salience mass and take the top few.
+    //
+    // Deliberately skipped when the query was degraded to oversized-tag hints: the
+    // recent blocks of a dumped tag ARE that dump, so falling back here would
+    // silently undo the guard and answer the flood anyway.
     const ranked = blocks
       .slice()
       .sort((a, b) => blockWeight(b) - blockWeight(a) || (a.day < b.day ? 1 : a.day > b.day ? -1 : 0));
@@ -389,6 +496,11 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
     if (!event) continue;
     const tags = event.tags.map((t) => t.tag);
     const monthly = tags.includes(MONTHLY_TAG);
+    // v1.5.4: internal handoff summaries are heavily down-ranked, never banned.
+    // Without this a 0.9-salience recursive summary outranks real facts on almost
+    // every query (the exact incident that motivated this patch).
+    const handoffInternal = tags.includes(HANDOFF_INTERNAL_TAG);
+    const handoffFactor = handoffInternal ? HANDOFF_INTERNAL_PENALTY : 1;
     // A monthly memo is a stable summary, not a fading episode: no decay at all,
     // and a small boost when the query is about a fuzzy historical period.
     const decay = monthly
@@ -407,7 +519,7 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
     const association = associationOf.get(eventId) ?? null;
     const associationFactor = association ? association.penalty : 1;
     const timeBoost = monthly && text && FUZZY_TIME_RE.test(text) ? 1.3 : 1;
-    const score = event.salience * decay * tagAffinity * lexicalBoost * associationFactor * timeBoost;
+    const score = event.salience * decay * tagAffinity * lexicalBoost * associationFactor * timeBoost * handoffFactor;
     scored.push({
       eventId,
       eventTime: event.eventTime,
@@ -420,6 +532,9 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
       tags,
       monthly,
       ...(association ? { association } : {}),
+      // Marks the two hits that exist because the caller insisted on an oversized
+      // tag, so the model knows this is a bounded preview, not the answer set.
+      ...(oversizedRecentIds.has(eventId) ? { oversizedRecent: true } : {}),
       reinforcementCount: event.reinforcementCount ?? 0,
       snippet: snippet(event.content, 400),
     });
@@ -453,6 +568,7 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
     hits,
     semantic: semanticHits,
     tempSemantic: tempHits,
+    oversizedTagHints,
     scanned: {
       blocks: blocks.length,
       candidates: candidates.size,
@@ -463,6 +579,44 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
     },
     candidateTags: [...tagHits.keys()].sort(),
   };
+}
+
+/**
+ * Super-tag detection for the forensic layer (v1.5.0).
+ *
+ * `deepRaw` without a time window is an unbounded scan of raw turns. When the query
+ * names a tag carried by more than `threshold` events, that scan is the tag
+ * explosion one layer down — so Memory.deepRaw refuses and demands a window, using
+ * this list to say WHY and which tags are responsible.
+ *
+ * A tag can be named two ways and both count: an explicit `tags` entry, or a token
+ * in the free text (canonicalised through the index's own alias map, so a synonym
+ * cannot slip past the gate). Pure read: a missing or partial index means "no super
+ * tags", never a throw — the gate must not turn a degraded index into a failed call.
+ */
+export function superTagAssociations({ index, text = '', tags = [], threshold = SUPER_TAG_THRESHOLD } = {}) {
+  if (!index || typeof index !== 'object' || !index.tags || typeof index.tags !== 'object') return [];
+  const limit = Number.isFinite(threshold) ? threshold : SUPER_TAG_THRESHOLD;
+  try {
+    const aliases = index.aliases ?? {};
+    const canonicalise = (tag) => {
+      const token = normaliseTagToken(tag);
+      if (!token) return '';
+      return aliases[token] ?? token;
+    };
+    const explicit = Array.isArray(tags) ? tags : tags ? [tags] : [];
+    const candidates = new Set([...explicit.map(canonicalise), ...tokenize(text).map(canonicalise)].filter(Boolean));
+    const found = [];
+    for (const tag of candidates) {
+      const eventCount = Number(index.tags[tag]?.eventCount);
+      if (!Number.isFinite(eventCount) || eventCount <= limit) continue;
+      found.push({ tag, eventCount });
+    }
+    found.sort((a, b) => b.eventCount - a.eventCount || a.tag.localeCompare(b.tag));
+    return found;
+  } catch {
+    return [];
+  }
 }
 
 /**

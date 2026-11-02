@@ -23,7 +23,7 @@ import path from 'node:path';
 import { assertClock, SystemClock } from './clock.js';
 import { DeletePipeline } from './deletePipeline.js';
 import { MemoryError, ErrorCodes, invalidInput } from './errors.js';
-import { buildAliasMap, hashPolicy, resolvePolicy } from './policy.js';
+import { buildAliasMap, hashPolicy, normaliseTagToken, resolvePolicy } from './policy.js';
 import { controlIdFor } from './identity.js';
 import { makeForget, makeReinforce, makeRestore } from './log/records.js';
 import { ingestEpisode } from './log/ingest.js';
@@ -38,10 +38,17 @@ import { PendingDeletes } from './pendingDelete.js';
 import { foldRecords } from './index/buildIndex.js';
 import { Maintenance } from './maintenance.js';
 import { TagTreeCache, eventsFromIndex } from './tagTreeCache.js';
-import { applyConfidence, degradeGhostHits, recall as runRecall, tokenize } from './retrieval.js';
+import {
+  SUPER_TAG_THRESHOLD,
+  degradeGhostHits,
+  recall as runRecall,
+  superTagAssociations,
+  tokenize,
+} from './retrieval.js';
 import { SemanticStore } from './semantic/semanticStore.js';
 import { TempSemanticStore } from './semantic/tempSemantic.js';
 import { ContextEngine } from './context/contextEngine.js';
+import { DEFAULT_SPACE_ID, SpaceRouter, normaliseSpaceId, validateNewSpaceId } from './spaces/spaceRouter.js';
 import { nextRun, parseCron } from './cron.js';
 import { ensureDir, dayKey, genNumber, sha256, readJson, writeJsonAtomic, snippet } from './util.js';
 
@@ -87,6 +94,44 @@ export const FOLD_BATCH = 5;
 export const FOLDED_TAG = 'status:folded';
 /** Tag written on a monthly memo. */
 export const MONTHLY_TAG = 'status:monthly';
+/** Snapshot shape for state/handoff.json (v1.5.0 session rollover). */
+export const HANDOFF_SCHEMA = 1;
+/** Tag written on the L1.5 tail summary produced by an automatic handoff. */
+export const HANDOFF_TAG = 'status:handoff';
+/** Session-key used when the host does not publish a session id. */
+export const DEFAULT_SESSION_KEY = 'default-session';
+/** Bounded session map: old session ids are forgotten, never persisted. */
+export const SESSION_TRACK_LIMIT = 16;
+/**
+ * Handoff watchdog (v1.5.4). A distillation that hangs (lock, IO, pathological
+ * payload) must NOT keep the state machine in `_handoffInFlight` forever: after
+ * this budget the engine degrades to a `failed` marker and lets the next session
+ * proceed. Configurable per call for tests.
+ */
+export const HANDOFF_TIMEOUT_MS = 5000;
+export const HANDOFF_STATES = Object.freeze({ ACTIVE: 'active', FAILED: 'failed', CONSUMED: 'consumed' });
+/** Any summary whose text starts with this is a handoff summary, never evidence. */
+export const HANDOFF_TEXT_PREFIX = '交接摘要';
+const HANDOFF_TEXT_RE = /^\s*交接摘要/;
+
+/**
+ * Bound an async handoff step. The timer is cleared in `finally` so a resolved
+ * distillation cannot keep the process alive; on expiry it rejects with
+ * MEM_E_HANDOFF_FAILED, which checkHandoff converts into a degraded marker.
+ */
+function withTimeout(promise, ms) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new MemoryError(ErrorCodes.HANDOFF_FAILED, `handoff distillation exceeded ${ms}ms`, { timeoutMs: ms, reason: 'timeout' })),
+      ms,
+    );
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
 
 const BASE64_RUN = /[A-Za-z0-9+/]{256,}={0,2}/;
 const ABSOLUTE_MEDIA = /^([A-Za-z]:[\\/]|\\\\|\/)/;
@@ -242,6 +287,10 @@ export class Memory {
     this.dataDir = path.resolve(dataDir);
     this.clock = clock;
     this.config = config;
+    // Kept so child spaces can be opened with the SAME policy input (the resolved
+    // policy is a projection; re-resolving the projection would silently double-apply
+    // aliases/defaults).
+    this._policyInput = policy;
     this.policy = resolvePolicy(policy);
     this.policyHash = hashPolicy(this.policy);
 
@@ -268,6 +317,9 @@ export class Memory {
       getPolicy: () => this.policy,
       clock: this.clock,
       getTombstones: () => this.tombstones.ids(),
+      // v1.5.0 tag-explosion defence: the cap is live config, read per build so an
+      // operator edit takes effect on the next maintenance/lazy fold.
+      getMaxPostingsPerTag: () => this.config?.index?.maxPostingsPerTag ?? 500,
     });
 
     this.semanticStore = new SemanticStore({ root: this.paths.semantic });
@@ -300,6 +352,13 @@ export class Memory {
       maxTokens: config.context?.maxTokens,
       threshold: config.context?.threshold,
       target: config.context?.target,
+      // v1.5.0: pure physical-layer context accounting. `nativeTokenLimit` is the
+      // model's native window (Qwen mode): below it nothing is folded; the rollover
+      // threshold is measured against it, not against the memory-block budget.
+      nativeTokenLimit: config.context?.nativeTokenLimit,
+      autoRolloverThreshold: config.context?.autoRolloverThreshold,
+      autoRolloverEnabled: config.context?.autoRolloverEnabled,
+      getSessionTokens: () => this.sessionUsage().tokens,
       statsFile: path.join(this.paths.state, 'context.json'),
     });
     this.deletePipeline = new DeletePipeline({
@@ -324,11 +383,45 @@ export class Memory {
 
     this._semanticCache = null;
     this._briefing = null;
+    /** Prompt-state line is derived from the index: refresh lazily, not per write. */
+    this._briefingDirty = true;
     this._boot = null;
     /** Evicted block ids already folded into a summary (per process). */
     this._foldedIds = new Set();
     this._closed = false;
     this._writeChain = Promise.resolve();
+    /**
+     * v1.5.0 physical-layer space routing. The default space IS this instance (no
+     * extra store, so every existing single-space behaviour is byte-identical);
+     * named spaces are child store directories under <dataDir>/spaces/<id>.
+     */
+    this._childMemories = new Set();
+    this.spaces = new SpaceRouter({
+      owner: this,
+      dataDir: this.dataDir,
+      openChild: async (childDir) => {
+        const child = new Memory({
+          dataDir: childDir,
+          clock: this.clock,
+          policy: this._policyInput,
+          config: this.config,
+        });
+        await child.init();
+        this._childMemories.add(child);
+        return child;
+      },
+    });
+    /**
+     * Session-context accounting for the rollover/handoff decision. Keyed by session
+     * id (bounded); the VALUE is the absolute estimated session size fed by the
+     * host's `session/event` stream, never an accumulated delta — a replay of the
+     * same turn must not inflate it.
+     */
+    this._sessionTokens = new Map();
+    this._currentSessionId = null;
+    /** Tags whose oversized hint has already been shown: the next recall is "insist". */
+    this._oversizedHintTags = new Set();
+    this._handoffInFlight = false;
     this.maintenance.onPublished = () => {
       this._semanticCache = null;
     };
@@ -382,7 +475,18 @@ export class Memory {
     }
   }
 
-  async remember({
+  /**
+   * Stage ONE episode: validate it, resolve identity and build the record — but do
+   * NOT write the log and do NOT touch the index. `commitMany()` performs one
+   * durable append, one ledger checkpoint and one lazy index delta for the whole
+   * batch. A duplicate/dead-letter plan is already final and needs no I/O.
+   *
+   * Staging mutates the in-memory ledger (occurrence allocation + idempotency map),
+   * which is what makes batching safe: two items in the same batch can never receive
+   * the same occurrence index. The ledger is a rebuildable cache, so a crash before
+   * its checkpoint costs a rebuild from the log, never data.
+   */
+  async stage({
     content,
     eventTime,
     happenedAt,
@@ -395,7 +499,7 @@ export class Memory {
     isTransientTrend = false,
     mediaUrl = null,
     mediaType = null,
-  }) {
+  } = {}) {
     this.assertOpen();
     ensureNoEmbeddedBase64(content);
     const media = validateMedia(mediaUrl, mediaType);
@@ -417,21 +521,26 @@ export class Memory {
       dedupe,
       clientKey: idempotencyKey,
     });
+    // The hot path must not rewrite the whole ledger per item (O(n²) bytes); the
+    // ledger's own debounce persists it shortly after, and close() forces it.
+    this.ledger.schedulePersist();
+    return { ...plan, isTransientTrend };
+  }
 
-    if (plan.status === 'duplicate') {
+  /** Public result for a staged plan — the exact shape `remember()` always returned. */
+  describePlan(plan, trend = null) {
+    if (!plan || plan.status === 'duplicate') {
       return {
         status: 'duplicate',
         duplicate: true,
-        eventId: plan.eventId,
-        contentHash: plan.contentHash,
-        eventTime: plan.eventTime,
-        dedupeKey: plan.dedupeKey,
+        eventId: plan?.eventId ?? null,
+        contentHash: plan?.contentHash ?? null,
+        eventTime: plan?.eventTime ?? null,
+        dedupeKey: plan?.dedupeKey ?? null,
         note: 'payload already stored for this event_time; nothing was written',
       };
     }
-
     if (plan.status === 'dead-letter') {
-      this.ledger.persist();
       return {
         status: 'dead-letter',
         deadLetter: true,
@@ -443,22 +552,7 @@ export class Memory {
         note: 'invalid payload routed to the DLQ; it never overwrites a stored event',
       };
     }
-
     const record = plan.record;
-    await this.logStore.append([record]);
-    this.ledger.persist();
-    await this.indexManager.applyRecords([record]);
-
-    let trend = null;
-    if (isTransientTrend) {
-      trend = await this.tempStore.observe({
-        content: record.content,
-        sourceEvents: [record.event_id],
-        tags: record.tags.map((tag) => tag.tag),
-        occurredAt: record.event_time,
-      });
-    }
-    this.refreshBriefing();
     return {
       status: 'appended',
       eventId: record.event_id,
@@ -479,13 +573,95 @@ export class Memory {
   }
 
   /**
+   * Commit a batch of staged plans. This is the ONLY honest batching point:
+   *   - one `logStore.append(records)` (one append + one manifest flush),
+   *   - one ledger checkpoint (debounced),
+   *   - one `indexManager.applyRecords(records)` (lazy: folded on the next read),
+   *   - one briefing invalidation.
+   * Order is load-bearing: the log is appended before the index delta, and the
+   * ledger is only a hint. Results preserve input order.
+   */
+  async commitMany(plans = []) {
+    this.assertOpen();
+    if (!Array.isArray(plans)) throw new MemoryError(ErrorCodes.INVALID_INPUT, 'commitMany requires an array of staged plans');
+    const results = new Array(plans.length);
+    const ready = [];
+    for (let index = 0; index < plans.length; index += 1) {
+      const plan = plans[index];
+      if (!plan || plan.status !== 'ready') {
+        results[index] = this.describePlan(plan);
+        continue;
+      }
+      ready.push({ index, plan });
+    }
+    if (ready.length === 0) return results;
+
+    const records = ready.map((entry) => entry.plan.record);
+    await this.logStore.append(records);
+    this.ledger.schedulePersist();
+    await this.indexManager.applyRecords(records);
+    this._markBriefingDirty();
+
+    for (const { index, plan } of ready) {
+      const record = plan.record;
+      let trend = null;
+      if (plan.isTransientTrend) {
+        trend = await this.tempStore.observe({
+          content: record.content,
+          sourceEvents: [record.event_id],
+          tags: record.tags.map((tag) => tag.tag),
+          occurredAt: record.event_time,
+        });
+      }
+      results[index] = this.describePlan(plan, trend);
+    }
+    return results;
+  }
+
+  /**
+   * Append one episode. A thin `stage -> commitMany` composition, so the single and
+   * bulk paths share the same identity, durability and index semantics.
+   *
+   * v1.5.0 routing: `targetSpaceId` (default/absent = this store) selects the
+   * physical space. Each space owns its own FIFO lock, so two spaces never serialise
+   * against each other and two operations on the same space can never interleave
+   * their append/index deltas. The `targetSpaceId` key is consumed here and never
+   * reaches identity: record hashes are space-local.
+   */
+  async remember(input = {}) {
+    this.assertOpen();
+    const { targetSpaceId, ...rest } = input ?? {};
+    const spaceId = normaliseSpaceId(targetSpaceId);
+    // Default space: this instance, already inside its own router lock -> use the
+    // space-local write path. A child space owns its OWN router/lock; delegate to
+    // its public remember() so a transfer writes into the same child lock as a
+    // direct routed write (one lock per physical directory, no interleaving).
+    return this.spaces.run(spaceId, (target) =>
+      target === this ? this._rememberLocal(rest) : target.remember(rest),
+    );
+  }
+
+  /** The space-local write path. Callers inside a space lock use this directly. */
+  async _rememberLocal(input = {}) {
+    this.assertOpen();
+    const plan = await this.stage(input);
+    if (plan.status !== 'ready') return this.describePlan(plan);
+    const [result] = await this.commitMany([plan]);
+    return result;
+  }
+
+  /**
    * One active heavy task (checkpoint). Exactly one is active at a time: writing
    * a new one demotes the previous, and `maintain()` demotes one that has not
    * been refreshed for ACTIVE_TASK_TTL_MS. The snapshot itself is a normal event
    * tagged `active_task`, so it is durable; the pointer in state/ only says which
    * one is current.
    */
-  async checkpoint({ taskId, progress, updatedAt } = {}) {
+  async checkpoint(options = {}) {
+    return this.spaces.run(DEFAULT_SPACE_ID, () => this._checkpointLocal(options));
+  }
+
+  async _checkpointLocal({ taskId, progress, updatedAt } = {}) {
     this.assertOpen();
     if (typeof taskId !== 'string' || !taskId.trim()) {
       throw invalidInput('checkpoint.task_id must be a non-empty string');
@@ -501,7 +677,7 @@ export class Memory {
 
     const previous = this.activeTask();
     const content = JSON.stringify({ task_id: taskId.trim(), progress, updated_at: at });
-    const result = await this.remember({
+    const result = await this._rememberLocal({
       content,
       tags: ['active_task', `task:${taskId.trim()}`],
       salience: 1,
@@ -521,7 +697,7 @@ export class Memory {
     };
     ensureDir(this.paths.state);
     writeJsonAtomic(this.activeTaskPath(), pointer);
-    this.refreshBriefing();
+    this._markBriefingDirty();
     return {
       status: 'active',
       taskId: pointer.taskId,
@@ -625,11 +801,11 @@ export class Memory {
       records.push(await this._controlRecord('reinforce', { target, eventTime, weight }));
     }
     this.assertWriteBudget();
-  await this.logStore.append(records);
+    await this.logStore.append(records);
     await this.indexManager.applyRecords(records);
     // A reinforcement IS a review: advance the spaced-repetition step.
     for (const target of ids) this.reviews.advance(target, { now: this.clock.now() });
-    this.refreshBriefing();
+    this._markBriefingDirty();
     return {
       reinforced: ids,
       reinforcementEventIds: records.map((record) => record.event_id),
@@ -698,9 +874,10 @@ export class Memory {
   // ---- read path ---------------------------------------------------------
 
   /**
-   * Retrieve. Pure read: no adjudication, no writes, no log scan.
-   * `indexManager.snapshot()` is a pointer read — a maintenance rebuild in flight
-   * cannot block or tear this query.
+   * Bulk ingest with REAL batching: each chunk is staged first (cheap, no I/O per
+   * item except the DLQ), then committed with ONE durable append + ONE index delta.
+   * Per-item failures stay isolated; duplicates are counted as skipped, never as
+   * written.
    */
   async bulkIngest(items = [], { batchSize = 50 } = {}) {
     this.assertOpen();
@@ -709,19 +886,45 @@ export class Memory {
     for (let start = 0; start < items.length; start += batchSize) {
       const batch = items.slice(start, start + batchSize);
       result.batches += 1;
+      const staged = [];
       for (const [offset, item] of batch.entries()) {
         try {
-          const saved = await this.remember(item);
-          if (saved.status === 'appended') result.created += 1; else result.skipped += 1;
+          staged.push({ offset, plan: await this.stage(item) });
         } catch (error) {
           result.failed.push({ index: start + offset, code: error?.code ?? 'MEM_E_UNKNOWN', message: error?.message ?? String(error) });
         }
+      }
+      if (staged.length === 0) continue;
+      const results = await this.commitMany(staged.map((entry) => entry.plan));
+      for (const saved of results) {
+        if (saved && saved.status === 'appended') result.created += 1;
+        else result.skipped += 1;
       }
     }
     return result;
   }
 
-  async recall({ text = '', tags = [], topK } = {}) {
+  /**
+   * Retrieve. Pure read: no adjudication, no writes, no log scan. The index view is
+   * resolved once per call (a lazy fold covers any awaited appends), so a
+   * maintenance rebuild in flight cannot tear the result.
+   *
+   * `targetSpaceId` routes the read to another physical space (same isolation rules
+   * as remember). On the default space the behaviour is byte-identical to v1.4.x
+   * except for the oversized-tag degradation added in v1.5.0.
+   */
+  async recall(query = {}) {
+    this.assertOpen();
+    const { targetSpaceId, ...rest } = query ?? {};
+    const spaceId = normaliseSpaceId(targetSpaceId);
+    // Same lock discipline as remember(): a child space uses its own public read
+    // path (its own lock), so routed reads and transfer-driven writes never
+    // interleave on one directory.
+    return this.spaces.run(spaceId, (target) => (target === this ? this._recallLocal(rest) : target.recall(rest)));
+  }
+
+  /** The space-local read path. */
+  async _recallLocal({ text = '', tags = [], topK } = {}) {
     this.assertOpen();
     const now = this.clock.now();
     const view = this.indexManager.snapshot();
@@ -733,6 +936,7 @@ export class Memory {
         generation: null,
         hits: [],
         ghostHints: [],
+        oversizedTagHints: [],
         semantic: [],
         tempSemantic: this.tempStore.list({ status: 'temp', now }),
         scanned: { blocks: 0, candidates: 0, scored: 0, tagHits: 0 },
@@ -741,30 +945,41 @@ export class Memory {
         notes: ['no index generation yet; run memory_admin action=maintain'],
       };
     }
+    // "The user insisted": an oversized tag whose hint was already returned by a
+    // previous recall is answered with its 3 most recent summaries instead of the
+    // oversized list. This is the only stateful part of the degradation, and it is
+    // per-process (a fresh session sees the hint first again).
+    const aliases = view.aliases ?? {};
+    const canonicalTags = [...new Set(tags.map((tag) => normaliseTagToken(tag)).filter(Boolean))]
+      .map((token) => aliases[token] ?? token);
+    const insist =
+      canonicalTags.length > 0 &&
+      canonicalTags.every((tag) => this._oversizedHintTags.has(tag)) &&
+      this._oversizedHintTags.size > 0;
     const semantic = this.semanticSummaries();
     const tempSemantic = this.tempStore.list({ status: 'temp', now });
     const associations = this.graphAssociations({ tags, text });
     const result = runRecall({
       index: view,
-      query: { text, tags, topK },
+      query: { text, tags, topK, allowOversizedTags: insist },
       policy: this.policy,
       now,
       semantic,
       tempSemantic,
       associations,
     });
-    const confidenceMin = this.config?.context?.minInjectConfidence ?? 0.6;
+    for (const hint of result.oversizedTagHints ?? []) this._oversizedHintTags.add(hint.tag);
     // Anti-hallucination: a hit reached only through a mid inside its grace window
     // loses its body before it can reach the model; the hint points at deep_raw.
     const ghostPass = degradeGhostHits(result.hits ?? [], this.ghostHints(), {
       now,
       queryTags: result.query?.tags ?? [],
     });
-    const confidence = applyConfidence(ghostPass.hits, confidenceMin);
     return {
       ...result,
-      hits: confidence.hits,
+      hits: ghostPass.hits,
       ghostHints: ghostPass.ghostHints,
+      oversizedTagHints: result.oversizedTagHints ?? [],
       stale: this._boot ? this._boot.status !== 'ok' : false,
       associations,
       // A count, not the resident list: the online queue may read the active set
@@ -773,7 +988,6 @@ export class Memory {
       notes: [
         ...(result.notes ?? []),
         ...ghostPass.notes,
-        ...confidence.notes,
         ...(associations.length > 0 ? [`graph-associations:${associations.length}`] : []),
         ...(this._boot && this._boot.status !== 'ok' ? [`boot-check:${this._boot.status}`] : []),
       ],
@@ -814,6 +1028,27 @@ export class Memory {
       return { mode: 'deep_raw', hits: [], scanned: { turns: 0, bytes: 0, shards: 0, tombstonesSkipped: 0 }, truncated: false, notes: [warning], warning };
     }
     if (!Number.isFinite(query.startTime) || !Number.isFinite(query.endTime)) {
+      // v1.5.0: a super tag (>500 associations) is not scannable without a time
+      // window — an unbounded deep_raw over it is exactly the context/OOM flood the
+      // tag-explosion defence exists to prevent. Narrow queries keep the old
+      // MEM_E_INVALID_INPUT contract.
+      const superTags = superTagAssociations({
+        index: this.indexManager.snapshot(),
+        text: query.text,
+        tags: query.tags,
+      });
+      if (superTags.length > 0) {
+        throw new MemoryError(
+          ErrorCodes.TIME_RANGE_REQUIRED,
+          `deep_raw on a super tag (>${SUPER_TAG_THRESHOLD} associations) requires start_time and end_time`,
+          {
+            startTime: query.startTime ?? null,
+            endTime: query.endTime ?? null,
+            tags: superTags.map((entry) => entry.tag),
+            threshold: SUPER_TAG_THRESHOLD,
+          },
+        );
+      }
       throw new MemoryError(ErrorCodes.INVALID_INPUT, 'deep_raw requires start_time and end_time (epoch ms)', {
         startTime: query.startTime ?? null,
         endTime: query.endTime ?? null,
@@ -837,12 +1072,19 @@ export class Memory {
    */
   async captureSessionEvent(session, event) {
     this.assertOpen();
+    const turn = turnFromSessionEvent(event);
+    if (turn && turn.contextOnly !== true) {
+      // v1.5.0: session-size accounting feeds the rollover/handoff decision and is
+      // deliberately INDEPENDENT of the raw-retention gates below — the handoff must
+      // still work when the black box is disabled or sampled.
+      this.observeSessionTurn(session?.id ?? session?.sessionId ?? null, turn.text);
+      this._maybeAutoHandoff();
+    }
     const raw = this.config?.raw ?? {};
     if (raw.autoCapture !== true) return { skipped: 'auto-capture-off' };
     if ((raw.mode ?? 'salience') === 'off') return { skipped: 'raw-off' };
     const ratio = raw.captureRatio ?? 1;
     if (ratio === 0) return { skipped: 'capture-ratio-0' };
-    const turn = turnFromSessionEvent(event);
     if (!turn) return { skipped: 'not-a-surface-message' };
     if (turn.contextOnly === true) return { skipped: 'runtime-context-only' };
     // Tool chatter is opt-in, but a FAILED tool call is exactly the detail worth
@@ -896,6 +1138,410 @@ export class Memory {
       }
     }
     return picked;
+  }
+
+  // ---- session accounting, auto-rollover and handoff (v1.5.0) --------------
+  //
+  // "Handoff" is the physical half of the philosophy: a session may end, the
+  // persona does not. When the estimated session context reaches
+  // context.autoRolloverThreshold x context.nativeTokenLimit, the tail is distilled
+  // into ONE L1.5 summary, state/handoff.json is marked active and the prompt state
+  // advertises the marker. A NEW session consumes the marker. If auto-rollover is
+  // disabled, ContextEngine force-evicts at 95% instead (no summary promised).
+
+  /**
+   * Feed the CURRENT session size (absolute tokens, not a delta) into the rollover
+   * math. Keyed by session id so two concurrent sessions cannot overwrite each
+   * other's accounting; the map is bounded (oldest evicted, never persisted — this
+   * is live process state, not a durable fact).
+   */
+  /**
+   * Feed the CURRENT session size (absolute tokens, not a delta) into the rollover
+   * math. Keyed by session id so two concurrent sessions cannot overwrite each
+   * other's accounting; the map is bounded (oldest evicted, never persisted).
+   *
+   * v1.5.4 state-machine guarantees (anti-deadlock):
+   *   - a NEW session id always establishes its own baseline immediately; the
+   *     previous session's handoff can never own or block the next one;
+   *   - a marker written for a DIFFERENT session is consumed on transition;
+   *   - `_handoffInFlight` is released on every transition, so a hung distillation
+   *     (timeout, IO error, pathological payload) cannot lock future sessions.
+   */
+  observeSessionTokens(sessionId, tokens) {
+    this.assertOpen();
+    if (!Number.isFinite(tokens) || tokens < 0) {
+      throw invalidInput('session tokens must be a finite non-negative number', { got: tokens });
+    }
+    const key = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : DEFAULT_SESSION_KEY;
+    const previousSession = this._currentSessionId;
+    const previousTokens = this._sessionTokens.get(key) ?? null;
+    if (!this._sessionTokens.has(key) && this._sessionTokens.size >= SESSION_TRACK_LIMIT) {
+      const oldest = this._sessionTokens.keys().next().value;
+      this._sessionTokens.delete(oldest);
+    }
+    this._sessionTokens.set(key, Math.round(tokens));
+    const isNewSession = previousSession === null || previousSession !== key;
+    // Same-key restart: the estimate collapsed after a reset/reload. Without this
+    // branch the old ratio would re-trigger a handoff immediately on the new turn.
+    const isSameKeyRestart =
+      previousTokens !== null && tokens < previousTokens / 2 && previousTokens > this.context.nativeTokenLimit / 2;
+    this._currentSessionId = key;
+    if (isNewSession || isSameKeyRestart) {
+      // CORE ANTI-DEADLOCK: the in-flight guard belongs to the OLD session only.
+      this._handoffInFlight = false;
+      const marker = this.handoffState();
+      if (marker.active && (isSameKeyRestart || marker.sessionId !== key)) {
+        this.clearHandoff({ reason: isNewSession ? 'new-session' : 'session-restart', consumedBy: key });
+      }
+    }
+    return this.sessionUsage();
+  }
+
+  /** Add ONE turn's estimated tokens to its session (surface messages only). */
+  observeSessionTurn(sessionId, text) {
+    this.assertOpen();
+    const key = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : DEFAULT_SESSION_KEY;
+    const previous = this._sessionTokens.get(key) ?? 0;
+    const tokens = previous + Math.max(1, Math.ceil(String(text ?? '').length / 4));
+    return this.observeSessionTokens(key, tokens);
+  }
+
+  /** Live session size used by the status bar and the rollover decision. */
+  sessionUsage() {
+    if (this._currentSessionId === null) return { sessionId: null, tokens: 0 };
+    return {
+      sessionId: this._currentSessionId,
+      tokens: this._sessionTokens.get(this._currentSessionId) ?? 0,
+    };
+  }
+
+  /**
+   * Escape hatch (v1.5.4): force the rollover state machine back to a clean slate.
+   * Clears the live session baseline, drops the in-flight guard, consumes any
+   * active marker and rewrites state/handoff.json. Durable memories are untouched:
+   * this only resets derived session state, so a user who is stuck can recover
+   * immediately from the UI/API/admin tool.
+   */
+  resetSessionState({ reason = 'manual' } = {}) {
+    this.assertOpen();
+    const before = { sessionId: this._currentSessionId, tokens: this.sessionUsage().tokens, handoff: this.handoffState() };
+    this._sessionTokens.clear();
+    this._currentSessionId = null;
+    this._handoffInFlight = false;
+    const marker = this.clearHandoff({ reason, consumedBy: null });
+    this._markBriefingDirty();
+    return { reset: true, reason, before, marker };
+  }
+
+  handoffPath() {
+    return path.join(this.paths.state, 'handoff.json');
+  }
+
+  /** The durable handoff marker (state/handoff.json). Missing/corrupt = inactive. */
+  handoffState() {
+    const marker = readJson(this.handoffPath(), null);
+    if (!marker || typeof marker !== 'object') {
+      return { active: false, at: null, summaryEventId: null, consumedAt: null };
+    }
+    // Keep provenance even after consumption (consumedBy/consumedAt are how the
+    // next boot can tell "handed off" from "never handed off").
+    return { ...marker, active: marker.active === true };
+  }
+
+  /** Mark a handoff consumed (new session, or an explicit clear). */
+  clearHandoff({ reason = 'manual', consumedBy = null } = {}) {
+    const current = readJson(this.handoffPath(), null);
+    if (!current || current.active !== true) return { active: false, cleared: false };
+    const next = { ...current, active: false, state: HANDOFF_STATES.CONSUMED, consumedAt: this.clock.now(), consumedBy, reason };
+    ensureDir(this.paths.state);
+    writeJsonAtomic(this.handoffPath(), next);
+    this._markBriefingDirty();
+    return { ...next, active: false, cleared: true };
+  }
+
+  /**
+   * Evaluate the rollover state and, when due, perform the handoff exactly once.
+   *
+   * v1.5.4 anti-deadlock contract: this method NEVER rejects and NEVER leaves the
+   * caller waiting beyond `timeoutMs`. A stale marker, a distillation error, a
+   * timeout or even a marker-write failure degrade into a `failed`/degraded marker
+   * (or a non-fatal result) so the host can always start the next session.
+   *
+   * @returns native state + session + marker (+ `distilled` / `failure`)
+   */
+  async checkHandoff({ now = this.clock.now(), distill = true, timeoutMs = HANDOFF_TIMEOUT_MS } = {}) {
+    this.assertOpen();
+    const usage = this.sessionUsage();
+    const native = this.context.nativeState({ now, sessionTokens: usage.tokens });
+    let marker = this.handoffState();
+    // A marker from a PREVIOUS session must not be inherited: consume it before the
+    // early returns, or a new session would advertise a handoff forever.
+    if (marker.active && marker.sessionId && usage.sessionId && marker.sessionId !== usage.sessionId) {
+      this.clearHandoff({ reason: 'stale-marker', consumedBy: usage.sessionId });
+      marker = this.handoffState();
+    }
+    const base = { ...native, session: usage, handoff: marker };
+    if (!native.rolloverEnabled) {
+      // Rollover off: 95% is the hard ceiling and ContextEngine evicts, no summary.
+      const forcedEviction = native.forceEvictionDue ? this.context.enforce({ now }) : null;
+      return { ...base, handoff: this.handoffState(), forcedEviction };
+    }
+    if (!native.rolloverDue) return base;
+    if (marker.active) return base;
+
+    let distilled = null;
+    let failure = null;
+    if (distill) {
+      try {
+        distilled = await withTimeout(this._distillHandoffTail({ now, native, usage }), timeoutMs);
+        if (!distilled || !distilled.eventId) {
+          failure = {
+            code: ErrorCodes.HANDOFF_FAILED,
+            reason: distilled?.reason ?? distilled?.error ?? 'no-summary',
+            message: 'handoff summary was not produced',
+          };
+        }
+      } catch (error) {
+        failure = {
+          code: error?.code ?? ErrorCodes.HANDOFF_FAILED,
+          reason: error?.details?.reason ?? error?.reason ?? 'distill-failed',
+          message: error?.message ?? String(error),
+        };
+      }
+    } else {
+      failure = { code: ErrorCodes.HANDOFF_FAILED, reason: 'distill-disabled', message: 'handoff marker written without a summary' };
+    }
+
+    const next = {
+      schema: HANDOFF_SCHEMA,
+      active: true,
+      state: failure ? HANDOFF_STATES.FAILED : HANDOFF_STATES.ACTIVE,
+      degraded: Boolean(failure),
+      at: now,
+      // Provenance matters: a context-window fallback is not a session measurement.
+      tokenSource: usage.sessionId === null ? 'context-window' : 'session',
+      sessionId: usage.sessionId,
+      tokens: native.tokens,
+      nativeTokenLimit: native.nativeTokenLimit,
+      ratio: native.ratio,
+      threshold: native.rolloverThreshold,
+      summaryEventId: distilled?.eventId ?? null,
+      summaryStatus: distilled?.status ?? null,
+      summaryError: failure,
+      note: failure
+        ? '交接摘要生成失败，状态机已优雅降级：新会话可立即开始（记录见 summaryError）。本插件不能保证一个会话永生不死，只能保证人格不死。'
+        : '人格交接点：末尾摘要已存为 L1.5，新会话从该摘要继续。本插件不能保证一个会话永生不死，只能保证人格不死。',
+    };
+    try {
+      ensureDir(this.paths.state);
+      writeJsonAtomic(this.handoffPath(), next);
+      this._markBriefingDirty();
+      return { ...base, handoff: next, distilled, failure };
+    } catch (error) {
+      // Marker write must never reject the caller. Report a degraded result and let
+      // the host proceed; the next session still resets its own baseline.
+      return {
+        ...base,
+        handoff: {
+          active: false,
+          degraded: true,
+          error: { code: ErrorCodes.HANDOFF_FAILED, message: `marker write failed: ${error?.message ?? error}` },
+        },
+        distilled,
+        failure: { code: ErrorCodes.HANDOFF_FAILED, reason: 'marker-write-failed', message: String(error?.message ?? error) },
+      };
+    }
+  }
+
+  /**
+   * Distil eligible tail content into ONE durable L1.5 summary.
+   *
+   * ANTI-RECURSION (v1.5.4): handoff summaries and folded summaries are filtered
+   * out by TAG and by the `交接摘要` text prefix, so a summary can never contain a
+   * previous summary. The output is hard-capped in length; the idempotency key
+   * includes the timestamp so distinct handoff epochs never collide.
+   */
+  async _distillHandoffTail({ now, native, usage }) {
+    const eligibleBlocks = this.context.blocks
+      .slice(-FOLD_BATCH)
+      .filter((block) => block.text && !HANDOFF_TEXT_RE.test(block.text));
+    let sourceTexts = eligibleBlocks.map((block) => block.text);
+    if (sourceTexts.length === 0) {
+      // Fallback: freshest indexed events, skipping any handoff summary (dirty
+      // historical data included) so recursion cannot re-enter through the index.
+      const events = (this.indexManager.snapshot()?.events ?? [])
+        .filter((event) => {
+          const tags = (event.tags ?? []).map((tag) => tag.tag ?? tag);
+          return !tags.includes(HANDOFF_TAG) && !HANDOFF_TEXT_RE.test(String(event.content ?? ''));
+        })
+        .slice(0, FOLD_BATCH);
+      sourceTexts = events.map((event) => event.content);
+    }
+    if (sourceTexts.length === 0) return { folded: 0, reason: 'no-eligible-content' };
+
+    const points = sourceTexts.map((text) => firstSentence(text)).filter(Boolean).slice(-5);
+    const names = extractNames(sourceTexts.join('\n'));
+    const tasks = extractTasks(sourceTexts.join('\n'));
+    const tags = new Set([FOLDED_TAG, 'folded_summary', HANDOFF_TAG]);
+    for (const block of eligibleBlocks) if (block.kind && block.kind !== 'recall') tags.add(`kind:${block.kind}`);
+    const content = [
+      `交接摘要（${new Date(now).toISOString().slice(0, 10)}，tokens≈${native.tokens}/${native.nativeTokenLimit}，ratio=${native.ratio}）`,
+      points.length ? `要点：${points.join('；')}` : '要点：无',
+      names.length ? `人名：${names.join('、')}` : null,
+      tasks.length ? `任务：${tasks.join('、')}` : null,
+      `会话：${usage.sessionId ?? '(context-window)'}`,
+    ]
+      .filter(Boolean)
+      .join('；')
+      // Hard cap: a handoff summary must stay small; recursion used to grow it.
+      .slice(0, 1200);
+    try {
+      const result = await this._rememberLocal({
+        content,
+        tags: [...tags],
+        salience: 0.9,
+        eventTime: now,
+        idempotencyKey: `handoff:${usage.sessionId ?? 'ctx'}:${native.tokens}:${now}`.slice(0, 200),
+      });
+      return { folded: sourceTexts.length, eventId: result.eventId, status: result.status, points };
+    } catch (error) {
+      return { folded: 0, error: error?.code ?? String(error), reason: 'remember-failed' };
+    }
+  }
+
+  /**
+   * Fire-and-forget handoff trigger used by the session/event listener and by tool
+   * calls. It never throws into the host's event bus and has an OUTER watchdog as
+   * well as checkHandoff's internal one: even if checkHandoff itself hangs, the
+   * in-flight flag is released so the next session/turn can proceed.
+   */
+  _maybeAutoHandoff() {
+    if (this._closed || this._handoffInFlight) return;
+    const state = this.context.nativeState({ sessionTokens: this.sessionUsage().tokens });
+    if (!state.rolloverDue && !state.forceEvictionDue) return;
+    this._handoffInFlight = true;
+    const watchdog = new Promise((resolve) => {
+      const timer = setTimeout(
+        () => resolve({ watchdog: true, handoff: { active: true, degraded: true, state: HANDOFF_STATES.FAILED, error: { code: ErrorCodes.HANDOFF_FAILED, message: 'handoff watchdog timeout', reason: 'watchdog' } } }),
+        HANDOFF_TIMEOUT_MS + 1000,
+      );
+      timer.unref?.();
+    });
+    Promise.race([this.checkHandoff(), watchdog])
+      .catch(() => {
+        /* the next turn retries; a failed handoff must never break session capture */
+      })
+      .finally(() => {
+        // CORE ANTI-DEADLOCK: this flag may never outlive the attempt.
+        this._handoffInFlight = false;
+      });
+  }
+
+  /**
+   * Maintenance repair for the recursion incident (v1.5.4): finds handoff summaries
+   * that are (a) self-recursive (>=2 `交接摘要` markers) or (b) beyond the newest
+   * `keep` generations, and parks them in the TWO-PHASE delete queue (never a
+   * physical purge on the spot). Default is a dry run so a human can inspect first.
+   */
+  async repairHandoffSummaries({ dryRun = true, keep = 1 } = {}) {
+    this.assertOpen();
+    const events = (this.indexManager.snapshot()?.events ?? [])
+      .filter((event) => (event.tags ?? []).some((tag) => (tag.tag ?? tag) === HANDOFF_TAG))
+      .slice()
+      .sort((a, b) => b.anchorTime - a.anchorTime || a.eventId.localeCompare(b.eventId));
+    const recursive = events.filter((event) => (String(event.content ?? '').match(/交接摘要/g) ?? []).length >= 2);
+    const excess = events.slice(Math.max(0, keep));
+    const candidates = [...new Set([...recursive, ...excess].map((event) => event.eventId))];
+    if (dryRun || candidates.length === 0) {
+      return { dryRun, totalHandoff: events.length, recursive: recursive.length, candidates, forget: null };
+    }
+    const forget = await this.forget({ eventIds: candidates, mode: 'purge', reason: 'handoff-recursive-cleanup' });
+    return { dryRun: false, totalHandoff: events.length, recursive: recursive.length, candidates, forget };
+  }
+
+  // ---- cross-space transfer (v1.5.0 / consent gate v1.5.1) ----------------
+
+  /**
+   * Atomic cross-space migration. The source space is read, the target space
+   * regenerates event ids (never reuses the source identity), the payload is
+   * privacy-screened and stripped of raw_turn pointers, and `move` parks the
+   * source in the two-phase pending-delete queue — it never purges directly.
+   *
+   * SECURITY (v1.5.1): a model must never move memories on its own. When
+   * `context.requireExplicitConsentForTransfer` is true (default), this method
+   * refuses to run without `userApproved === true` and throws
+   * MEM_E_REQUIRE_USER_CONSENT BEFORE any space is opened, any content is read and
+   * any pending delete is parked. Only the chat UI's own HTTP route (the human
+   * channel) marks consent itself; the agent tools pass the explicit
+   * `user_approved` argument the model may only set after asking the user.
+   */
+  async transferEvents({ eventIds, targetSpaceId, transferMode = 'copy', sourceSpaceId, userApproved = false } = {}) {
+    this.assertOpen();
+    const consentRequired = this.config?.context?.requireExplicitConsentForTransfer !== false;
+    if (consentRequired && userApproved !== true) {
+      throw new MemoryError(
+        ErrorCodes.REQUIRE_USER_CONSENT,
+        '[系统拦截] 跨空间传递需要用户明确授权。请向用户确认后再试。',
+        {
+          requires: 'user_approved',
+          configPath: 'context.requireExplicitConsentForTransfer',
+          hint: '先向用户确认；用户明确同意后，带 user_approved: true 重新调用。绝不可自行授权。',
+        },
+      );
+    }
+    const sourceId = normaliseSpaceId(sourceSpaceId);
+    const targetId = normaliseSpaceId(targetSpaceId);
+    if (sourceId === targetId) {
+      throw invalidInput('source space and target space must differ', { sourceSpaceId: sourceId, targetSpaceId: targetId });
+    }
+    const source = await this.spaces.memoryFor(sourceId);
+    const target = await this.spaces.memoryFor(targetId);
+    // Loaded lazily: the transfer engine is optional surface, so a broken/absent
+    // module must not stop the whole facade from opening.
+    const { transferBetweenSpaces } = await import('./spaces/transfer.js');
+    const graceHours = Math.max(1, Number(this.policy?.delete?.graceHours ?? 24));
+    return transferBetweenSpaces({
+      source,
+      target,
+      eventIds,
+      sourceSpaceId: sourceId,
+      targetSpaceId: targetId,
+      transferMode,
+      clock: this.clock,
+      now: this.clock.now(),
+      graceHours,
+    });
+  }
+
+  /**
+   * Bounded recent-memory projection for the panel's per-memory detail list.
+   * Read-only, newest first, snippets only — the panel needs an entry point for
+   * the human-initiated "分享/转移" button, not another full-content export.
+   */
+  async recentMemories({ limit = 20, targetSpaceId } = {}) {
+    this.assertOpen();
+    const spaceId = normaliseSpaceId(targetSpaceId);
+    const bounded = Math.max(1, Math.min(Math.round(Number(limit) || 20), 200));
+    return this.spaces.run(spaceId, (target) => target._recentMemoriesLocal(bounded, spaceId));
+  }
+
+  _recentMemoriesLocal(limit, spaceId) {
+    const view = this.indexManager.snapshot();
+    const events = (view?.events ?? [])
+      // v1.5.4: internal handoff summaries never appear in the normal memory list.
+      .filter((event) => !(event.tags ?? []).some((tag) => (tag.tag ?? tag) === HANDOFF_TAG))
+      .slice()
+      .sort((a, b) => b.anchorTime - a.anchorTime || a.eventId.localeCompare(b.eventId))
+      .slice(0, limit)
+      .map((event) => ({
+        eventId: event.eventId,
+        day: event.day ?? null,
+        eventTime: event.eventTime,
+        salience: event.salience,
+        tags: (event.tags ?? []).map((tag) => tag.tag ?? tag),
+        snippet: snippet(event.content, 240),
+      }));
+    return { spaceId, count: events.length, events };
   }
 
   async maintain({ reason = 'manual' } = {}) {
@@ -1011,6 +1657,76 @@ export class Memory {
     return this.tagTree.view(options);
   }
 
+  /**
+   * Multi-space route payloads (UI space selector): the graph/tag-tree of the
+   * SELECTED space, never a mix. `default` reads this instance; a named space reads
+   * its own child store through the per-space lock, so switching the selector can
+   * never leak one space's projection into another's view.
+   */
+  async graphForSpace({ targetSpaceId, limit } = {}) {
+    this.assertOpen();
+    const spaceId = normaliseSpaceId(targetSpaceId);
+    if (spaceId === DEFAULT_SPACE_ID) {
+      return { spaceId, graph: this.graphView(limit), tagTree: this.tagTreeView() };
+    }
+    return this.spaces.run(spaceId, (target) => ({
+      spaceId,
+      graph: target.graphView(limit),
+      tagTree: target.tagTreeView(),
+    }));
+  }
+
+  /** Ensure a named space exists (creates its store lazily) and list all spaces. */
+  async ensureSpace(spaceId) {
+    this.assertOpen();
+    const id = normaliseSpaceId(spaceId);
+    await this.spaces.memoryFor(id);
+    return { spaceId: id, spaces: this.spaces.status() };
+  }
+
+  /**
+   * CREATE a named space (the UI's ＋ 新建空间). Unlike `ensureSpace` this is NOT
+   * idempotent: an existing space is a conflict. Fail-Fast happens BEFORE any
+   * write:
+   *   - malformed/reserved id           -> MEM_E_SPACE_INVALID
+   *   - `default`                       -> MEM_E_SPACE_INVALID (always exists)
+   *   - spaces/<id> already exists      -> MEM_E_SPACE_INVALID (conflict)
+   *   - spaces/<id> exists as a FILE    -> MEM_E_SPACE_INVALID (path conflict)
+   * so a typo can never create a directory, and dirty data never reaches JSONL.
+   */
+  async createSpace(spaceId) {
+    this.assertOpen();
+    const id = validateNewSpaceId(spaceId);
+    const dir = this.spaces.spaceDir(id);
+    let existing = null;
+    try {
+      existing = fs.statSync(dir);
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        throw new MemoryError(ErrorCodes.SPACE_INVALID, `space path cannot be inspected: ${error.code}`, { spaceId: id });
+      }
+    }
+    if (existing) {
+      throw new MemoryError(
+        ErrorCodes.SPACE_INVALID,
+        existing.isDirectory() ? `space already exists: ${id}` : `space path conflicts with a file: ${id}`,
+        { spaceId: id, reason: 'conflict' },
+      );
+    }
+    // Only now create the store. Any IO failure is surfaced as SPACE_INVALID so
+    // the UI always gets a 400 with a stable, user-presentable code.
+    try {
+      await this.spaces.memoryFor(id);
+    } catch (error) {
+      throw new MemoryError(ErrorCodes.SPACE_INVALID, `failed to create space ${id}: ${error?.code ?? 'IO'}`, {
+        spaceId: id,
+        reason: 'create-failed',
+        cause: error?.code ?? null,
+      });
+    }
+    return { spaceId: id, created: true, spaces: this.spaces.status() };
+  }
+
   // ---- L2.5 trend quarantine ---------------------------------------------
 
   /**
@@ -1018,12 +1734,35 @@ export class Memory {
    * away. A light rule folds the most recent batch into ONE `folded_summary`
    * episode and writes it back to L1, tagged `status:folded`, so the transition
    * from context to long-term memory is smooth and observable.
+   *
+   * v1.5.0 native fidelity (Qwen mode): while the memory volume that would be
+   * folded plus the live window stays BELOW `context.nativeTokenLimit`, nothing is
+   * folded — verbatim is the point of a native window. Above it, the normal L1.5
+   * layered fold runs. The check uses the pre-eviction volume (live blocks + the
+   * evicted records' own tokens) because `enforce()` has already shrunk the live
+   * window by the time the caller folds its report.
    */
   async foldEvicted(records = []) {
+    return this.spaces.run(DEFAULT_SPACE_ID, () => this._foldEvictedLocal(records));
+  }
+
+  async _foldEvictedLocal(records = []) {
     this.assertOpen();
     const fresh = (records ?? []).filter((record) => record?.text && !this._foldedIds.has(record.id));
     if (fresh.length === 0) return null;
     const batch = fresh.slice(-FOLD_BATCH);
+    const evictedTokens = batch.reduce((sum, record) => sum + (Number(record.tokens) || 0), 0);
+    const native = this.context.nativeState({ sessionTokens: this.sessionUsage().tokens });
+    if (native.tokens + evictedTokens < native.nativeTokenLimit) {
+      return {
+        folded: 0,
+        mode: 'native',
+        reason: 'native-mode',
+        nativeTokenLimit: native.nativeTokenLimit,
+        tokens: native.tokens + evictedTokens,
+        note: 'token volume is below the native window; verbatim blocks are kept, no L1.5 fold',
+      };
+    }
     for (const record of batch) this._foldedIds.add(record.id);
     const now = this.clock.now();
     const joined = batch.map((record) => record.text).join('\n');
@@ -1042,7 +1781,7 @@ export class Memory {
       .filter(Boolean)
       .join('；');
     try {
-      const result = await this.remember({
+      const result = await this._rememberLocal({
         content,
         tags: [FOLDED_TAG, 'folded_summary'],
         salience: 0.65,
@@ -1121,7 +1860,7 @@ export class Memory {
       occurredAt: occurredAt ?? this.clock.now(),
       ttlDays,
     });
-    this.refreshBriefing();
+    this._markBriefingDirty();
     return result;
   }
 
@@ -1130,7 +1869,20 @@ export class Memory {
     return this.tempStore.list({ status, now: this.clock.now() });
   }
 
-  async status() {
+  /**
+   * Status for one space. `targetSpaceId` is the UI space selector's routing hook:
+   * a named space reports ITS OWN log/index/semantic/tag-tree counts, so the panel
+   * and the L1/L2/L3 cards can never show a blended view. `spaceIds` is the root
+   * router's id list (a child store does not know its siblings).
+   */
+  async status({ targetSpaceId, spaceIds = null } = {}) {
+    this.assertOpen();
+    const spaceId = normaliseSpaceId(targetSpaceId);
+    if (spaceId === DEFAULT_SPACE_ID) return this._statusLocal(DEFAULT_SPACE_ID, spaceIds);
+    return this.spaces.run(spaceId, (target) => target._statusLocal(spaceId, spaceIds));
+  }
+
+  async _statusLocal(spaceId = DEFAULT_SPACE_ID, spaceIds = null) {
     this.assertOpen();
     const now = this.clock.now();
     const log = await this.logStore.status();
@@ -1146,6 +1898,10 @@ export class Memory {
       logGeneration: log.gen ? genNumber(log.gen) : 0,
       indexGeneration: index.generation ? genNumber(index.generation) : 0,
     };
+    // v1.5.0 session/handoff surface: read-only projection for the status bar.
+    const sessionUsage = this.sessionUsage();
+    const native = this.context.nativeState({ now, sessionTokens: sessionUsage.tokens });
+    const handoff = this.handoffState();
     return {
       dataDir: this.dataDir,
       policyHash: this.policyHash,
@@ -1215,6 +1971,34 @@ export class Memory {
         raw: { ...this.raw.stats(), mode: this.config?.raw?.mode ?? 'salience' },
         reviews: this.reviews.status({ now }),
         pendingDeletes: this.pendingDeletes.status(now),
+        // v1.5.0: the status bar and the space panel read exactly these fields.
+        // `mode` is the Qwen native/layered decision (native below nativeTokenLimit);
+        // `remainingTokens` is what the UI renders as "剩余 X Tokens 触发交接".
+        session: {
+          mode: native.mode,
+          tokens: native.tokens,
+          nativeTokenLimit: native.nativeTokenLimit,
+          threshold: native.rolloverThreshold,
+          ratio: native.ratio,
+          remainingTokens: native.remainingTokens,
+          rolloverEnabled: native.rolloverEnabled,
+          rolloverDue: native.rolloverDue,
+          sessionId: sessionUsage.sessionId,
+          handoffActive: handoff.active === true,
+          handoffAt: handoff.at ?? null,
+          handoffSummaryEventId: handoff.summaryEventId ?? null,
+          // v1.5.4: a degraded/failed handoff is VISIBLE, never a silent lock.
+          handoffState: handoff.state ?? null,
+          handoffDegraded: handoff.degraded === true,
+          handoffErrorCode: handoff.summaryError?.code ?? handoff.error?.code ?? null,
+        },
+        spaces: {
+          // The SELECTED space is the routing key for every card above: a status
+          // read for `alpha` reports alpha's log/index and marks current=alpha.
+          current: spaceId,
+          ids: Array.isArray(spaceIds) ? spaceIds : this.spaces.status().ids,
+          open: this.spaces.status().open,
+        },
       },
     };
   }
@@ -1245,13 +2029,21 @@ export class Memory {
   /**
    * Compact, model-facing state line used by the prompt context section.
    * Synchronous and IO-free on purpose: prompt assembly must never await disk.
+   * Written only when dirty: a write burst invalidates it once, the next prompt /
+   * panel poll rebuilds it once, instead of every append rebuilding it.
    */
   briefing() {
-    if (!this._briefing) this.refreshBriefing();
+    if (!this._briefing || this._briefingDirty) this.refreshBriefing();
     return this._briefing.text;
   }
 
+  /** Invalidate the derived prompt-state line without recomputing it. */
+  _markBriefingDirty() {
+    this._briefingDirty = true;
+  }
+
   refreshBriefing() {
+    this._briefingDirty = false;
     const index = this.indexManager.snapshot();
     const entries = index?.activeSet?.entries ?? [];
     const stats = index?.stats ?? {};
@@ -1283,6 +2075,33 @@ export class Memory {
   }
 
   // ---- policy & lifecycle ------------------------------------------------
+
+  /**
+   * Project a validated config onto this facade AND every open child space.
+   * Live values are read through `this.config` on every pass, so an operator edit
+   * must not wait for a reload; the context engine's overrides are updated here
+   * because it caches them at construction.
+   */
+  applyLiveConfig(config) {
+    this.config = config ?? {};
+    const engine = this.context;
+    if (engine) {
+      engine.maxTokensOverride = this.config.context?.maxTokens ?? null;
+      engine.thresholdOverride = this.config.context?.threshold ?? null;
+      engine.targetOverride = this.config.context?.target ?? null;
+      engine.nativeTokenLimitOverride = this.config.context?.nativeTokenLimit ?? null;
+      engine.rolloverThresholdOverride = this.config.context?.autoRolloverThreshold ?? null;
+      engine.rolloverEnabledOverride = this.config.context?.autoRolloverEnabled ?? null;
+    }
+    for (const child of this._childMemories) {
+      try {
+        child.applyLiveConfig(this.config);
+      } catch {
+        // A closing/failed child must never block the live config update.
+      }
+    }
+    return this.config;
+  }
 
   setPolicy(overrides) {
     this.policy = resolvePolicy(overrides);
@@ -1328,7 +2147,33 @@ export class Memory {
     };
   }
 
+  /**
+   * Sync shutdown: checkpoint the buffers we deliberately keep open on the hot path
+   * (log append handle + manifest, identity-ledger hint). Both are recoverable, but
+   * flushing here keeps a clean restart cheap and a test's temp dir complete.
+   */
   close() {
+    if (this._closed) return;
     this._closed = true;
+    // Child spaces own their own append handles/timers: close them first, then the
+    // default space. Idempotent, and a child failure must not leak the rest.
+    for (const child of this._childMemories) {
+      try {
+        child.close();
+      } catch {
+        /* best effort */
+      }
+    }
+    this._childMemories.clear();
+    try {
+      this.logStore.close();
+    } catch {
+      /* already closed */
+    }
+    try {
+      this.ledger.persist();
+    } catch {
+      /* the log remains the truth source */
+    }
   }
 }

@@ -46,6 +46,43 @@ export const ErrorCodes = Object.freeze({
   MIGRATION_MISMATCH: 'MEM_E_MIGRATION_MISMATCH',
   MIGRATION_TIMEOUT: 'MEM_E_MIGRATION_TIMEOUT',
   MIGRATION_IO: 'MEM_E_MIGRATION_IO',
+
+  // ---- v1.5.0: tag explosion, multi-space transfer -------------------------
+  /** A deep_raw query touches a super tag (>500 associations): a time window is mandatory. */
+  TIME_RANGE_REQUIRED: 'MEM_E_TIME_RANGE_REQUIRED',
+  /** Cross-space transfer refused: the payload matched a privacy-sensitive pattern. */
+  PRIVACY_BLOCKED: 'MEM_E_PRIVACY_BLOCKED',
+  /**
+   * Cross-space transfer refused: the model may never move memories on its own.
+   * The call was made without `user_approved:true` while
+   * `context.requireExplicitConsentForTransfer` is enabled (the default).
+   */
+  REQUIRE_USER_CONSENT: 'MEM_E_REQUIRE_USER_CONSENT',
+
+  // ---- v1.5.3 space management hardening --------------------------------
+  /**
+   * A NEW space id is malformed, reserved, or collides with an existing space /
+   * a non-directory path. Always a 400 for the create route; never written to
+   * JSONL, never silently clamped to another id.
+   */
+  SPACE_INVALID: 'MEM_E_SPACE_INVALID',
+
+  // ---- v1.5.3 tool schema pruning (tools.disabled) ----------------------
+  /**
+   * `tools.disabled` names something that is not a tool of this plugin, names a
+   * CORE tool (remember/recall/admin may never be disabled), or repeats a name.
+   * Fail-fast at config resolution: a typo must abort activation, never silently
+   * leave a tool enabled under a misspelled key.
+   */
+  INVALID_TOOL_NAME: 'MEM_E_INVALID_TOOL_NAME',
+
+  // ---- v1.5.4 handoff state machine -------------------------------------
+  /**
+   * Automatic handoff distillation failed or timed out. The engine records a
+   * degraded (but ACTIVE) marker and lets the next session start — it never
+   * rejects, never leaves the state machine in-flight, never locks the user out.
+   */
+  HANDOFF_FAILED: 'MEM_E_HANDOFF_FAILED',
 });
 
 export class MemoryError extends Error {

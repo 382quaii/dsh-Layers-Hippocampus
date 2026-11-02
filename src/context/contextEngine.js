@@ -25,13 +25,36 @@ export class ContextEngine {
    * @param {object}   options
    * @param {object}   options.clock     Clock (injected; tests use FakeClock)
    * @param {Function} options.getPolicy () => resolved policy (context section)
+   * @param {number}   [options.nativeTokenLimit]        model-native window size
+   * @param {number}   [options.autoRolloverThreshold]   fraction of native window that triggers a handoff
+   * @param {boolean}  [options.autoRolloverEnabled]     false disables handoff and enables forced eviction
+   * @param {Function} [options.getSessionTokens]        () => tokens consumed by the live session
    */
-  constructor({ clock, getPolicy, maxTokens, threshold, target, statsFile = null } = {}) {
+  constructor({
+    clock,
+    getPolicy,
+    maxTokens,
+    threshold,
+    target,
+    statsFile = null,
+    nativeTokenLimit,
+    autoRolloverThreshold,
+    autoRolloverEnabled,
+    getSessionTokens,
+  } = {}) {
     this.clock = clock;
     this.getPolicy = getPolicy;
     this.maxTokensOverride = maxTokens ?? null;
     this.thresholdOverride = threshold ?? null;
     this.targetOverride = target ?? null;
+    // v1.5.0 routing options. An explicit constructor value wins over the policy
+    // block, which wins over the documented default — same precedence as limits.
+    // `null` means "not supplied" so a caller cannot accidentally pin undefined.
+    this.nativeTokenLimitOverride =
+      Number.isFinite(nativeTokenLimit) && nativeTokenLimit > 0 ? Math.round(nativeTokenLimit) : null;
+    this.rolloverThresholdOverride = Number.isFinite(autoRolloverThreshold) ? autoRolloverThreshold : null;
+    this.rolloverEnabledOverride = typeof autoRolloverEnabled === 'boolean' ? autoRolloverEnabled : null;
+    this.getSessionTokens = typeof getSessionTokens === 'function' ? getSessionTokens : null;
     this.statsFile = statsFile;
     /** @type {Array<object>} insertion-ordered block table */
     this.blocks = [];
@@ -65,6 +88,80 @@ export class ContextEngine {
       threshold: this.thresholdOverride ?? pol.threshold ?? 0.85,
       target: this.targetOverride ?? pol.target ?? 0.7,
     };
+  }
+
+  get nativeTokenLimit() {
+    const pol = this.getPolicy?.()?.context ?? {};
+    return this.nativeTokenLimitOverride ?? pol.nativeTokenLimit ?? 8000;
+  }
+
+  get rolloverThreshold() {
+    const pol = this.getPolicy?.()?.context ?? {};
+    return this.rolloverThresholdOverride ?? pol.autoRolloverThreshold ?? 0.85;
+  }
+
+  get rolloverEnabled() {
+    const pol = this.getPolicy?.()?.context ?? {};
+    return this.rolloverEnabledOverride ?? pol.autoRolloverEnabled ?? true;
+  }
+
+  /**
+   * The native/layered decision, derived purely from measurements.
+   *
+   * `tokens` is the effective occupancy: the larger of the blocks this engine
+   * tracks and the live session size. A session can be inside the native window
+   * while the engine's own block table is empty (or vice versa), so neither number
+   * alone is the honest answer. `getSessionTokens` is the injection point; a
+   * caller may also pass `sessionTokens` per call.
+   *
+   * mode 'native': the model's own window can hold this session; no folding is
+   * allowed (there is nothing to fold into yet). mode 'layered': the session has
+   * outgrown the native window, so the layered memory pipeline may take over.
+   *
+   * `remainingTokens` is headroom to the HANDOFF point (threshold * native), not
+   * to the hard limit: crossing the hard limit is already too late to hand off.
+   *
+   * @param {{ now?: number, sessionTokens?: number }} [options]
+   */
+  nativeState({ now = this.clock.now(), sessionTokens } = {}) {
+    void now; // part of the API so callers can pin one timestamp across a snapshot
+    const limit = this.nativeTokenLimit;
+    const threshold = this.rolloverThreshold;
+    const enabled = this.rolloverEnabled;
+    const reported = Number.isFinite(sessionTokens) ? sessionTokens : this.getSessionTokens?.();
+    const session = Number.isFinite(reported) ? reported : 0;
+    const tokens = Math.max(this.tokens(), session);
+    const ratio = round(limit > 0 ? tokens / limit : 0, 4);
+    const handoffThresholdTokens = Math.round(threshold * limit);
+    return {
+      mode: tokens < limit ? 'native' : 'layered',
+      tokens,
+      // Effective occupancy (max of block table and session). `effectiveTokens` is
+      // the canonical name; `sessionTokens` is kept as an alias so existing callers
+      // that read the session-side name keep working.
+      effectiveTokens: tokens,
+      sessionTokens: tokens,
+      nativeTokenLimit: limit,
+      ratio,
+      rolloverThreshold: threshold,
+      rolloverEnabled: enabled,
+      rolloverDue: enabled && ratio >= threshold,
+      remainingTokens: Math.max(0, Math.ceil(threshold * limit - tokens)),
+      // Rollover disabled means no handoff can move the session; once the native
+      // window is effectively exhausted (95%) eviction is the only honest option
+      // left, and it must be FORCED rather than silently ignored.
+      forceEvictionDue: !enabled && ratio >= 0.95,
+      handoffThresholdTokens,
+    };
+  }
+
+  /**
+   * Folding ("推币机") is a layered-mode operation: folding blocks out of the
+   * native window would evict context the model still holds natively. Memory asks
+   * this gate before folding; the engine itself never folds.
+   */
+  foldAllowed(options = {}) {
+    return this.nativeState(options).mode === 'layered';
   }
 
   /**
@@ -132,17 +229,42 @@ export class ContextEngine {
   /**
    * Evict until usage is back under `target`. Deterministic: score ascending,
    * ties broken by insertion order (oldest leaves first).
+   *
+   * Two triggers exist, and they are deliberately kept apart:
+   *   - 'threshold'    the legacy rule: before > threshold * maxTokens. Unchanged
+   *                    for every existing caller;
+   *   - 'native-force' only when auto-rollover is DISABLED and the native window
+   *                    is >= 95% full. With rollover off there is no handoff to
+   *                    move the session, so the window itself must shrink.
+   *                    Its eviction limit is the stricter of target*maxTokens and
+   *                    target*nativeTokenLimit: a large maxTokens must not make the
+   *                    forced eviction a no-op when the native window is small.
    */
   enforce({ now = this.clock.now() } = {}) {
     const { maxTokens, threshold, target } = this.limits;
     const before = this.tokens();
+    const native = this.nativeState({ now });
+    const legacyTriggered = before > threshold * maxTokens;
+    const forced = !legacyTriggered && !native.rolloverEnabled && native.forceEvictionDue;
     const evictedNow = [];
 
-    if (before <= threshold * maxTokens) {
-      return { triggered: false, before, after: before, evicted: [], threshold, target, maxTokens };
+    if (!legacyTriggered && !forced) {
+      return {
+        triggered: false,
+        before,
+        after: before,
+        evicted: [],
+        threshold,
+        target,
+        maxTokens,
+        pinnedFloorReached: false,
+        reason: null,
+        forced: false,
+        native,
+      };
     }
 
-    const limit = target * maxTokens;
+    const limit = forced ? Math.min(target * maxTokens, target * native.nativeTokenLimit) : target * maxTokens;
     let current = before;
     while (current > limit) {
       let victim = null;
@@ -184,6 +306,9 @@ export class ContextEngine {
       target,
       maxTokens,
       pinnedFloorReached: current > limit,
+      reason: legacyTriggered ? 'threshold' : 'native-force',
+      forced,
+      native,
     };
   }
 
@@ -198,6 +323,9 @@ export class ContextEngine {
     return {
       ...this.usage({ now }),
       maxTokens,
+      // Native/layered measurement rides along with the panel snapshot so status
+      // readers never have to reconstruct it from the block table.
+      native: this.nativeState({ now }),
       blocks: this.blocks.map((block) => ({
         id: block.id,
         kind: block.kind,

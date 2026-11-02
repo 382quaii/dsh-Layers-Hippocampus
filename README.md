@@ -4,7 +4,7 @@
 
 | | |
 | --- | --- |
-| 版本 | **1.4.2** |
+| 版本 | **1.5.4** |
 | 包名 | `dsh-layers-hippocampus`（npm 只允许小写；仓库名保留 `dsh-Layers-Hippocampus`，*Hippocampus* 双 **p**） |
 | 仓库 | <https://github.com/382quaii/dsh-Layers-Hippocampus> |
 | 许可证 | MIT |
@@ -18,7 +18,7 @@
 ### 从 GitHub
 
 ```bash
-pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.4.2"
+pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.5.4"
 ```
 
 ### 从 npm
@@ -57,6 +57,8 @@ node scripts/wait-for-routes.mjs
 | --- | --- |
 | `remember` | 追加一条长期记忆（内容哈希幂等）；可带 `media_url` + `media_type` 指向附件 |
 | `checkpoint` | 记录**唯一**进行中的重任务：`task_id`、`progress`（0–100）、`updated_at` |
+| `space_transfer` | 跨空间原子迁移：`event_ids` + `target_space_id` + `transfer_mode: copy \| move`；**必须 `user_approved: true`**（AI 自行调用会被引擎拦截）；隐私词拦截、剥离 `raw_turn`、目标空间重新生成 `event_id` 并打标 |
+| `transfer_to_global` | 迁移到 `global` 空间，参数与安全门禁同 `space_transfer`（`memory_transfer_to_global`） |
 | `recall` | 关键词 + 标签检索，衰减加权，含图谱联想；宽限中 mid 的命中只回**元数据**并引导 `deep_raw`；`mode: "deep_raw"` 走受限 raw 扫描 |
 | `capture` | 把**一轮原始对话**存入取证层（受门控与预算限制，不进索引） |
 | `reinforce` | 确认一次记忆，不重写内容，并推进复习档位 |
@@ -70,8 +72,10 @@ node scripts/wait-for-routes.mjs
 - **异步写盘**：捕获只入内存队列，每 10 条或 1 秒批量 `appendFile`，绝不阻塞 `session/event` 回调。
 - **明文存储 + 读出脱敏**：落盘保留 100% 原文（黑匣子完整性）；`deep_raw` 返回前对 snippet 做脱敏（Bearer、`sk-`、长 base64 串 → `[redacted]`），防止密钥进入云端 prompt。**注意：本地磁盘为明文。**
 - **墓碑**：`forget` 真正执行 purge 后，按内容 hash 追加 `{ type: "raw_tombstone", hash, timestamp }`；扫描时命中墓碑的记录直接跳过（防死灰复燃）。
-- **强制时间窗**：`memory_recall mode="deep_raw"` 必须同时给 `start_time` 与 `end_time`，缺失直接 `MEM_E_INVALID_INPUT`。
+- **时间窗**：`memory_recall mode="deep_raw"` 通常必须同时给 `start_time` 与 `end_time`，缺失抛 `MEM_E_INVALID_INPUT`；但若查询词命中**超级大标签**（关联数 > 500），缺失时间窗抛更具体的 **`MEM_E_TIME_RANGE_REQUIRED`**（1.5.0）——大标签裸扫正是要防的上下文/内存洪峰。
 - **Token 预算**：结果上限 `raw.maxResultTokens`（默认 1000），超出截断并在 `notes` 末尾注明「由于预算限制，部分原始记录已被截断」。
+- **最新优先扫描**：`deep_raw` 在分片内**从尾部倒序**扫描（日文件内越新越先看到），回合预算 `raw.maxScanTurns`（默认 5000，UI 可调）控制"从最新往回看多远"。超出预算返回 `truncated: true` + notes 说明，绝不假装更旧的数据不存在。1.4.3 前是头部正序扫描，大分片里最新的 5000 条永远查不到——黑匣子的核心价值被反转，已修复。
+- **⚠ 尾扫偏置（明确的已知代价）**：单个日分片超过 `maxScanTurns`（默认 5000）时，一次 `deep_raw` **只能看到该分片最新的 N 条**；更早的历史记录不在本次扫描范围内，需要：① 调大 `raw.maxScanTurns`（上限 50 000）；或 ② 按时间窗**分页**查询——把 `end_time` 逐步前移、用多个时间窗分别扫描。返回体里 `truncated: true` 与 `notes` 会明确告知"本次没扫完"，绝不静默返回空。该偏置是"查新优先"的直接代价。
 - **TTL**：`maintain()` 删除文件名日期早于 `今天 - retentionDays` 的整文件；**今天正在写的文件绝不删**。raw 体积计入 Dashboard 存储环（`panel.storage.rawBytes` + 总 `diskBytes`）。
 - 自动捕获：订阅 `session/event`，只收 user/assistant 原文（剥离宿主注入的 `Current runtime context.` 段），工具输出默认不收、但 `isError` 的失败结果强制入库。
 
@@ -130,6 +134,44 @@ node scripts/wait-for-routes.mjs
 - `event_id = hash(content_hash + event_time + occurrence_index)` 用于**身份**。
 - 重复写通过独立幂等索引抑制；墓碑在日志压实后仍然存在，遗忘的事件不会复活。
 
+### 写入路径与耐久性（1.4.3）
+
+- **`stage()` / `commitMany()`**：`remember` 先 `stage`（校验、身份解析、构造记录，不碰日志与索引），再 `commitMany`（**一次** durable append + **一次** ledger checkpoint + **一次** lazy 索引 delta + **一次** briefing 失效）。`bulkIngest` 每 50 条真正批量提交一次。
+- **日志追加缓冲**：热路径只保留一个 append 句柄，不再每条 fsync + 重写 manifest；`flushSync()` 由 200ms 定时器、`close()`、以及任何 rewrite/compaction 触发。记录写入后**立即对本进程可读**（page cache），跨进程崩溃窗口 ≤ 200ms。
+- **崩溃可见**：`status().unflushedBytes` 对比分片文件大小与 manifest 计数字节；boot check 看到未 checkpoint 的尾巴就判 stale 并重建，不会把"未写进 manifest 的尾记录"当成不存在。
+- **identity ledger 延迟 checkpoint**（500ms / close）：它是可从日志重建的启动提示，不是真相源。
+- **索引追加惰性化**：`applyRecords` 只记录 delta 并置 dirty，下一次 `snapshot()` 一次性折叠——N 次写只付一次建索引成本，且"写完即可读"由读路径保证。
+- **实测**：顺序 `remember` ×1000 从 **119/s → 9104/s**（8.4s → 110ms）。
+
+---
+
+## v1.5.0：大标签治理、多空间路由与会话交接
+
+### 1. 超级大标签（Tag Explosion）超载治理
+
+- **索引层截断（防 OOM）**：倒排索引构建时，每个标签最多保留 `index.maxPostingsPerTag`（默认 **500**）个指针；超限时按 `salience desc → eventTime desc → eventId asc` 保留，再按检索序重排。`eventCount` / `mass` / `lastSeen` 仍按**全部事件**统计，因此降级提示里的 N 是真实总数；被移出的只是内存索引指针，**底层 JSONL 完好**，删索引重建即可恢复。标签带 `postingsLimit` / `postingsTruncated` / `postingsDropped`，索引 stats 带同名汇总。
+- **检索层降级（防上下文爆炸）**：显式 `tags: ["big"]` 命中数 > **50** 时不再展开候选，返回元数据提示：`[系统提示] 发现关于 [big] 的记忆共 N 条，数据量过大。请提供更精确的 startTime/endTime 或使用 deep_raw 查阅。`（附该标签的 `window` 起止时间）；coarse-block 回退同时被抑制，避免洪峰从后门回来。若用户坚持（再次查询同一标签），只返回**最近 3 条摘要**（`oversizedRecent: true`）。
+- **深层检索强制时间窗**：`deep_raw` 命中超级大标签（关联数 > **500**）且缺 `start_time`/`end_time` 时抛 **`MEM_E_TIME_RANGE_REQUIRED`**；窄查询保持原 `MEM_E_INVALID_INPUT` 契约。判断只有一处（引擎），工具不再重复校验。
+
+### 2. 多空间路由与会话交接（纯物理层）
+
+- **路由隔离**：`remember` / `recall` 支持可选 `target_space_id`（核心 API 为 `targetSpaceId`）。`default` 就是原有存储（旧路径字节不变），命名空间落在 `<dataDir>/spaces/<id>/`，各自独立日志/索引/状态。**每个空间一条 FIFO 文件锁**：同空间串行、跨空间并发，绝不交叉；`runMany` 按 id 排序加锁，杜绝 ABBA 死锁。id 会变成目录名，所以 `^[a-z0-9][a-z0-9._-]{0,63}$` 强校验，拼错直接 `MEM_E_INVALID_INPUT`，绝不静默落到默认空间。
+- **原生保真与折叠（Qwen 模式）**：Token 低于 `context.nativeTokenLimit`（默认 8000）时**绝不折叠**——保留逐字原文；超过后自动走 L1.5 分层折叠。旧的 `context.maxTokens` 分页阈值完全不变。
+- **自动交接（转生）**：达到 `autoRolloverThreshold`（默认 0.85）× `nativeTokenLimit` 时，把窗口末尾提炼成**一条** L1.5 摘要（`status:handoff`），写入 `state/handoff.json` 交接标记，并在 `memory-state` 提示词尾部注入 `[交接标记]`。交接幂等（一次交接只产一条摘要），由 `session/event` 与工具边界自动触发；新会话会消费标记。关闭交接则不写标记，由 ContextEngine 在 **95%** 强制驱逐（`reason: "native-force"`，驱逐到 `target × nativeTokenLimit`）。
+
+### 3. 跨空间安全迁移（`memory_space_transfer`）
+
+- `transfer_mode`: `copy`（默认）| `move`；**安检铁律**：隐私敏感内容（身份证/手机号/银行卡/邮箱/凭据赋值/PEM 私钥）整批拦截 `MEM_E_PRIVACY_BLOCKED`（命中的原文绝不回传）；`raw_turn`/`raw_*` 指针逐层剥离；目标空间重新生成 `event_id`（`dedupe:false`，绝不复用源身份）并打标 `transferred:from:<source>` / `transferred:to:<target>`。
+- **状态差异**：`copy` 源数据原样保留；`move` 在**全部目标写入成功之后**把源数据挂入两阶段删除流水线（`pending_delete` 倒计时，可用 `restore` 取消），**绝不直接物理删除**；目标写入部分失败则源数据完全不动。
+
+### 4. 安全红线：跨空间迁移必须显式用户授权（1.5.1）
+
+跨空间传消息是**数据外发**，不是记忆优化，绝不允许 AI“自作主张”或“合理推测”。双重保险：
+
+- **提示词层**：`memory:policy` 常驻 `【🚨最高安全红线】`——`memory_space_transfer` / `memory_transfer_to_global` 极度危险，**绝对禁止** AI 因自身判断、同情心或“为了更好地跨端共享记忆”而自动调用；唯一允许条件是用户在**当前对话**明确下令。不确定时必须先问：`您需要我把这条信息同步到其他空间吗？`
+- **引擎层**：`context.requireExplicitConsentForTransfer`（默认 **true**）。为 true 时，任何未带 `user_approved: true` 的迁移调用都会被拦截并返回 **`MEM_E_REQUIRE_USER_CONSENT`**：`[系统拦截] 跨空间传递需要用户明确授权。请向用户确认后再试。` 该检查发生在**校验空间 id、打开存储、读取内容、挂起待删之前**——被拒绝的调用可证明零副作用。AI 看到此错误必须停下、向用户确认，得到明确同意后才能带 `user_approved: true` 重试。
+- **UI 人工通道（1.5.2 起更强）**：面板记忆列表勾选 →「移动到…」→ 第一步提示“即将向 [目标空间] 发起迁移请求” → 第二步**二次显式确认**（剪切另有警告）→ 才带 `user_approved: true` 调 API。**HTTP 路由不再自行伪造授权**：缺这个标志的 POST 与 AI 工具调用一样被引擎拦截（`MEM_E_REQUIRE_USER_CONSENT`），因此“底层 API 绕过 UI”同样走不通；AI 也无法访问 HTTP 路由。
+
 ---
 
 ## 配置
@@ -154,6 +196,13 @@ node scripts/wait-for-routes.mjs
 | `context.maxTokens` | `4000` | 256 – 1 000 000 |
 | `context.threshold` / `context.target` | `0.85` / `0.7` | target < threshold < 1 |
 | `context.injectPrompt` | `true` | 布尔 |
+| `context.autoSpaceFollow` | `false` | 布尔；开启后跨空间操作完成时 UI 自动切换空间 |
+| `context.autoRolloverEnabled` | `true` | 布尔；关闭则 95% 时强制驱逐、不写交接标记 |
+| `context.autoRolloverThreshold` | `0.85` | 0.5 – 0.99；× `nativeTokenLimit` 触发交接 |
+| `context.nativeTokenLimit` | `8000` | 512 – 1 000 000；低于该 Token 数绝不折叠（Qwen 原生模式） |
+| `context.requireExplicitConsentForTransfer` | `true` | 布尔；开启时 AI 直接调用迁移工具返回 `MEM_E_REQUIRE_USER_CONSENT`，仅 UI 人工通道放行（1.5.1） |
+| `index.maxPostingsPerTag` | `500` | 1 – 100 000；每个标签在内存索引中最多保留的指针数 |
+| `tools.disabled` | `[]` | 工具后缀数组（如 `["capture","bulk_ingest"]`）；核心 remember/recall/admin 不可关闭；未知/重复/带前缀名称 fail-fast 抛 `MEM_E_INVALID_TOOL_NAME` |
 | `temp.ttlDays` / `temp.promotionWindowDays` | `30` / `20` | promotion ≤ ttl |
 | `identity.eventTimePolicy` | `content` | `content` \| `explicit` \| `ingest` |
 | `raw.mode` | `salience` | `off` \| `salience` \| `all` |
@@ -163,6 +212,7 @@ node scripts/wait-for-routes.mjs
 | `raw.maxTotalMb` | `256` | 16 – 4096 MB |
 | `raw.retentionDays` | `30` | 1 – 365（按文件日期整文件清理） |
 | `raw.maxScanMb` | `16` | 1 – 256 MB |
+| `raw.maxScanTurns` | `5000` | 500 – 50 000；deep_raw 从最新往回的回合预算 |
 | `raw.maxResultTokens` | `1000` | 50 – 20000 |
 | `raw.autoCapture` | `true` | 布尔 |
 | `raw.captureTools` | `false` | 布尔（`isError` 工具结果始终捕获） |
@@ -216,6 +266,14 @@ Cron **和** 空闲 Dream 触发调用同一个入口 `runtime.runMaintenance(so
   - **拖拽**：`onPointerDown/Move/Up` + `setPointerCapture`；拖拽期间只改 ref 坐标并直接写 DOM（`transform` 与线段端点），**不触发 setState**；松手后解除 pin，对 1 跳邻域做 alpha 衰减的局部松弛；位移 < 4px 仍算点击（切换标签）。
   - **幽灵节点与历史开关**：图谱接口在同一次响应里带 `tagTree.ghosts`（渲染上限 50 条，含 `totalGhosts`/`truncated`）；"仅活跃 / 历史全貌"开关用 CSS `opacity` 420ms 过渡淡入淡出（布局键不含开关状态，切换**不会重排**）。历史里的 mid 渲染为半透明虚线圆，挂在父 root 下，hover 有 `title` 提示剩余宽限期。
 - **设置页**：开关（Dream / Reflection / briefing / promptSection / autoMaintainOnBoot / injectPrompt）、数字（含上下限与客户端预检）、滑块 + 数字框（L1.5 四个寿命旋钮，label 的 `title` 是场景化 Tooltip）、下拉（`identity.eventTimePolicy`）、Cron 文本框；保存一次性提交带点号路径的 patch，后端 fail-fast 失败时顶部红色横幅显示 `MEM_E_CONFIG_*`，成功后广播 `config-changed`，面板立即重拉 stats 与 graph。
+- **空间与会话交接（1.5.0）**：面板状态栏实时显示 `[当前: 原生模式 | 剩余 X Tokens 触发交接]`（另有两种文案：`分层折叠`、`已交接`）；设置页新增「空间与会话交接（纯物理层）」区：空间软跟随开关、自动交接开关、触发比例滑块、原生窗口、单标签索引上限。
+- **全局空间选择器（1.5.2）**：面板 Header 的 `SpaceSelector` 手动切换当前空间（默认空间 / 工作空间 / 私人空间 / 新建空空间）；面板与设置页共用同一全局状态，所有读取（`stats` / `graph` / `memories`）都带 `?space=<id>` 后端路由隔离——记忆列表、图谱、L1/L2/L3 状态、会话计数严格跟随选中空间，切换不串流。
+- **物理迁移与业务迁移彻底拆开（1.5.2）**：`dataDir` 迁移只在设置页底部的「系统级 · 存储位置迁移（dataDir / A-B 双缓冲）」里，严格绝对路径 + 空目录 Fail-Fast，旧目录保留备份，`state=migrating`。**业务记忆迁移**只在面板：勾选记忆 →「移动到…」→ 第一步显示「即将向 [目标空间] 发起迁移请求」→ 第二步**二次显式确认**（`二次确认 · 安全红线`，剪切另有警告）→ 才带 `user_approved: true` 发请求；不再有任何手动 `event_ids` / `target_space_id` 输入框。
+- **工具 schema 裁剪（1.5.3）**：设置页新增「工具 schema 裁剪（tools.disabled）」复选目录，逐项说明核心不可关闭（remember/recall/admin）与低频可裁剪（capture/bulk_ingest/reinforce/space_transfer 等），并用 Tooltip 解释每个工具的用途与 token 底座税权衡；保存写回 `tools.disabled`，下次宿主启动/重载时跳过注册并从提示词工具清单中剔除。
+- **空间创建热修（1.5.3）**：`POST /api/hippocampus/spaces` 失败不再裸奔 `MEM_E_SPACES: HTTP 404`。`/stats` 与 `GET /spaces` 返回 `capabilities`（version/spaces/memories/transferConsent），前端**调用前先握手**：旧宿主（不支持该路由）直接显示版本提示并禁用创建，不会打空请求；即使仍失败也统一转成「创建失败：底层引擎未响应，请检查版本或联系架构师」。后端对非法/保留/已存在名称抛 `MEM_E_SPACE_INVALID`（HTTP 400，写盘前拦截），成功创建返回 201。**注意：内核升级后需重启 DSH/重载插件，旧进程不会凭空长出 /spaces 路由。**
+- **减法交互（1.5.0）**：图谱上方的标签搜索框只依赖宿主原生**回车**触发（`onKeyDown` + `Enter`），**没有防抖 / 定时器 / effect**；过滤是纯函数 `filterGraphByQuery`，不会重跑力布局。
+- **逐条记忆人工迁移（1.5.1 / 1.5.2）**：面板“记忆详情”列表用勾选 +「移动到…」，目标空间来自下拉（含新建空间），完成后按软跟随开关决定是否切换；AI 自行调用只会收到 `MEM_E_REQUIRE_USER_CONSENT`，HTTP 路由也不再自行伪造授权（缺 `user_approved:true` 同样被引擎拦截）。
+- **哲学底注**：设置页 Footer（加粗）：**本插件不能保证一个会话永生不死，只能保证人格不死。**
 - UI 不调用 Agent 工具，只读下面的 JSON 路由。
 
 ### 截图
@@ -234,11 +292,15 @@ Cron **和** 空闲 Dream 触发调用同一个入口 `runtime.runMaintenance(so
 
 | 方法 | 路径 | 返回 |
 | --- | --- | --- |
-| `GET` | `/api/hippocampus/stats` | `{ ok, state, phase, panel, briefing, config }`；未就绪 `503` |
+| `GET` | `/api/hippocampus/stats?space=<id>` | `{ ok, state, phase, spaceId, panel, briefing, config }`；面板数据只属于该空间；未就绪 `503` |
 | `GET` | `/api/hippocampus/config` | 可编辑配置子集（`ready` 前也可读，用于回填表单） |
-| `POST` | `/api/hippocampus/config` | `{ patch }` → fail-fast 校验 → 生效 → 尽量持久化 |
-| `GET` | `/api/hippocampus/graph` | 缓存图谱，`.slice(0, graphMaxEdges)`；同时带 `tagTree.ghosts`（历史视图的幽灵元数据） |
+| `POST` | `/api/hippocampus/config` | `{ patch }` → fail-fast 校验 → 生效 → 尽量持久化；`{ dataDir }` 单独请求 = 系统级物理迁移（202 / state=migrating） |
+| `GET` | `/api/hippocampus/graph?space=<id>` | 该空间的缓存图谱，`.slice(0, graphMaxEdges)`；同时带 `tagTree.ghosts` |
 | `POST` | `/api/hippocampus/retry` | 重试 `failed` 启动（`202`） |
+| `POST` | `/api/hippocampus/transfer` | 业务数据跨空间迁移 `{ event_ids, target_space_id, transfer_mode, source_space_id?, user_approved }`；**缺 `user_approved:true` 由引擎拦截**（1.5.2 起路由不再代为授权） |
+| `GET` | `/api/hippocampus/memories?limit=20&space=<id>` | 该空间的最近记忆投影（面板勾选迁移的数据源） |
+| `POST` | `/api/hippocampus/session/reset` | 逃生舱：清零当前会话 token 基线、释放 in-flight 锁、消费 handoff.json（不删除记忆）；交接卡死时用（1.5.4） |
+| `GET` / `POST` | `/api/hippocampus/spaces` | 列出物理空间 / 新建空空间 `{ space_id }`（成功 201；非法/保留/已存在 → 400 `MEM_E_SPACE_INVALID`；1.5.3 起 `/stats` 带 `capabilities` 供前端握手） |
 
 图谱路由**不排序、不读日志**：缓存由 `maintain()` 写入，路由只做切片。
 
@@ -252,7 +314,8 @@ Cron **和** 空闲 Dream 触发调用同一个入口 `runtime.runMaintenance(so
   index/        gen-*/ + CURRENT          A/B 投影
   identity/     ledger.json               幂等 + 墓碑
   semantic/     摘要 + temp.json          独立语义流
-  state/        context.json、maintenance.json、graph.json、tag-tree.json、months.json、active-task.json
+  state/        context.json、maintenance.json、graph.json、tag-tree.json、months.json、active-task.json、handoff.json
+  spaces/       <spaceId>/…               命名空间的独立存储（default 不在此处，复用根目录）
   journal/      删除流水账
 ```
 
@@ -267,7 +330,8 @@ Cron **和** 空闲 Dream 触发调用同一个入口 `runtime.runMaintenance(so
 ## 开发与验证
 
 ```bash
-npm test      # node test/run.mjs —— 189 个进程内用例，30 秒看门狗
+npm test      # node test/run.mjs —— 295 个进程内用例，60 秒看门狗
+npm run bench # 基准协议：独立临时库 + 同进程预热 + 5 次取中位数
 npm run check # 语法检查 + 全量测试
 ```
 
@@ -288,6 +352,26 @@ node scripts/compact-raw.mjs --apply         # 先备份到 raw/.backup-<ts>/ �
 node scripts/compact-raw.mjs --data-dir "D:\Users\86135\memory" --apply
 ```
 
+基准协议（唯一被认可的吞吐量发布方式；单次跑出的数字一律视为噪声）：
+
+```bash
+npm run bench                                  # node scripts/bench-protocol.mjs，markdown 报告
+node scripts/bench-protocol.mjs --json         # 原始样本
+node scripts/bench-protocol.mjs --records 2000 --runs 5 --warmup 1
+```
+
+交接脏数据修复（默认 dry-run；`--apply` 后只进入 pending_delete 两阶段队列，仍可 restore）：
+
+```bash
+node scripts/repair-handoff.mjs --data-dir "<DSH_HOME>/memory"              # 只列出候选
+node scripts/repair-handoff.mjs --data-dir "<DSH_HOME>/memory" --apply      # 归档递归/超额 handoff
+node scripts/repair-handoff.mjs --data-dir "<DSH_HOME>/memory" --reset-marker  # 顺带清除卡住的 marker
+```
+
+协议固定为：每次测量独立临时库（跑完删除）→ 同进程预热 1 次（丢弃）→ 5 次测量取**中位数**并同时报告 min/max/离散度；任何只引用单一数字的结论都无效。脚本不对吞吐量做断言（共享机器/杀软扫描不能把 CI 弄红），只保证测量方法一致。
+
+`context.minInjectConfidence` 已在 1.5.3 移除（从未证明省 Token，0.6 与 0 逐字节相同）；旧配置若仍带该键，启动会 fail-fast 报 `MEM_E_CONFIG_UNKNOWN_KEY` 并提示删除。
+
 绑定/注册体检（检查 package.json 名、patch 行名、profile 依赖、Junction 与实时路由）：
 
 ```bash
@@ -296,7 +380,7 @@ node scripts/check-binding.mjs --port 55879
 
 ## 变更记录
 
-见 [CHANGELOG.md](CHANGELOG.md)（当前 **1.4.2**：L1.5 标签层级树 / 宽限幽灵 / 检索降级 / 图谱历史视图；1.4.1：提示词软引导 / 工具瘦身 / 置信度 / 洪峰防护；1.4.0：raw 原始回合取证 / 间隔重复 / 两阶段删除 / UI 数据目录迁移）。
+见 [CHANGELOG.md](CHANGELOG.md)（当前 **1.5.4**：自动交接死锁修复 / 摘要递归切断 / ratio 基线重置 / handoff 隔离降权 / 逃生舱与脏数据修复；1.5.3：空间创建热修 / 路由漂移锁定 / 能力握手 / `MEM_E_SPACE_INVALID` / 人话降级 / `tools.disabled` 工具裁剪 / 基准协议 / 移除死配置 `minInjectConfidence` / 多空间固定开销测试；1.5.2：UI 架构纠偏 / 物理迁移与业务迁移解耦 / 全局空间选择器 / 按空间路由隔离 / 迁移显式二次授权；1.5.1：跨空间迁移显式用户授权 / 提示词安全红线 / `memory_transfer_to_global`；1.5.0：大标签治理 / 多空间路由 / 会话交接 / 跨空间安全迁移；1.4.3：写入批量化 / deep_raw 最新优先 / 日志缓冲与崩溃可见；1.4.2：L1.5 标签层级树 / 宽限幽灵 / 检索降级 / 图谱历史视图；1.4.1：提示词软引导 / 工具瘦身 / 置信度 / 洪峰防护；1.4.0：raw 原始回合取证 / 间隔重复 / 两阶段删除 / UI 数据目录迁移）。
 
 ## 许可
 

@@ -4,7 +4,6 @@ import { foldText, extractEntities } from '../src/utils/RegexExtractor.js';
 import { composePrompt, stablePrefix, renderMemoryMap } from '../src/utils/promptLayout.js';
 import { slimToolOutput, needsSlimming } from '../src/utils/ToolOutputSlimmer.js';
 import { WriteQueue } from '../src/utils/WriteQueue.js';
-import { applyConfidence } from '../src/retrieval.js';
 import { makeMemory, FakeClock, T0, DAY_MS } from './helpers.js';
 
 const cfg = (raw = {}) => ({ config: { raw: { mode: 'all', autoCapture: true, maxTurnKb: 64, maxBytesPerDay: 8, maxTotalMb: 256, retentionDays: 30, maxScanMb: 16, maxResultTokens: 1000, captureRatio: 1, ...raw } } });
@@ -101,14 +100,5 @@ test('captureRatio 0.5 samples deterministically; 0 blocks capture and deep_raw 
   }
 });
 
-test('confidence: low hits become short hints, never full bodies', () => {
-  const hits = [
-    { eventId: 'a', score: 1, snippet: 'high body' },
-    { eventId: 'b', score: 0.2, snippet: 'low body' },
-  ];
-  const result = applyConfidence(hits, 0.6);
-  assert.equal(result.hits[0].snippet, 'high body');
-  assert.match(result.hits[1].snippet, /低置信/);
-  assert.equal(result.hits[1].lowConfidence, true);
-  assert.deepEqual(result.notes, ['low-confidence-hints:1']);
-});
+// v1.5.3: the `minInjectConfidence` pass was removed as dead token tax. Its
+// regression assertions live in test/v154.release.test.js.

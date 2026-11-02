@@ -6,11 +6,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { buildIndex, foldRecords } from '../src/index/buildIndex.js';
+import { ingestEpisode } from '../src/log/ingest.js';
 import { Memory } from '../src/memory.js';
 import { FakeClock } from '../src/clock.js';
 import { tempDir, T0, DAY_MS } from './helpers.js';
 
-test('a suspended writer never exposes a partial index to readers', async () => {
+test('a suspended rebuild never exposes a partial index to readers', async () => {
   const dir = tempDir('barrier');
   const memory = await Memory.open({ dataDir: dir, clock: new FakeClock(T0) });
   try {
@@ -19,7 +20,18 @@ test('a suspended writer never exposes a partial index to readers', async () => 
     const before = memory.indexManager.snapshot();
     assert.equal(before.events.length, 1);
 
-    // Park the writer exactly at the barrier, between BUILD and SWAP.
+    // The second event reaches the LOG without touching the live index: online
+    // appends are lazy now, so the barrier contract lives on the rebuild path — the
+    // only writer that swaps a buffer. Appending straight to the truth source is
+    // exactly the "event arrived while BUILD ran" situation catch-up exists for.
+    const plan = ingestEpisode({
+      payload: { content: 'event arriving during the build', tags: ['new'], salience: 0.7, event_time: T0 + 1000 },
+      clock: memory.clock,
+      policy: memory.policy,
+      ledger: memory.ledger,
+    });
+    await memory.logStore.append([plan.record]);
+
     let reachedBarrier;
     const atBarrier = new Promise((resolve) => {
       reachedBarrier = resolve;
@@ -33,7 +45,7 @@ test('a suspended writer never exposes a partial index to readers', async () => 
       await gate;
     };
 
-    const writing = memory.remember({ content: 'event arriving during the build', tags: ['new'], salience: 0.7, eventTime: T0 + 1000 });
+    const writing = memory.indexManager.rebuild({ reason: 'barrier' });
     await atBarrier;
 
     // Reader path is lock-free: it resolves the pointer once, mid-build.

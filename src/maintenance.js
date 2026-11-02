@@ -64,6 +64,17 @@ export class Maintenance {
         reason: `sourceLogGen=${index.sourceLogGen} logGen=${logGen}`,
       };
     }
+    // A buffered append path checkpoints the manifest on close(); bytes on disk that
+    // the manifest never counted mean the process died mid-burst. Treat that as
+    // stale so the index cannot silently miss the tail.
+    if ((log.unflushedBytes ?? 0) > 0) {
+      return {
+        status: 'stale',
+        logGen,
+        indexGen: index.gen,
+        reason: `unflushed-bytes=${log.unflushedBytes}`,
+      };
+    }
     if ((index.stats?.recordCount ?? 0) !== log.recordCount) {
       return {
         status: 'stale',

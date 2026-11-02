@@ -4,6 +4,480 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.4] — 2026-11-02
+
+**Hotfix: the automatic handoff state machine can no longer wedge a session, and
+recursive handoff summaries are cut off at the source.** Incident: recursive
+`交接摘要` generations inflated the ratio past the native window and a handoff that
+failed could leave the machine stuck, blocking new sessions. **295 tests green**
+(was 286).
+
+### Fixed — state machine (no deadlock, Fail-Fast with graceful degradation)
+
+- **`checkHandoff()` never rejects**: a distillation error, a timeout (default 5s,
+  injectable per call) or a marker-write failure degrade to a `state:"failed"`
+  marker carrying `summaryError` and return immediately. The next session starts
+  regardless.
+- **New-session transition resets everything**: `observeSessionTokens()` always
+  establishes the new session's own baseline, consumes a marker belonging to a
+  different session, and **releases `_handoffInFlight`**, so a hung handoff guard
+  can never own the next session. A same-key restart (estimate halved after reset)
+  is treated as a new baseline too.
+- **Stale marker consumption happens before early returns**, so a fresh session
+  cannot inherit "handoff active" forever.
+- **Outer watchdog in `_maybeAutoHandoff()`** in addition to the inner one: even if
+  `checkHandoff` itself hangs, the in-flight flag is released in `finally`.
+
+### Fixed — recursion
+
+- **`_distillHandoffTail()` refuses handoff content** by tag (`status:handoff`) and
+  by the `交接摘要` text prefix, in both the live-context path and the indexed
+  fallback. Output is hard-capped at 1200 characters; the idempotency key includes
+  the timestamp so distinct epochs never collide. (No more summary-of-summary.)
+- **`status:handoff` is internal**: 2% weight in normal recall and excluded from the
+  recent-memory list, so real facts always outrank handoff bookkeeping.
+
+### Added — escape hatches and cleanup
+
+- **`Memory.resetSessionState()` / `memory_admin action=reset_session` /
+  `POST /api/hippocampus/session/reset` / settings-page 「强制重置交接状态（逃生舱）」**:
+  clears the live token baseline, the in-flight guard and the active marker. It
+  rewrites only `state/`; durable memories are untouched.
+- **`Memory.repairHandoffSummaries()` + `scripts/repair-handoff.mjs`
+  (`npm run repair-handoff`)**: finds recursive/excess handoff generations
+  (recursive = >=2 `交接摘要` markers) and parks them in the two-phase
+  `pending_delete` queue. Dry-run by default; `--reset-marker` consumes a stuck
+  marker.
+- Panel session status now exposes `handoffState` / `handoffDegraded` /
+  `handoffErrorCode`; a degraded handoff is visible in the status bar instead of
+  silently locking.
+- New error code **`MEM_E_HANDOFF_FAILED`**.
+
+### Tests
+
+- New `test/v156.handoff.test.js` (9 tests): recursion refused by tag/prefix and
+  fallback path; throwing/hanging distillation degrades without rejecting; new
+  session resets ratio and releases the stuck guard; handoff summary ranking and
+  list isolation; `resetSessionState` preserves memories; repair dry-run + pending
+  delete; admin tool + HTTP escape hatch (route table 8).
+- Route contract 7 → 8, manifest 1.5.4.
+- Full suite: **295 tests / 295 pass / 0 fail**, 40 test files.
+
+## [1.5.3] — 2026-11-02
+
+**Hotfix: space creation no longer exposes a raw `MEM_E_SPACES: HTTP 404`, and
+invalid/conflicting space names are rejected by the ENGINE with
+`MEM_E_SPACE_INVALID`.** Incident: a new client bundle called
+`/api/hippocampus/spaces` against a host process that predated the route (the same
+process also 404s `/memories`). Fixed on three layers plus a route-drift test.
+**286 tests green** (was 270).
+
+### Added — release hygiene
+
+- **Benchmark Protocol v1 (`scripts/bench-protocol.mjs`, `npm run bench`)**: the only
+  sanctioned way to publish a throughput number. Each measured run gets a fresh
+  `os.tmpdir()` store, one discarded same-process warmup precedes 5 measured runs,
+  and the report carries MEDIAN + min/max/spread. It makes no speed assertions
+  (a shared/AV-scanned machine must report, not fail), so single-run noise cannot
+  become an architecture conclusion again. Replaces the deleted single-run
+  `scripts/confidence-ab.mjs`.
+- **Multi-space fixed-overhead coverage (`test/v154.release.test.js`)**: N=10
+  physical spaces — bounded per-space boot (<500ms median), lazy root boot
+  (`spaces.open=[]`, children never eagerly opened), uniform per-space storage
+  (max/min ≤1.35), linear total bytes (≤1.3×N), per-space fixed overhead <256KB.
+- **Dead config removal**: `context.minInjectConfidence` is gone end-to-end
+  (default/validation/projection, HTTP-editable key,
+  `applyConfidence`/`MIN_INJECT_CONFIDENCE` retrieval pass, recall
+  `confidence`/`lowConfidence` annotations and low-confidence notes, obsolete A/B
+  script). Supplying the old key fails fast with `MEM_E_CONFIG_UNKNOWN_KEY`
+  (`details.removedIn = "1.5.3"`), so a profile cannot keep believing it works.
+- Test watchdog default 30s → 60s (the in-process suite boots real stores/spaces and
+  legitimately takes ~15–25s; the watchdog now only fires on real hangs).
+
+### Added — tool schema pruning
+
+- **`tools.disabled` config (default `[]`)**: every registered tool definition costs its
+  JSON schema in prompt tokens on EVERY turn (~1.1–1.2k tokens of baseline tax). A
+  closed suffix vocabulary (`remember/checkpoint/recall/capture/bulk_ingest/reinforce/forget/space_transfer/transfer_to_global/admin`)
+  lets an operator prune low-frequency tools; `remember`/`recall`/`admin` are CORE
+  and cannot be disabled. A typo/prefix/full name, a core tool, or a duplicate aborts
+  config resolution with **`MEM_E_INVALID_TOOL_NAME`** (fail-fast, never silently
+  ignored). The register wrapper skips disabled suffixes AND the `memory` prompt
+  section stops advertising them, so the schema prune cannot lie to the model.
+  Editable over HTTP (`tools.disabled`) and rendered in the settings page as a
+  checkbox catalog with core-不可关闭 / low-frequency tooltips. Takes effect on the
+  next host start/reload (tool registration happens at activation).
+
+### Fixed
+
+- **Route-drift lock**: a new test parses the client `API` constant table and
+  proves every path equals the backend `MEMORY_API` value verbatim, and that the
+  registered route table contains them all. Adding a route on one side without the
+  other now fails CI instead of 404-ing in production.
+- **Capability handshake**: `/stats` (ready AND booting) and `GET /spaces` now carry
+  `capabilities: { version, spaces, memories, transferConsent, multiSpace }`.
+  The client checks `capabilities.spaces` BEFORE calling `POST /spaces`; if the
+  host is older it shows a version hint and disables the action instead of firing a
+  request that 404s. `memories` is gated the same way (old host → "当前宿主版本不
+  支持记忆列表", not `MEM_E_MEMORIES`).
+- **Human error copy**: every space-create failure now renders a complete sentence.
+  404 / route-missing / network → `创建失败：底层引擎未响应，请检查版本或联系架构师`;
+  invalid name → `创建失败：空间名称无效——需以小写字母/数字开头，只能含 a-z 0-9 . _ -（最长 64）`;
+  duplicate → `创建失败：空间「33」已存在，请换一个名称`; reserved → `创建失败：该名称是
+  系统保留名，请换一个`. The `MEM_E_SPACES: HTTP 404` template is gone from the bundle.
+- **`MEM_E_SPACE_INVALID` (400)**: `validateNewSpaceId` + `Memory.createSpace` reject,
+  before any directory/JSONL write: empty/whitespace, wrong charset (`Bad`, `bad id!`,
+  path separators, `..`, `.`), >64 chars, trailing dot (Windows alias), Windows
+  device names (`con`, `nul`, `com1`, …), `default` (always exists), an existing
+  space (conflict), and a non-directory path collision. Creation returns `201`,
+  conflicts/invalid ids `400 MEM_E_SPACE_INVALID`.
+- Fresh spaces are created from `POST /spaces` with a strict non-idempotent
+  `runtime.createSpace`; the lazy `ensureSpace` used by transfer keeps its
+  idempotent semantics.
+
+### Tests
+
+- New `test/v153.spaces.test.js` (7 tests): client↔backend route-path equality
+  (the anti-404 lock), a real dispatch through the CLIENT path against the
+  registered host route table (handler answers 201, never a router 404),
+  invalid/reserved matrix, engine conflict-before-write, HTTP 201/400 + capability
+  handshake, human-copy mapper (no raw 404), capability gating for old hosts.
+- Updated: `POST /spaces` assertions 200 → 201 strict creation; manifest 1.5.3.
+- Full suite: **286 tests / 286 pass / 0 fail**, 39 test files (includes
+  `v154.release.test.js`).
+- **Note (deployment)**: the live host process observed during the incident still
+  404s `/spaces` and `/memories` — it must be restarted/reloaded for the new routes
+  to serve; until then the new client degrades with the version hint above instead
+  of a naked 404.
+
+## [1.5.2] — 2026-11-02
+
+**Architecture correction: physical storage migration vs. business-data transfer
+are now physically decoupled, and the UI has a real global SpaceSelector.** The
+v1.5.0/v1.5.1 UI mixed two unrelated concerns and let the user type
+`target_space_id`/`event_ids` by hand. Fixed and locked by tests. **270 tests
+green** (was 263).
+
+### Changed — UI (module decoupling)
+
+- **Physical dataDir migration extracted** into `StorageMigratorUI`, a SYSTEM/DATA
+  MANAGEMENT section at the bottom of the settings page. It owns only the A/B
+  double-buffer state machine: `POST { dataDir }` → `202 state=migrating` → copy →
+  verify → swap, old directory kept as a backup. No event ids, no spaces.
+- **Business cross-space transfer removed from the settings form**: the manual
+  `event_ids` / `target_space_id` text inputs, the copy/cut buttons and the
+  inline confirmation are gone. Business transfer now exists ONLY in the panel's
+  regulated flow (below).
+- **Global `SpaceSelector`** in the panel header: a dropdown of the physical spaces
+  (friendly labels: 默认空间 / 工作空间 / 私人空间 / 全局空间, unknown ids verbatim)
+  with `＋ 新建空间` (creates an EMPTY space — never a copy). The selection is
+  app-global (`spaceStore` + `space-changed` bus event), so the panel and the
+  settings page follow it.
+- **Every UI read follows the selected space**: `useMemoryStats`, `useGraph` and
+  `useRecentMemories` append `?space=<id>`; the backend routes `stats`, `graph` and
+  `memories` to that physical store. Memory list, graph, L1 log/index counts, L2.5
+  quarantine, L3 semantic count, L1.5 tag tree and the session status bar are all
+  that space's only — switching spaces cannot blend views or contexts.
+- **Regulated cross-space flow (UI_TASK_3)**: check memories in the current space →
+  `移动到…` → dialog step 1 states `即将向 [目标空间] 发起迁移请求` → step 2 is the
+  SECOND explicit consent (`二次确认 · 安全红线`, with the cut warning when 剪切) →
+  only then is `user_approved: true` sent. Target is a dropdown of known spaces,
+  never a free-text id.
+- `h(StorageMigratorUI)` is a separate component, so the two state machines can no
+  longer share draft state or validation.
+
+### Added — backend routing
+
+- **`GET/POST /api/hippocampus/spaces`**: list the router's spaces / create an empty
+  one (`space_id`). The selector and `＋ 新建空间` use it.
+- **`?space=<id>` on `/api/hippocampus/stats` and `/api/hippocampus/graph`**:
+  `runtime.uiPayload(spaceId)` / `runtime.graphPayload(spaceId)` return that space's
+  panel/graph via `Memory.status({ targetSpaceId })` and
+  `Memory.graphForSpace({ targetSpaceId })`; a new space reports zeros (empty), so a
+  switched view is never a fallback to the default store.
+- `Memory.ensureSpace()` (root router) and `runtime.spaceList()`.
+- Panel status `panel.spaces.current` now reports the SELECTED space (was always
+  `default`), and `stats`/`graph` responses carry a top-level `spaceId`.
+
+### Security (unchanged red line, stricter transport)
+
+- The HTTP transfer route no longer fabricates consent: it forwards
+  `user_approved` from the request and the ENGINE gate rejects a request that lacks
+  it with `MEM_E_REQUIRE_USER_CONSENT`. The UI only sets the flag after step 2. An
+  agent tool call and a raw POST that "bypasses the UI" therefore hit the same
+  wall.
+- `dataDir` migration Fail-Fast strengthened: `validateMigrationPaths` now also
+  rejects an existing non-empty target (`MEM_E_MIGRATION_TARGET_BUSY`) and a
+  non-directory target (`MEM_E_MIGRATION_PATH`) synchronously, before a 202/job.
+  The old store remains authoritative on any rejection.
+
+### Tests
+
+- New `test/v152.refactor.test.js` (7 tests): dataDir validation matrix
+  (missing/relative/same/inside/root/non-empty/non-dir) + `startMigration`
+  fail-fast with the old dir intact; space isolation for stats/graph/memories/
+  session/recall with `?space=`; `ensureSpace` empty space + spaces route;
+  unauthorized transfer blocked at engine AND HTTP, authorized passes; UI wiring
+  (SpaceSelector header mount, checkbox flow, no manual inputs, isolated
+  StorageMigratorUI).
+- Updated contract assertions: HTTP routes 6 → 7 (spaces), transfer route requires
+  explicit `user_approved`, settings order now context → space/session → system
+  storage, cut second-confirmation now lives in the panel dialog, manifest 1.5.2.
+- Full suite: **270 tests, 270 pass, 0 fail**.
+
+## [1.5.1] — 2026-11-02
+
+**Security patch: cross-space transfer now requires EXPLICIT user consent.** Moving
+memories between spaces is a data-egress action, not a memory optimisation. Two
+independent locks (prompt + engine), plus a human-only UI path. **263 tests green**
+(was 254).
+
+### Added
+
+- **Prompt red line (`memory:policy`)**: a static `【🚨最高安全红线】` block forbids
+  the model from calling `memory_space_transfer` / `memory_transfer_to_global` on
+  its own judgement, sympathy, or "better cross-device sharing". The only allowed
+  trigger is a direct user command in the current conversation; when unsure the
+  model must ask `您需要我把这条信息同步到其他空间吗？`. It also documents the
+  `user_approved: true` retry protocol for `MEM_E_REQUIRE_USER_CONSENT` and states
+  that the intercept is never a one-off obstacle to bypass.
+- **`memory_transfer_to_global` tool**: copy/move memories from a space into the
+  canonical `global` space, with the same privacy screen, raw_turn stripping, fresh
+  target ids and consent gate as `memory_space_transfer`. Both tool schemas expose
+  `user_approved` and their descriptions carry the security warning.
+- **`context.requireExplicitConsentForTransfer`** (default **true**, validated
+  boolean, HTTP-editable and exposed in the settings page): the operator's master
+  switch for the engine gate. The settings toggle explains the risk.
+- **`GET /api/hippocampus/memories`** (`limit`, `space`): bounded recent-memory
+  projection (`eventId`, `day`, `tags`, `snippet`) used by the panel's per-memory
+  detail rows. `Memory.recentMemories()` is read-only and index-snapshot based.
+- **UI per-memory 分享/转移 button**: the panel now lists the 20 most recent
+  memories with a human-initiated transfer dialog (target space, copy/cut toggle,
+  second confirmation for cut). It calls the transfer route directly — **bypassing
+  the model entirely** — and the browser request is the consenting human.
+
+### Fixed / Security
+
+- `Memory.transferEvents()` now throws
+  **`MEM_E_REQUIRE_USER_CONSENT`** with the fixed message
+  `[系统拦截] 跨空间传递需要用户明确授权。请向用户确认后再试。` when
+  `context.requireExplicitConsentForTransfer` is true and the call does not carry
+  `userApproved === true`. The gate runs **before** space ids are validated, before
+  any store is opened, before content is read and before any pending-delete record
+  is written, so a refused call is provably side-effect free.
+- `POST /api/hippocampus/transfer` is documented and implemented as the **human
+  channel**: it marks `userApproved: true` itself (same-origin authenticated
+  browser request). The agent half cannot reach HTTP routes, so a UI click needs no
+  model involvement and a model call still hits the gate.
+- The consent gate is strict: `userApproved` must be the boolean `true`; the
+  config value must be a boolean (a string like `"yes"` fails fast).
+
+### Tests
+
+- New `test/v151.consent.test.js` (9 tests): default-on config + fail-fast type
+  check; engine gate fires before validation/IO (invalid target still answers
+  CONSENT, nothing parked, source untouched); agent tool blocked then succeeds only
+  with `user_approved: true`; `memory_transfer_to_global` same contract; explicit
+  config opt-out; engine-level facade contract; prompt red-line markers; HTTP route
+  marks consent; UI 分享/转移 + direct-API contract.
+- Intentional contract growth updates: tools 9 → 10, HTTP routes 5 → 6, v150 UI
+  route/transfer assertions extended with `userApproved`, manifest 1.5.1.
+- Full suite: **263 tests, 263 pass, 0 fail**.
+
+## [1.5.0] — 2026-11-02
+
+Tag-explosion defence, physical multi-space routing, session handoff and the
+cross-space transfer API. The plugin stays deliberately permission-free: the
+complex permission choreography belongs to the future Orchestrator plugin, while
+this engine owns only physical memory. **253 tests green** (was 200).
+
+### Added — module 1: tag-explosion defence (P0)
+
+- **`index.maxPostingsPerTag` (default 500, 1–100000)**: derives the inverted index
+  with a hard physical cap per tag. When a tag exceeds it, the retained pointers are
+  chosen by `salience desc -> eventTime desc -> eventId asc` and re-sorted for
+  retrieval (`eventTime desc`, then id). `eventCount`, `mass` and `lastSeen` are
+  still aggregated over **all** events, so the counts the degradation layer reports
+  are honest; only the in-memory posting pointers are dropped (the JSONL log is
+  untouched and rebuildable). Tags expose `postingsLimit` / `postingsTruncated` /
+  `postingsDropped`; index stats expose `postingsTruncated` / `postingsDropped`.
+- **Recall degradation for oversized tags**: an EXPLICIT query tag holding more than
+  50 memories (`TAG_OVERFLOW_THRESHOLD`) is not expanded into the candidate pool.
+  The response carries `oversizedTagHints: [{ tag, total, code:
+  'MEM_E_TAG_OVERFLOW', hint: '[系统提示] 发现关于 [tag] 的记忆共 N 条，数据量过大。
+  请提供更精确的 startTime/endTime 或使用 deep_raw 查阅。', window }]` and the
+  course-block fallback is suppressed so the flood cannot re-enter through the back
+  door. If the caller insists (a second recall on the same tag), only the **3 most
+  recent** summaries are returned (`oversizedRecent: true`,
+  `oversized-tag-recent:3`). Graph neighbours of an oversized tag are never woken.
+- **`deep_raw` super-tag gate**: a query touching a tag with more than 500
+  associations (`SUPER_TAG_THRESHOLD`) without `start_time`/`end_time` now throws
+  **`MEM_E_TIME_RANGE_REQUIRED`** (narrow queries keep the old
+  `MEM_E_INVALID_INPUT` contract). One authority decides: the tool no longer
+  pre-validates the window.
+
+### Added — module 2: multi-space routing & session handoff (physical layer)
+
+- **Config** `context.autoSpaceFollow` (false), `context.autoRolloverEnabled`
+  (true), `context.autoRolloverThreshold` (0.85, 0.5–0.99),
+  `context.nativeTokenLimit` (8000, 512–1000000) — validated fail-fast, editable
+  over HTTP and in the UI.
+- **`SpaceRouter`** (`src/spaces/spaceRouter.js`): `targetSpaceId` on
+  `remember`/`recall` routes to an isolated physical store
+  (`<dataDir>/spaces/<id>`, `default` = the existing store, so every old path is
+  byte-identical). One FIFO promise chain **per space**: same-space operations are
+  serialised, different spaces run concurrently (a single global lock would
+  reintroduce the cross-space stalls spaces exist to remove). Ids become directory
+  names, so `^[a-z0-9][a-z0-9._-]{0,63}$` is enforced and a typo fails with
+  `MEM_E_INVALID_INPUT` instead of silently writing into the default space.
+  `runMany` acquires in sorted order (no ABBA deadlock).
+- **Qwen native fidelity**: `ContextEngine.nativeState()` reports
+  `mode: 'native' | 'layered'`; below `nativeTokenLimit` nothing is folded (folding
+  is a layered-mode operation), above it the L1.5 layered fold runs. The legacy
+  `maxTokens` paging threshold is untouched.
+- **Automatic handoff (转生)**: when the session reaches
+  `autoRolloverThreshold x nativeTokenLimit`, the tail is distilled into ONE durable
+  L1.5 summary (`status:handoff`), `state/handoff.json` is marked active and the
+  `memory-state` prompt appends `[交接标记] … 本插件不能保证一个会话永生不死，只能
+  保证人格不死。`. A new session consumes the marker. Handoffs are idempotent (one
+  summary per handoff) and self-trigger from the `session/event` stream and from
+  tool boundaries. With `autoRolloverEnabled: false` no marker is written and
+  ContextEngine force-evicts at 95% (`reason: 'native-force'`, down to
+  `target x nativeTokenLimit`).
+- **Panel/status**: `panel.session` (`mode`, `tokens`, `nativeTokenLimit`,
+  `threshold`, `remainingTokens`, `rolloverEnabled`, `handoffActive`, …) and
+  `panel.spaces` (`current`, `ids`, `open`) are part of the UI contract.
+
+### Added — module 3: atomic cross-space transfer
+
+- **`memory_space_transfer` tool** (`event_ids`, `target_space_id`,
+  `transfer_mode: 'copy' | 'move'` default copy, optional `source_space_id`) and
+  `Memory.transferEvents()`.
+- **Safety rails enforced by the engine, not the caller**: privacy screening aborts
+  the whole batch with **`MEM_E_PRIVACY_BLOCKED`** (ID cards, CN phones, bank cards,
+  emails, credential assignments, PEM private keys; matched bytes never leave the
+  scanner) before any write; `raw_turn` / `rawTurn` / `raw_*` pointers are stripped
+  from meta at every depth; the TARGET space regenerates `event_id`s
+  (`dedupe:false`, never reuses the source identity) and tags copies
+  `transferred:from:<source>` + `transferred:to:<target>`.
+- **State difference**: `copy` leaves the source untouched (`state: 'retained'`);
+  `move` parks the source ids in the **two-phase pending_delete queue**
+  (`state: 'pending_delete'`, `dueAt`, cancellable with `restore`) only after every
+  target write succeeded — never a direct physical delete, and a partial target
+  failure leaves the source untouched.
+- **HTTP**: `POST /api/hippocampus/transfer` (same-origin, validated body) for the
+  UI migration button.
+
+### Added — module 4: UI
+
+- **Space panel**: soft-follow toggle (`context.autoSpaceFollow`), auto-rollover
+  toggle, trigger-ratio slider, native-window field, single-tag index cap control,
+  and a live status bar: `[当前: 原生模式 | 剩余 X Tokens 触发交接]` (also
+  `分层折叠` / `已交接` variants).
+- **Migration interaction**: copy/cut (复制/剪切) toggle next to the transfer button;
+  choosing 剪切 requires a **second confirmation warning** before any request is
+  sent.
+- **Philosophy footer** (bold, bottom of the settings page): **本插件不能保证一个
+  会话永生不死，只能保证人格不死。**
+- **Subtraction**: the tag search box uses the host-native Enter key only — no
+  debounce, no timer, no effect. `filterGraphByQuery` is pure and testable; the
+  force layout is not re-run by filtering.
+
+### Changed
+
+- `uiConfig` exposes `index`; `Memory.applyLiveConfig()` projects a validated config
+  onto the facade **and every open child space**, including the context engine's
+  native/rollover overrides.
+- `Memory` opens child spaces lazily with the same policy input; `close()` closes
+  children first; a child failure never blocks the rest.
+- The `memory-state` prompt only gains the handoff block when a marker is active,
+  so the cache-stable prefix is unchanged in the common case.
+
+### Tests
+
+- New files: `v150.index.test.js` (truncation/degradation/super-tag gate),
+  `v150.space.test.js` (per-space concurrency, native boundary, forced eviction),
+  `v150.transfer.test.js` (copy/move state difference, privacy, raw_turn strip,
+  fresh ids), `v150.ui.test.js` (bundle contract, helpers, no debounce, footer,
+  transfer route), `v150.lifecycle.test.js` (Qwen mode, threshold handoff, marker
+  consumption, `targetSpaceId` isolation, ninth tool surface),
+  `v150.config.test.js` (new groups, ranges, HTTP editability).
+- Intentional contract updates in old tests: 8 -> 9 tools, 4 -> 5 routes,
+  `panel.session`/`panel.spaces` added to the panel snapshot, manifest 1.5.0.
+- Full suite: **253 tests, 253 pass, 0 fail** (old 200 cases included unchanged).
+
+## [1.4.3] — 2026-11-02
+
+Two measured blockers from the 2026-11-02 handoff, both fixed and locked by tests.
+
+### Added
+
+- **`raw.maxScanTurns` config (500–50000, default 5000)**: `deep_raw`'s scan budget
+  was a hidden constant and is now a validated, UI-editable knob (`raw.maxScanTurns`).
+- **`stage()` / `commitMany()`**: remember is now a `stage -> commitMany` composition.
+  `stage()` validates and builds a record (identity + idempotency, no log/index I/O);
+  `commitMany()` performs ONE durable append, ONE ledger checkpoint and ONE index
+  delta for a whole batch. `bulkIngest` uses it, so a 50-item chunk is one write
+  instead of 50.
+- **`memory-state` prompt is now composed** via `composePrompt`: stable rules →
+  `[Memory Map]` (active tags + counts) → `[Memory Blocks]` (the only per-turn
+  volatile tail). The old single-line `briefing()` is no longer the prompt body
+  (it changed on every write and broke the prefix cache). Full-chain tests lock the
+  prefix to be byte-identical before/after a recall injects a block.
+- **`scripts/confidence-ab.mjs`**: local A/B benchmark for `context.minInjectConfidence`
+  (100 noise + 10/3 relevant; characters, hits, low-confidence hints, mis-degraded
+  relevant memories). Run it with `node scripts/confidence-ab.mjs`.
+- **Crash-restart test**: kills the process inside the 200ms checkpoint window
+  (cancelled timer, no `close()`), reopens the same directory, and asserts the fresh
+  instance reports `stale` (`unflushed-bytes`), rebuilds the index and can recall the
+  unflushed tail.
+
+### Fixed
+
+- **`injectRecall()` crashed on any L3 semantic hit**: it used `summary.id` while
+  `rankSemantic()` returns `summaryId`, so a recall with a distilled summary and
+  `context.injectPrompt` failed with `MEM_E_IO: ContextEngine.inject requires an id`.
+  Now it uses `summaryId ?? id` and skips invalid summaries. Found by the new
+  prompt/tag-tree full-chain test.
+- `logStore.status()` now exposes `unflushedBytes` (shard size minus manifest bytes)
+  so an unclean shutdown cannot hide the uncheckpointed tail behind equal counters.
+
+### Changed
+
+- **`deep_raw` scans NEWEST-FIRST** (per shard, tail to head). The old head-first
+  scan burned its whole budget on the oldest 5000 turns of a day file — in a 10k
+  shard the newest turn could never be found. A hit beyond the window now returns
+  `truncated: true` with a note instead of pretending the turn does not exist.
+- **Buffered log append**: the hot path keeps one append handle without fsync +
+  manifest rewrite per record. A 200ms checkpoint (and `close()`, and any
+  rewrite/compaction) fsyncs and publishes the manifest; `status().unflushedBytes`
+  plus the boot check make a mid-burst crash visible as stale instead of silently
+  "up to date".
+- **Identity ledger checkpoint is debounced** (500ms / `close()`): it is a derived
+  startup hint rebuilt from the log, so rewriting it per append was pure O(n²) cost.
+- **Index appends are lazy**: `applyRecords` records the delta and marks the view
+  dirty; the next `snapshot()` folds it once. N writes cost one index build, and
+  read-your-writes still holds because the fold happens on the read path.
+- **Briefing is dirty-driven**: a write marks the prompt-state line stale; the next
+  `briefing()` / panel poll rebuilds it once instead of every append.
+
+### Measured
+
+- Sequential `memory.remember` x1000: **119/s -> 9104/s** (8.4s -> 110ms).
+- 10,000-line raw shard, newest query: **0 hits -> 1 hit** (`deep_raw` now starts at
+  the tail; hash restore and redaction regression-guarded).
+- **`deep_raw` tail-scan bias documented**: beyond `raw.maxScanTurns` (default 5000)
+  per shard, only the newest N turns are covered; older history needs a larger budget
+  or time-window pagination (`end_time` moved backwards). `truncated: true` + notes
+  always say so.
+- **Confidence A/B (measured)**: `minInjectConfidence=0.6` cuts the tool payload by
+  **49.7%** (10 relevant / 100 noise) and **75.8%** (3 relevant / 100 noise), with
+  **0 relevant hits mis-degraded**; the prompt window only shrinks when the top-8
+  contains noise (0% vs 59.7% in the two scenarios), so the honest claim is
+  "long-tail payload + anti-hallucination", not "always fewer prompt tokens".
+- 197 tests green (was 189); after the prompt/tag-tree full-chain wiring and the
+  crash-restart test: **200**.
+
 ## [1.4.2] — 2026-11-01
 
 ### Added

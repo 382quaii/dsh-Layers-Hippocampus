@@ -228,6 +228,7 @@ test('settings cover every documented config key, including storageBudgetMb', ()
     'tagTree.midGracePeriodDays',
     'tagTree.pruneBatchSize',
     'tagTree.leafDecayFloor',
+    'raw.maxScanTurns',
   ]) {
     assert.ok(source.includes(key), `settings must expose ${key}`);
   }
@@ -372,6 +373,6 @@ test('the manifest points ./client at a real file and declares a web client', ()
   assert.equal(manifest.dsh.client.platform, 'web');
   assert.equal(manifest.dsh.client.immediately, undefined, 'the UI must not be boot-critical');
   assert.equal(manifest.name, 'dsh-layers-hippocampus');
-  assert.equal(manifest.version, '1.4.2');
+  assert.equal(manifest.version, '1.5.4');
   assert.ok(manifest.dsh.client.inject === undefined || Array.isArray(manifest.dsh.client.inject));
 });

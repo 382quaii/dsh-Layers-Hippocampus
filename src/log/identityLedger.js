@@ -21,6 +21,8 @@ import { appendLineDurable, readJson, readJsonLines, writeJsonAtomic } from '../
 import { normaliseEventTime, occurrenceKeyOf } from '../identity.js';
 
 const LEDGER_VERSION = 1;
+/** Debounce for the startup hint file. The log is the truth source; this is a cache. */
+const PERSIST_DELAY_MS = 500;
 
 export class IdentityLedger {
   /** @param {{file: string}} opts */
@@ -29,6 +31,7 @@ export class IdentityLedger {
     this._occurrences = new Map(); // "<contentHash>|<eventTime>" -> next index
     this._idempotency = new Map(); // dedupe key -> eventId
     this._dirty = false;
+    this._persistTimer = null;
   }
 
   /** Rebuild both maps from log records; persisted state is never trusted blindly. */
@@ -82,8 +85,16 @@ export class IdentityLedger {
     this._dirty = true;
   }
 
-  /** Persist for fast startup. The log stays the truth source. */
+  /**
+   * Persist for fast startup. The log stays the truth source, so this is a cache:
+   * the hot path only SCHEDULES it (one O(n) write per interval, not per append) —
+   * a crash between appends and the checkpoint costs a log rebuild, never data.
+   */
   persist() {
+    if (this._persistTimer) {
+      clearTimeout(this._persistTimer);
+      this._persistTimer = null;
+    }
     if (!this._dirty) return;
     writeJsonAtomic(this.file, {
       v: LEDGER_VERSION,
@@ -91,6 +102,16 @@ export class IdentityLedger {
       idempotency: Object.fromEntries(this._idempotency),
     });
     this._dirty = false;
+  }
+
+  /** Debounced checkpoint: the append path calls this, never `persist()` per item. */
+  schedulePersist(delayMs = PERSIST_DELAY_MS) {
+    if (this._persistTimer) return;
+    this._persistTimer = setTimeout(() => {
+      this._persistTimer = null;
+      this.persist();
+    }, delayMs);
+    this._persistTimer.unref?.();
   }
 
   /** Load the persisted hint; the caller then calls rebuild(records) to verify it. */

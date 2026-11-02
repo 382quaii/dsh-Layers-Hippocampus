@@ -124,8 +124,18 @@ export function projectEpisode({ episode, aliases, reinforcement = null }) {
  * @param {object[]} [input.semantic] folded semantic summaries (for reference counts only)
  * @param {string|null} [input.sourceLogGen]
  * @param {object|null} [input.previous] previous index, used to report churn
+ * @param {number} [input.maxPostingsPerTag] physical cap on postings per tag (v1.5.0)
  */
-export function buildIndex({ records, policy, now, semantic = [], sourceLogGen = null, previous = null, tombstones = null }) {
+export function buildIndex({
+  records,
+  policy,
+  now,
+  semantic = [],
+  sourceLogGen = null,
+  previous = null,
+  tombstones = null,
+  maxPostingsPerTag = 500,
+}) {
   if (!Array.isArray(records)) throw new MemoryError(ErrorCodes.INVALID_INPUT, 'records must be an array');
   if (!Number.isFinite(now)) throw new MemoryError(ErrorCodes.INVALID_INPUT, 'now must be epoch ms');
 
@@ -151,7 +161,7 @@ export function buildIndex({ records, policy, now, semantic = [], sourceLogGen =
   // identically across rebuilds, so no insertion-order dependence is allowed.
   events.sort((a, b) => b.anchorTime - a.anchorTime || a.eventId.localeCompare(b.eventId));
 
-  const tags = deriveTagTable(events, { policy, now });
+  const tags = deriveTagTable(events, { policy, now, maxPostingsPerTag });
   const activeSet = deriveActiveSet(tags, { policy, now, previous });
   const diary = deriveDiary(events, { policy, now });
 
@@ -170,6 +180,10 @@ export function buildIndex({ records, policy, now, semantic = [], sourceLogGen =
     semanticSummaries: semantic.length,
     aliases: aliases.size,
     unknownRecordTypes: unknownTypes,
+    // v1.5.0 physical-cap accounting: how many tags hit the posting ceiling and how
+    // many event pointers were left out of the index (the log keeps them all).
+    postingsTruncated: Object.values(tags).filter((entry) => entry.postingsTruncated).length,
+    postingsDropped: Object.values(tags).reduce((sum, entry) => sum + entry.postingsDropped, 0),
   };
 
   return {
@@ -194,10 +208,28 @@ export function buildIndex({ records, policy, now, semantic = [], sourceLogGen =
 /**
  * tag -> postings + aggregate metrics used by both the online scorer and the
  * offline adjudicator.
+ *
+ * Physical cap (v1.5.0): one tag can be mentioned by an unbounded number of events,
+ * so the index keeps at most `maxPostingsPerTag` postings per tag. The cap is
+ * deliberately applied to the POINTER LIST ONLY: `eventCount` and `mass` are
+ * accumulated over every matching event, because degradation thresholds ("this tag
+ * has 600 events") and the honest totals in status/hints must stay true even when
+ * the index only points at 500 of them.
+ *
+ * Which postings survive matters: retrieval order is recency, but retention order is
+ * value — highest salience first, newest as the tie-break, eventId last for
+ * determinism. A low-salience flood must not push out a decisive old memory just
+ * because it arrived later.
+ *
+ * @param {object[]} events projections from buildIndex()
+ * @param {{policy: Readonly<object>, now: number, maxPostingsPerTag?: number}} options
  */
-export function deriveTagTable(events, { policy, now }) {
+export function deriveTagTable(events, { policy, now, maxPostingsPerTag = 500 }) {
   const table = {};
   const halfLife = policy.decay.halfLifeDays;
+  // The config layer validates 1..100000; a direct caller gets the default rather
+  // than a silently empty index (slice(0, 0) would drop every posting).
+  const cap = Number.isFinite(maxPostingsPerTag) && maxPostingsPerTag >= 1 ? Math.floor(maxPostingsPerTag) : 500;
 
   for (const event of events) {
     const anchor = event.anchorTime ?? event.eventTime;
@@ -238,6 +270,7 @@ export function deriveTagTable(events, { policy, now }) {
 
   for (const entry of Object.values(table)) {
     entry.postings.sort((a, b) => b.eventTime - a.eventTime || a.eventId.localeCompare(b.eventId));
+    capPostings(entry, cap);
     entry.mass = round(entry.mass, 4);
     const lastActivity = Math.max(entry.lastSeen, entry.lastReinforcedAt ?? 0);
     const cold = now - lastActivity > policy.tags.archiveAfterDays * 86_400_000;
@@ -247,6 +280,33 @@ export function deriveTagTable(events, { policy, now }) {
   }
 
   return Object.fromEntries(Object.entries(table).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+/**
+ * Enforce the per-tag posting cap on one already-sorted entry.
+ *
+ * The flags are always present (not only on truncated tags) so a reader never has to
+ * distinguish "unknown" from "not truncated": `postingsLimit` is the cap in force,
+ * `postingsTruncated`/`postingsDropped` are 0/false for a tag below it. Only the
+ * postings list changes here — aggregate counters stay over the full event set.
+ */
+function capPostings(entry, cap) {
+  entry.postingsLimit = cap;
+  if (entry.postings.length <= cap) {
+    entry.postingsTruncated = false;
+    entry.postingsDropped = 0;
+    return;
+  }
+  const retained = entry.postings
+    .slice()
+    .sort((a, b) => b.salience - a.salience || b.eventTime - a.eventTime || a.eventId.localeCompare(b.eventId))
+    .slice(0, cap);
+  // Retention rank is not retrieval order: survivors go back to newest-first so the
+  // cap is invisible to every existing consumer except for the dropped ids.
+  retained.sort((a, b) => b.eventTime - a.eventTime || a.eventId.localeCompare(b.eventId));
+  entry.postingsTruncated = true;
+  entry.postingsDropped = entry.postings.length - retained.length;
+  entry.postings = retained;
 }
 
 /**

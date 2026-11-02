@@ -21,7 +21,6 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import readline from 'node:readline';
 import { createHash } from 'node:crypto';
 import { MemoryError, ErrorCodes } from './errors.js';
 import { dayKey, ensureDir, sha256 } from './util.js';
@@ -304,7 +303,11 @@ export class RawStore {
       matcher = { test: (value) => value.toLowerCase().includes(needle.toLowerCase()) };
     }
     const maxBytes = Math.max(1, config.maxScanMb ?? 16) * 1024 * 1024;
-    const maxTurns = Math.min(5000, config.maxScanTurns ?? 5000);
+    // Bounded turn budget from config (fail-fast validated upstream). The old code
+    // hard-capped it at 5000 and always scanned from the HEAD of the shard, so the
+    // newest 5000 turns could never be found in a large day file — the exact
+    // opposite of a black box's job.
+    const maxTurns = Math.max(1, Number(config.maxScanTurns ?? 5000));
     const tokenBudget = Math.max(1, Number(maxTokens ?? config.maxResultTokens ?? 1000));
     const shards = this.listShards()
       .filter((name) => {
@@ -321,11 +324,21 @@ export class RawStore {
       if (truncated) break;
       const file = path.join(this.dir, name);
       scanned.shards += 1;
-      const stream = fs.createReadStream(file, { encoding: 'utf8' });
-      const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
-      let lineNumber = 0;
-      for await (const line of lines) {
-        lineNumber += 1;
+      let text = '';
+      try {
+        text = await fs.promises.readFile(file, 'utf8');
+      } catch (error) {
+        if (error && error.code === 'ENOENT') continue;
+        throw error;
+      }
+      const lines = text.split(/\r?\n/);
+      let end = lines.length;
+      while (end > 0 && lines[end - 1] === '') end -= 1;
+      // NEWEST FIRST: walk the shard from its tail backwards. A day file is bounded
+      // by raw.maxBytesPerDay, so this read is bounded too; the byte/turn budget
+      // below still stops the scan long before the head when the shard is huge.
+      for (let index = end - 1; index >= 0; index -= 1) {
+        const line = lines[index];
         const lineBytes = Buffer.byteLength(line, 'utf8') + 1;
         scanned.bytes += lineBytes;
         if (scanned.bytes > maxBytes || scanned.turns >= maxTurns) {
@@ -349,8 +362,7 @@ export class RawStore {
         }
         const haystack = record.content;
         if (!matcher.test(haystack)) continue;
-        const index = needle ? haystack.toLowerCase().indexOf(needle.toLowerCase()) : 0;
-        const at = index >= 0 ? index : 0;
+        const at = needle ? haystack.toLowerCase().indexOf(needle.toLowerCase()) : 0;
         const snippet = redactSecrets(haystack.slice(Math.max(0, at - 120), at + 120 + needle.length));
         const snippetTokens = Math.ceil(snippet.text.length / CHARS_PER_TOKEN);
         if (tokensUsed + snippetTokens > tokenBudget) {
@@ -365,12 +377,9 @@ export class RawStore {
           snippet: snippet.text,
           redactions: snippet.redactions,
           shard: name,
-          line: lineNumber,
-        });
-        if (hits.length >= limit) break;
+          line: index + 1,
+        });        if (hits.length >= limit) break;
       }
-      lines.close();
-      stream.destroy();
     }
     const notes = [];
     const notesTruncated = truncated || hits.length >= limit;

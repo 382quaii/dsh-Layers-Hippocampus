@@ -35,6 +35,7 @@ import { MigrationRunner } from './src/migrationRunner.js';
 import { CronScheduler } from './src/scheduler.js';
 import { asMemoryError, ErrorCodes, MemoryError } from './src/errors.js';
 import { Memory } from './src/memory.js';
+import { composePrompt, renderMemoryMap } from './src/utils/promptLayout.js';
 import { MEMORY_API, registerMemoryRoutes } from './src/webRoutes.js';
 
 export const name = 'memory';
@@ -44,6 +45,21 @@ export const inject = ['tools', 'systemPrompt'];
 export { MEMORY_API };
 /** Re-exported so tests and the README point at one schema. */
 export { resolveConfig, DEFAULT_CONFIG };
+
+/**
+ * Capability handshake for the UI (v1.5.3). A newer client bundle may talk to an
+ * OLDER host process after a hot reload (exactly the situation that produced
+ * `MEM_E_SPACES: HTTP 404`): it can now check these flags BEFORE calling a route
+ * that the old host does not serve, and degrade with human-readable copy instead
+ * of letting a raw 404 reach the user.
+ */
+export const CAPABILITIES = Object.freeze({
+  version: '1.5.4',
+  spaces: true,
+  memories: true,
+  transferConsent: true,
+  multiSpace: true,
+});
 
 /**
  * Runtime handles by context. Deliberately a WeakMap instead of `ctx.memory`:
@@ -98,6 +114,18 @@ export const REFLECTION_TEXT = [
   '(2) should it be stored under an existing tag instead of a new one?',
   '(3) is the query a keyword the stored text actually contains?',
 ].join(' ');
+
+/**
+ * STABLE head of the `memory-state` prompt context. Prefix-cache discipline: this
+ * text must not change for a given config, so it carries no counts and no timestamps.
+ * The (slow-moving) memory map follows it; only the `[Memory Blocks]` tail is
+ * per-turn volatile — that is the whole point of `composePrompt`.
+ */
+export const PROMPT_STATE_RULES = [
+  'Memory state (live). The engine measures and pages this window; never trim it yourself.',
+  'Only the memory blocks listed below are remembered facts for this turn - do not invent memories, tags or details.',
+  'When a detail is missing, call the memory tools instead of guessing.',
+].join('\n');
 
 function errorJson(error) {
   // Failures are values, never thrown across the tool boundary: {ok:false,error}
@@ -256,16 +284,60 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
       runtime.reflectionActive = active;
       emit({ type: 'reflection', active });
     }
+    // v1.5.0: every tool boundary is a natural pseudo-turn. Evaluate the rollover
+    // costlessly; only a due handoff performs I/O, and it must never surface as a
+    // tool failure (fire-and-forget).
+    if (runtime.phase === 'ready') {
+      try {
+        const usage = memory.sessionUsage();
+        const native = memory.context.nativeState({ sessionTokens: usage.tokens });
+        if (native.rolloverDue || native.forceEvictionDue) {
+          memory
+            .checkHandoff()
+            .catch((error) => ctx?.logger?.warn?.(`hippocampus: handoff failed: ${asMemoryError(error).code}`));
+        }
+      } catch {
+        /* accounting failure must never break a tool result */
+      }
+    }
   };
 
   runtime.reflectionText = () => (runtime.reflectionActive ? REFLECTION_TEXT : '');
 
   /**
-   * Prompt text, built on demand from the live window. Before READY it states the
-   * phase instead of pretending memory is empty.
+   * Prompt text for the `memory-state` context, built on demand from the live
+   * window. Layout is the cache-stable contract from `promptLayout`:
+   *
+   *   [stable rules]      constant for a given config  -> cacheable prefix
+   *   [Memory Map]        active tags + counts         -> slow-moving prefix
+   *   [Memory Blocks]     surviving window blocks      -> the only volatile tail
+   *
+   * Before READY it states the phase instead of pretending memory is empty. The old
+   * one-line `briefing()` is still available for the panel/status surfaces but is no
+   * longer the prompt body: a changing state line at the head would break the prefix
+   * cache on every write.
    */
   runtime.promptState = () => {
-    if (runtime.phase === 'ready') return memory.briefing();
+    if (runtime.phase === 'ready') {
+      const view = memory.indexManager.snapshot();
+      const entries = view?.activeSet?.entries ?? [];
+      const map = renderMemoryMap(entries.map((entry) => ({ tag: entry.tag, count: entry.eventCount ?? 0 })));
+      const blocks = memory.context.render();
+      // v1.5.0 handoff marker: appended to the volatile tail on purpose — the
+      // stable prefix above must stay byte-identical for the prompt cache.
+      const handoff = memory.handoffState();
+      const marker = handoff.active
+        ? [
+            '',
+            '[交接标记] 上下文已接近原生窗口上限，末尾摘要已存为 L1.5。',
+            '新会话从该摘要继续即可；本插件不能保证一个会话永生不死，只能保证人格不死。',
+            handoff.summaryEventId ? `摘要事件：${handoff.summaryEventId}` : null,
+          ]
+            .filter(Boolean)
+            .join('\n')
+        : '';
+      return composePrompt({ rules: PROMPT_STATE_RULES, map, blocks }) + marker;
+    }
     const error = runtime.phaseError ? ` — ${asMemoryError(runtime.phaseError).code}` : '';
     return `Memory state: ${runtime.phase}${error} (not ready: memory tools answer MEM_E_NOT_READY).`;
   };
@@ -327,6 +399,22 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
       return { ...result, readFrom: 'legacy', note: `startup phase=${runtime.phase}; served from ${config.migrateFrom}` };
     }
     throw runtime.notReady('recall');
+  };
+
+  /**
+   * Cross-space atomic transfer (v1.5.0). The runtime owns the READY gate; the
+   * engine owns validation, privacy screening and the move->pending_delete handoff.
+   */
+  runtime.transferEvents = async (payload = {}) => {
+    if (runtime.phase !== 'ready') throw runtime.notReady('space_transfer');
+    runtime.recordToolCall({ landed: true });
+    return memory.transferEvents(payload);
+  };
+
+  /** Recent-memory projection for the panel's per-memory 分享/转移 entry point. */
+  runtime.recentMemories = async ({ limit = 20, targetSpaceId } = {}) => {
+    if (runtime.phase !== 'ready') throw runtime.notReady('memories');
+    return memory.recentMemories({ limit, targetSpaceId });
   };
 
   runtime.status = async () => {
@@ -438,33 +526,44 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
     maintenanceSource: runtime.maintenanceSource,
   });
 
-  /** UI cards read exactly this: one source of truth (no panel-specific math). */
-  runtime.uiPayload = async () => {
+  /**
+   * UI cards read exactly this: one source of truth (no panel-specific math).
+   * `spaceId` is the SELECTED space from the global SpaceSelector: every card in
+   * the payload (log/index/semantic/L1.5 counts, session) belongs to that space.
+   */
+  runtime.uiPayload = async (spaceId = null) => {
     const view = runtime.phaseView();
     if (runtime.phase !== 'ready') {
       // Migration is a first-class state: the panel needs its progress even
       // though the store is offline for writes.
-      return { ok: false, ...view, migration: runtime.migrationStatus() };
+      // capabilities are advertised even before READY: the client must be able to
+      // tell "old host" from "temporarily booting" without probing missing routes.
+      return { ok: false, ...view, capabilities: CAPABILITIES, migration: runtime.migrationStatus() };
     }
     try {
-      const status = await memory.status();
+      const spaceIds = memory.spaces.status().ids;
+      const status = await memory.status({ targetSpaceId: spaceId ?? undefined, spaceIds });
       return {
         ok: true,
         ...view,
+        spaceId: status.panel.spaces.current,
+        capabilities: CAPABILITIES,
         panel: { ...status.panel, migration: runtime.migrationStatus() },
         briefing: memory.briefing(),
         config: uiConfig(runtime.config),
       };
     } catch (error) {
-      return { ok: false, ...view, error: asMemoryError(error).toJSON(), migration: runtime.migrationStatus() };
+      return { ok: false, ...view, spaceId, capabilities: CAPABILITIES, error: asMemoryError(error).toJSON(), migration: runtime.migrationStatus() };
     }
   };
 
   /**
-   * Graph route payload. The cache is rebuilt by maintenance, so this is a slice
-   * plus the phase: no sorting, no disk walk, no log scan on the request path.
+   * Graph route payload for the selected space. The cache is rebuilt by
+   * maintenance, so this is a slice plus the phase: no sorting, no disk walk, no
+   * log scan on the request path. A named space answers from ITS own cached
+   * projection, so switching the selector cannot blend two spaces.
    */
-  runtime.graphPayload = async () => {
+  runtime.graphPayload = async (spaceId = null) => {
     const view = runtime.phaseView();
     if (runtime.phase !== 'ready') {
       return {
@@ -475,25 +574,59 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
       };
     }
     try {
-      const graph = runtime.memory.graphView(runtime.config.graphMaxEdges);
-      // The same response carries the ghost metadata the history view needs: a
-      // derived cache read, never a scan. No nodes are shipped twice (ghosts only).
-      return {
-        ok: true,
-        phase: runtime.phase,
-        state: runtime.phase,
-        graph,
-        tagTree: runtime.memory.tagTreeView(),
-      };
+      const { spaceId: selected, graph, tagTree } = await memory.graphForSpace({
+        targetSpaceId: spaceId ?? undefined,
+        limit: runtime.config.graphMaxEdges,
+      });
+      return { ok: true, phase: runtime.phase, state: runtime.phase, spaceId: selected, graph, tagTree };
     } catch (error) {
       return {
         ok: false,
         ...view,
+        spaceId,
         error: asMemoryError(error).toJSON(),
         graph: { available: false, nodes: [], edges: [], limit: runtime.config.graphMaxEdges },
         tagTree: { available: false, ghosts: [] },
       };
     }
+  };
+
+  /** Global SpaceSelector data source (root router: every physical space). */
+  runtime.spaceList = () => (runtime.phase === 'ready' ? memory.spaces.status().ids : []);
+
+  /** Capability handshake read by the client bundle (old host → new UI safety). */
+  runtime.capabilities = CAPABILITIES;
+
+  /** "＋ 新建空间": creates the child store lazily, then returns the updated list. */
+  runtime.ensureSpace = async (spaceId) => {
+    if (runtime.phase !== 'ready') throw runtime.notReady('spaces');
+    const result = await memory.ensureSpace(spaceId);
+    emit({ type: 'spaces', spaces: result.spaces });
+    return result;
+  };
+
+  /**
+   * "＋ 新建空间" (strict): idempotency is NOT allowed here — an invalid/reserved/
+   * existing id answers MEM_E_SPACE_INVALID (400), so the UI never gets a raw IO
+   * error and JSONL is never touched by a bad name.
+   */
+  runtime.createSpace = async (spaceId) => {
+    if (runtime.phase !== 'ready') throw runtime.notReady('spaces');
+    const result = await memory.createSpace(spaceId);
+    emit({ type: 'spaces', spaces: result.spaces });
+    return result;
+  };
+
+  /**
+   * ESCAPE HATCH (v1.5.4): force the rollover state machine back to a clean slate.
+   * This is the user-facing recovery path when a handoff wedged the session; it
+   * clears the live token baseline, the in-flight guard and any active marker.
+   */
+  runtime.resetSessionState = async ({ reason = 'manual' } = {}) => {
+    if (runtime.phase !== 'ready') throw runtime.notReady('reset_session');
+    const result = memory.resetSessionState({ reason });
+    emit({ type: 'handoff-reset', result });
+    return result;
   };
 
   /** What the UI may read AND write (never exposes policy or paths it cannot set). */
@@ -507,12 +640,6 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
    */
   runtime.applyConfig = (next) => {
     runtime.config = next;
-    const engine = runtime.memory?.context;
-    if (engine) {
-      engine.maxTokensOverride = next.context.maxTokens;
-      engine.thresholdOverride = next.context.threshold;
-      engine.targetOverride = next.context.target;
-    }
     // Retrieval reads `memory.policy` on every call. The resolved policy is
     // deep-frozen, so replace it with a shallow copy carrying the new topK
     // instead of mutating a frozen object (which throws in strict mode).
@@ -523,13 +650,12 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
         candidates: { ...liveMemory.policy.candidates, topK: next.retrieval.topK },
       };
     }
-    // Live config groups (raw limits, retrieval confidence, tagTree lifetimes, …)
-    // are read through `memory.config` on every pass. Project the validated config
-    // onto the running facade instead of waiting for a reload: the settings page
-    // promises "保存后立即生效".
-    if (liveMemory) {
-      liveMemory.config = { ...(liveMemory.config ?? {}), ...toMemoryOptions(next).config };
-    }
+    // Live config groups (context budgets/rollover, raw limits, retrieval
+    // confidence, tagTree lifetimes, index cap, …) are read through
+    // `memory.config` on every pass. Project the validated config onto the running
+    // facade (and every open child space) instead of waiting for a reload: the
+    // settings page promises "保存后立即生效".
+    if (liveMemory) liveMemory.applyLiveConfig(toMemoryOptions(next).config);
     emit({ type: 'config', config: uiConfig(next) });
     return next;
   };
@@ -550,6 +676,20 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
    * UI-triggered data-dir migration. Returns as soon as the background job is
    * accepted (HTTP 202); the copy/verify/reload continues out of band and the
    * caller polls `state` until it is `ready` again.
+   *
+   * ISOLATION (validation point 1): this is the PHYSICAL storage state machine
+   * only (A/B copy of <dataDir>, state=migrating, verified swap). It shares no
+   * state, no queue and no UI flow with business-data transfer
+   * (`Memory.transferEvents`, which moves event ids between spaces and is gated by
+   * requireExplicitConsentForTransfer). The only common trait is "migration" in
+   * the name; a failure here never parks a memory pending-delete and a refused
+   * transfer never touches the data directory.
+   *
+   * FAIL-FAST (validation point 2): `migrationRunner.start` validates the target
+   * synchronously (absolute, not equal/inside the current dir, not a root, empty or
+   * absent) and throws MEM_E_MIGRATION_PATH / MEM_E_MIGRATION_TARGET_BUSY BEFORE a
+   * 202 is returned and before any copy starts; the old direction remains
+   * authoritative and untouched.
    */
   runtime.startMigration = (targetDir) => {
     if (runtime.phase === 'migrating') {
@@ -730,6 +870,8 @@ function uiConfig(config) {
     storageBudgetMb: config.storageBudgetMb,
     maxRecallTopK: config.maxRecallTopK,
     retrieval: { topK: config.retrieval.topK },
+    // v1.5.0 index cap: the settings form edits index.maxPostingsPerTag.
+    index: config.index,
     context: config.context,
     temp: config.temp,
     decay: config.decay,
@@ -741,6 +883,8 @@ function uiConfig(config) {
     identity: { eventTimePolicy: config.identity.eventTimePolicy },
     // L1.5: the four editable knobs are nested so the form's dotted keys map 1:1.
     tagTree: config.tagTree,
+    // Tool schema pruning: the settings page renders a checkbox catalog from this.
+    tools: config.tools,
     // Convenience mirrors kept for older clients; the form uses the nested form.
     eventTimePolicy: config.identity.eventTimePolicy,
     retrievalTopK: config.retrieval.topK,
@@ -846,9 +990,28 @@ export async function apply(ctx, rawConfig = {}) {
       }
     });
 
+    /**
+     * Tool schema pruning (v1.5.3): every registered definition costs its JSON
+     * schema in prompt tokens on EVERY turn. `tools.disabled` is validated
+     * fail-fast in resolveConfig (unknown/core/duplicate names abort activation),
+     * so this filter can be a pure set lookup. Disabled tools are not registered
+     * AND are not advertised in the `memory` prompt section below — pruning the
+     * schema without pruning the instructions would lie to the model.
+     */
+    const disabledToolSuffixes = new Set(config.tools?.disabled ?? []);
+    const toolSuffixOf = (definition) => {
+      const prefix = `${config.toolPrefix}_`;
+      return definition.name.startsWith(prefix) ? definition.name.slice(prefix.length) : definition.name;
+    };
     const register = (definition) => {
+      if (disabledToolSuffixes.has(toolSuffixOf(definition))) {
+        ctx.logger?.info?.(`hippocampus: tool ${definition.name} skipped by config.tools.disabled`);
+        return;
+      }
       disposers.push(ctx.tools.register(definition));
     };
+    const toolLine = (suffix, text) =>
+      disabledToolSuffixes.has(suffix) ? null : `- ${config.toolPrefix}_${suffix}: ${text}`;
 
     // ---- automatic raw capture: every surface message, verbatim ------------
     // `dsh-session` publishes `session/event` as (session, event). Subscribing at
@@ -917,6 +1080,11 @@ export async function apply(ctx, rawConfig = {}) {
           idempotency_key: { type: 'string', description: 'Client idempotency key; a repeat returns the existing event id' },
           dedupe: { type: 'boolean', description: 'Default true. false records a genuine second occurrence' },
           is_transient_trend: { type: 'boolean', description: 'Mark as a trend: isolated in L2.5, never promoted directly' },
+          target_space_id: {
+            type: 'string',
+            description:
+              'Optional physical space id (v1.5.0). Omit for the default space; each space has its own isolated log/index and file lock.',
+          },
           media_url: {
             type: 'string',
             description:
@@ -976,13 +1144,20 @@ export async function apply(ctx, rawConfig = {}) {
           'decay x salience, with graph-neighbour association (0.5 penalty). Read-only — no adjudication, no writes. ' +
           'A hit reached only through a fading (ghost) mid returns metadata in ghostHints instead of its body — ' +
           'do not reconstruct its detail from memory; use mode="deep_raw" with the hinted time window for the verbatim ' +
-          'turns. Use mode="deep_raw" to search the bounded raw-turn shards when episode-level detail is not enough; that ' +
-          'scan has a byte/turn budget and reports truncated=true when it stops early.',
+          'turns. A tag holding more than 50 memories is degraded to a metadata hint (oversizedTagHints): narrow it with ' +
+          'a time window / deep_raw, or repeat the recall to receive only its 3 most recent summaries. Use mode="deep_raw" ' +
+          'to search the bounded raw-turn shards when episode-level detail is not enough; that ' +
+          'scan has a byte/turn budget and reports truncated=true when it stops early. deep_raw on a super tag ' +
+          '(>500 associations) REQUIRES start_time and end_time (MEM_E_TIME_RANGE_REQUIRED).',
         parameters: {
           text: { type: 'string', description: 'What to search for' },
           tags: { type: 'array', items: { type: 'string' }, description: 'Tag filters; empty means no tag filter' },
           top_k: { type: 'number', description: `Max hits, default ${config.retrieval.topK}, max ${config.maxRecallTopK}` },
           verbose: { type: 'boolean', description: 'Include full content instead of snippets' },
+          target_space_id: {
+            type: 'string',
+            description: 'Optional physical space id (v1.5.0). Omit for the default space; reads never cross spaces.',
+          },
           mode: {
             type: 'string',
             enum: ['auto', 'deep_raw'],
@@ -1003,20 +1178,14 @@ export async function apply(ctx, rawConfig = {}) {
                 const restored = await runtime.memory.deepRaw({ hash: args.hash.trim() });
                 return JSON.stringify({ ok: true, ...restored });
               }
-              if (args.start_time === undefined || args.end_time === undefined) {
-                return errorJson(
-                  new MemoryError(
-                    ErrorCodes.INVALID_INPUT,
-                    'deep_raw requires start_time and end_time (fail-fast: an unbounded raw scan is not allowed)',
-                    { missing: ['start_time', 'end_time'].filter((key) => args[key] === undefined) },
-                  ),
-                );
-              }
+              // A missing window is NOT pre-validated here: the engine decides. A
+              // narrow query keeps MEM_E_INVALID_INPUT, while a super tag answers
+              // MEM_E_TIME_RANGE_REQUIRED (v1.5.0) — one authority, no duplicate rule.
               const limit = Math.max(1, Math.min(Number(args.top_k) || 20, config.maxRecallTopK));
               const result = await runtime.memory.deepRaw({
                 text: args.text ?? '',
-                startTime: toEpoch(args.start_time),
-                endTime: toEpoch(args.end_time),
+                startTime: args.start_time === undefined ? undefined : toEpoch(args.start_time),
+                endTime: args.end_time === undefined ? undefined : toEpoch(args.end_time),
                 limit,
                 regex: args.regex === true,
                 maxTokens: args.max_tokens,
@@ -1029,6 +1198,7 @@ export async function apply(ctx, rawConfig = {}) {
               text: args.text ?? '',
               tags: args.tags ?? [],
               topK: Math.min(args.top_k ?? config.retrieval.topK, config.maxRecallTopK),
+              targetSpaceId: args.target_space_id,
             });
             runtime.recordToolCall({
               landed: (result.hits ?? []).length > 0 || (result.ghostHints ?? []).length > 0,
@@ -1147,15 +1317,113 @@ export async function apply(ctx, rawConfig = {}) {
 
     register(
       defineTool({
+        name: `${config.toolPrefix}_space_transfer`,
+        description:
+          'Move or copy memories between physical spaces (v1.5.0). Safety rails are enforced by the engine, not by the ' +
+          'caller: privacy-sensitive payloads (ID cards, phones, bank cards, credentials, private keys) abort the whole ' +
+          'batch with MEM_E_PRIVACY_BLOCKED; raw_turn pointers are stripped; the TARGET space regenerates event ids ' +
+          '(never reuses the source identity) and tags the copies transferred:from:<source>. transferMode="copy" ' +
+          '(default) leaves the source untouched; transferMode="move" parks the source ids in the two-phase ' +
+          'pending_delete queue AFTER every target write succeeds (cancellable with restore, never a direct physical ' +
+          'delete).',
+        parameters: {
+          event_ids: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Source event ids to transfer',
+            required: true,
+          },
+          target_space_id: {
+            type: 'string',
+            description: 'Destination space id (created on first use); must differ from the source space',
+            required: true,
+          },
+          transfer_mode: {
+            type: 'string',
+            enum: ['copy', 'move'],
+            description: 'copy (default) keeps the source; move parks the source in pending_delete after success',
+          },
+          source_space_id: { type: 'string', description: 'Source space id; omit for the default space' },
+          user_approved: {
+            type: 'boolean',
+            description:
+              'SECURITY: only set true AFTER the user explicitly asked for this transfer in the current conversation. ' +
+              'Without it the engine refuses with MEM_E_REQUIRE_USER_CONSENT. Never self-approve.',
+          },
+        },
+        output: { schema: { type: 'string' }, render: (_args, value) => toolResult(value) },
+        execute: async (args = {}) =>
+          stillStarting('space_transfer', async () => {
+            runtime.touch();
+            const result = await runtime.transferEvents({
+              eventIds: args.event_ids,
+              targetSpaceId: args.target_space_id,
+              transferMode: args.transfer_mode ?? 'copy',
+              sourceSpaceId: args.source_space_id,
+              userApproved: args.user_approved === true,
+            });
+            return JSON.stringify({ ok: true, ...result });
+          }),
+      }),
+    );
+
+    register(
+      defineTool({
+        name: `${config.toolPrefix}_transfer_to_global`,
+        description:
+          'SECURITY-SENSITIVE (v1.5.1): copy/move memories from a space into the canonical "global" space. ' +
+          'NEVER call this on your own initiative or from a "reasonable inference" — the engine refuses with ' +
+          'MEM_E_REQUIRE_USER_CONSENT unless the call carries user_approved=true, which you may only set after the ' +
+          'user explicitly commanded the transfer in this conversation. Same safety rails as memory_space_transfer: ' +
+          'privacy screen (MEM_E_PRIVACY_BLOCKED), raw_turn stripping, fresh target event ids + transfer tags, and ' +
+          'move parks the source in the two-phase pending_delete queue (never a direct physical delete).',
+        parameters: {
+          event_ids: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Source event ids to send to the global space',
+            required: true,
+          },
+          transfer_mode: {
+            type: 'string',
+            enum: ['copy', 'move'],
+            description: 'copy (default) keeps the source; move parks the source in pending_delete after success',
+          },
+          source_space_id: { type: 'string', description: 'Source space id; omit for the default space' },
+          user_approved: {
+            type: 'boolean',
+            description:
+              'SECURITY: only true after explicit user instruction in this conversation; otherwise the engine blocks the call.',
+          },
+        },
+        output: { schema: { type: 'string' }, render: (_args, value) => toolResult(value) },
+        execute: async (args = {}) =>
+          stillStarting('transfer_to_global', async () => {
+            runtime.touch();
+            const result = await runtime.transferEvents({
+              eventIds: args.event_ids,
+              targetSpaceId: 'global',
+              transferMode: args.transfer_mode ?? 'copy',
+              sourceSpaceId: args.source_space_id,
+              userApproved: args.user_approved === true,
+            });
+            return JSON.stringify({ ok: true, ...result });
+          }),
+      }),
+    );
+
+    register(
+      defineTool({
         name: `${config.toolPrefix}_admin`,
         description:
           'Maintenance and observability. status = dashboard panel; maintain = run the offline job now; ' +
           'active_tags = resident active set; semantic = L3 summaries; active_task = current checkpoint ' +
-          '(read straight from the index, never filtered by the active set).',
+          '(read straight from the index, never filtered by the active set); reset_session = escape hatch that ' +
+          'clears the rollover token baseline and consumes the handoff marker when a session is wedged.',
         parameters: {
           action: {
             type: 'string',
-            enum: ['status', 'maintain', 'active_tags', 'semantic', 'active_task', 'reviews', 'pending_deletes'],
+            enum: ['status', 'maintain', 'active_tags', 'semantic', 'active_task', 'reviews', 'pending_deletes', 'reset_session'],
             description: 'What to do',
             required: true,
           },
@@ -1164,12 +1432,16 @@ export async function apply(ctx, rawConfig = {}) {
         execute: async (args = {}) => {
           try {
             const action = args.action;
-            if (!['status', 'maintain', 'active_tags', 'semantic', 'active_task', 'reviews', 'pending_deletes'].includes(action)) {
+            if (!['status', 'maintain', 'active_tags', 'semantic', 'active_task', 'reviews', 'pending_deletes', 'reset_session'].includes(action)) {
               return errorJson(
                 new MemoryError(ErrorCodes.INVALID_INPUT, `unknown admin action: ${JSON.stringify(action)}`, {
-                  allowed: ['status', 'maintain', 'active_tags', 'semantic', 'active_task', 'reviews', 'pending_deletes'],
+                  allowed: ['status', 'maintain', 'active_tags', 'semantic', 'active_task', 'reviews', 'pending_deletes', 'reset_session'],
                 }),
               );
+            }
+            if (action === 'reset_session') {
+              if (runtime.phase !== 'ready') return errorJson(runtime.notReady('reset_session'));
+              return JSON.stringify({ ok: true, ...(await runtime.resetSessionState({ reason: 'admin_tool' })) });
             }
             if (action === 'reviews') {
               if (runtime.phase !== 'ready') return errorJson(runtime.notReady('reviews'));
@@ -1254,16 +1526,33 @@ export async function apply(ctx, rawConfig = {}) {
           text: () =>
             [
               `Long-term memory (tool prefix: ${config.toolPrefix}):`,
-              `- ${config.toolPrefix}_remember: store a durable fact with tags, salience and (when known) happened_at.`,
-              `- ${config.toolPrefix}_recall: search memory before asking the user to repeat themselves; mode="deep_raw" scans the bounded raw-turn shards.`,
-              `- ${config.toolPrefix}_capture: keep one verbatim turn for forensics (gated; not indexed).`,
-              `- ${config.toolPrefix}_reinforce: reward a memory that proved useful (moves its decay anchor and advances the review schedule).`,
-              `- ${config.toolPrefix}_forget: two-phase delete — pending_delete countdown, then tombstone -> archive -> consolidation -> purge.`,
-              `- ${config.toolPrefix}_checkpoint: record the one active heavy task (task_id, progress, updated_at).`,
-              `- ${config.toolPrefix}_admin: status / maintain / active_tags / semantic / active_task / reviews / pending_deletes.`,
+              toolLine('remember', 'store a durable fact with tags, salience and (when known) happened_at.'),
+              toolLine(
+                'recall',
+                'search memory before asking the user to repeat themselves; mode="deep_raw" scans the bounded raw-turn shards.',
+              ),
+              toolLine('capture', 'keep one verbatim turn for forensics (gated; not indexed).'),
+              toolLine('bulk_ingest', 'batch-ingest memories in chunks of 50 with per-item failure isolation.'),
+              toolLine(
+                'reinforce',
+                'reward a memory that proved useful (moves its decay anchor and advances the review schedule).',
+              ),
+              toolLine('forget', 'two-phase delete — pending_delete countdown, then tombstone -> archive -> consolidation -> purge.'),
+              toolLine('checkpoint', 'record the one active heavy task (task_id, progress, updated_at).'),
+              toolLine(
+                'space_transfer',
+                'copy|move memories between physical spaces (privacy-screened; move uses the two-phase pending_delete queue). SECURITY: requires explicit user consent (user_approved:true) — never call on your own.',
+              ),
+              toolLine(
+                'transfer_to_global',
+                'copy|move memories into the global space. SECURITY: requires explicit user consent (user_approved:true) — never call on your own.',
+              ),
+              toolLine('admin', 'status / maintain / active_tags / semantic / active_task / reviews / pending_deletes.'),
               'Memory is NOT the session transcript: store durable facts, not turn-by-turn narration.',
               'If a memory call fails, report the error code instead of inventing a result.',
-            ].join('\n'),
+            ]
+              .filter(Boolean)
+              .join('\n'),
         }),
       );
       // Static discipline (cache-safe: no dynamic content in this section).
@@ -1275,6 +1564,13 @@ export async function apply(ctx, rawConfig = {}) {
             [
               `【读取与检索纪律】当需要回忆历史、查阅文件、获取系统信息时，**必须优先调用 ${config.toolPrefix}_recall 工具**，严禁直接盲目读取外部超长文件或调用其他原生工具输出全文。`,
               `若 ${config.toolPrefix}_recall 返回了 [Slimmed] 标记，说明内容已被智能瘦身：如无绝对必要，请基于瘦身摘要和关键实体回答；若确实需要全文，请通过返回的 recovery_hash 指针再次向海马体请求原文（${config.toolPrefix}_recall mode="deep_raw", hash=...）。`,
+              '',
+              // ---- SECURITY RED LINE (v1.5.1) ----------------------------------
+              // Static text: it must be present in every prompt and must never
+              // depend on runtime state (a model cannot argue with a constant).
+              `【🚨最高安全红线】\`${config.toolPrefix}_space_transfer\` 与 \`${config.toolPrefix}_transfer_to_global\` 是极度危险的操作！你（AI）**绝对禁止**基于自己的判断、同情心或为了“更好地跨端共享记忆”而自动调用此工具。`,
+              `**唯一允许调用的条件**：用户在当前对话中，明确下达了类似“把这条记忆传给全局”、“把这条消息转移到工作空间”的直接命令。如果你不确定，必须询问用户：“您需要我把这条信息同步到其他空间吗？”`,
+              `调用时必须显式传 \`user_approved: true\`（仅在你已获得用户明确同意之后）。若返回 \`MEM_E_REQUIRE_USER_CONSENT\`（[系统拦截] 跨空间传递需要用户明确授权。请向用户确认后再试。），你必须立即停下，先向用户确认；得到明确同意后才能带 \`user_approved: true\` 重试。**绝不可自行批准，绝不可把“系统拦截”当成可以绕过的一次性错误。**`,
             ].join('\n'),
         }),
       );
@@ -1340,6 +1636,7 @@ function injectRecall(runtime, result) {
   const { memory, config } = runtime;
   const now = memory.clock.now();
   for (const hit of (result.hits ?? []).slice(0, memory.policy.context.blockTopK)) {
+    if (!hit?.eventId) continue;
     memory.context.inject({
       id: hit.eventId,
       kind: 'recall',
@@ -1349,9 +1646,14 @@ function injectRecall(runtime, result) {
       now,
     });
   }
+  // Semantic hits are ranked summaries (`summaryId`); the older `id` alias is kept
+  // for callers that normalise them. A summary without any id must be skipped, not
+  // crash the whole recall: inject() refuses an undefined id.
   for (const summary of (result.semantic ?? []).slice(0, 2)) {
+    const id = summary?.summaryId ?? summary?.id;
+    if (!id || !summary.text) continue;
     memory.context.inject({
-      id: summary.id,
+      id,
       kind: 'semantic',
       text: summary.text,
       salience: summary.confidence,
@@ -1382,6 +1684,7 @@ async function memory_remember(runtime, args, media = {}) {
     idempotencyKey: args.idempotency_key,
     dedupe: args.dedupe,
     isTransientTrend: args.is_transient_trend,
+    targetSpaceId: args.target_space_id,
     mediaUrl: media.mediaUrl ?? null,
     mediaType: media.mediaType ?? null,
   });

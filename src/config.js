@@ -44,6 +44,31 @@ export const EVENT_TIME_POLICIES = Object.freeze(['content', 'explicit', 'ingest
 /** Raw-turn retention modes: off / gated by value / everything. */
 export const RAW_MODES = Object.freeze(['off', 'salience', 'all']);
 
+/**
+ * Tool suffixes this plugin registers (`${toolPrefix}_<suffix>`). This is the
+ * closed vocabulary of `tools.disabled`: a typo must fail config resolution, not
+ * silently leave a tool enabled.
+ */
+export const TOOL_SUFFIXES = Object.freeze([
+  'remember',
+  'checkpoint',
+  'recall',
+  'capture',
+  'bulk_ingest',
+  'reinforce',
+  'forget',
+  'space_transfer',
+  'transfer_to_global',
+  'admin',
+]);
+
+/**
+ * Tools that may NEVER be disabled: without them the memory system cannot be
+ * written to, read from, or observed, so an operator could brick the plugin from
+ * a config file. The UI renders them as checked+disabled with a tooltip.
+ */
+export const CORE_TOOL_SUFFIXES = Object.freeze(['remember', 'recall', 'admin']);
+
 /** Every accepted top-level key (nested groups are validated separately). */
 export const CONFIG_KEYS = Object.freeze([
   'dataDir',
@@ -63,6 +88,9 @@ export const CONFIG_KEYS = Object.freeze([
   'maxRecallTopK',
   'retrieval',
   'context',
+  // Inverted-index physical limits (v1.5.0). Kept as their own group because they
+  // bound the read model's memory footprint, not retrieval semantics.
+  'index',
   'temp',
   'decay',
   'activeSet',
@@ -72,6 +100,9 @@ export const CONFIG_KEYS = Object.freeze([
   'migration',
   'tagTree',
   'identity',
+  // Tool schema pruning (v1.5.3): every registered tool costs prompt tokens on
+  // every turn through its JSON schema, so low-frequency tools are opt-out.
+  'tools',
   'policy',
 ]);
 
@@ -104,7 +135,32 @@ export const DEFAULT_CONFIG = Object.freeze({
   storageBudgetMb: 50,
   maxRecallTopK: 100,
   retrieval: Object.freeze({ topK: 20 }),
-  context: Object.freeze({ maxTokens: 4000, threshold: 0.85, target: 0.7, injectPrompt: true, minInjectConfidence: 0.6 }),
+  // Tag-explosion defence (v1.5.0): a single tag may keep at most this many
+  // postings in the in-memory inverted index. Older/lower-salience events are
+  // dropped from the index only — the JSONL log itself is never touched.
+  index: Object.freeze({ maxPostingsPerTag: 500 }),
+  context: Object.freeze({
+    maxTokens: 4000,
+    threshold: 0.85,
+    target: 0.7,
+    injectPrompt: true,
+    // REMOVED in v1.5.3: `minInjectConfidence`. It never demonstrably saved tokens
+    // (0.6 vs 0 produced byte-identical payloads) and every hit-shaping pass is a
+    // permanent token tax; keeping a misleading knob is worse than having none.
+    // Supplying it now fails fast (CONFIG_UNKNOWN_KEY) so no profile believes it
+    // still does something.
+    // Multi-space routing + session handoff (v1.5.0). Pure physical layer: no
+    // permission rules here, only routing and context-window bookkeeping.
+    autoSpaceFollow: false,
+    autoRolloverEnabled: true,
+    autoRolloverThreshold: 0.85,
+    nativeTokenLimit: 8000,
+    // Security (v1.5.1): moving memories across spaces is NEVER an autonomous
+    // decision. While true, the engine refuses a model-initiated transfer unless
+    // the tool call carries `user_approved: true`; the UI route is the human
+    // channel and marks consent itself.
+    requireExplicitConsentForTransfer: true,
+  }),
   temp: Object.freeze({ ttlDays: 30, promotionWindowDays: 20 }),
   // Decay curve and active-set size are policy knobs, but they are also first-class
   // config: the UI edits them, so they must be declared and validated here.
@@ -124,6 +180,10 @@ export const DEFAULT_CONFIG = Object.freeze({
     maxTotalMb: 256,
     retentionDays: 30,
     maxScanMb: 16,
+    // Deep-scan turn budget. The scanner walks each shard NEWEST-FIRST, so this is
+    // "how far back from the tail a single deep_raw may look" — a knob, not a
+    // hard-coded constant (the old hidden 5000 made the newest turns unreachable).
+    maxScanTurns: 5000,
     // Result token budget: deep_raw truncates and says so instead of flooding
     // the model's context with raw records.
     maxResultTokens: 1000,
@@ -137,6 +197,10 @@ export const DEFAULT_CONFIG = Object.freeze({
   // hard-coded half-lives. leafDecayFloor 0 keeps the strict forget-driven mode.
   tagTree: Object.freeze({ midHalfLifeMultiplier: 3.0, midGracePeriodDays: 30, pruneBatchSize: 100, leafDecayFloor: 0 }),
   identity: Object.freeze({ eventTimePolicy: 'content' }),
+  // Tool schema pruning: each registered tool's JSON schema is paid on EVERY turn.
+  // Default is "everything on" so behaviour is unchanged unless an operator opts
+  // out; core tools (remember/recall/admin) can never be listed here.
+  tools: Object.freeze({ disabled: [] }),
   policy: Object.freeze({}),
 });
 
@@ -315,7 +379,7 @@ function normaliseRaw(raw) {
   }
 
   const out = { ...nested };
-  for (const group of ['retrieval', 'context', 'temp', 'decay', 'activeSet', 'raw', 'delete', 'review', 'migration', 'identity']) {
+  for (const group of ['retrieval', 'context', 'index', 'temp', 'decay', 'activeSet', 'raw', 'delete', 'review', 'migration', 'identity', 'tools']) {
     if (isPlainObject(nested[group])) out[group] = { ...nested[group] };
   }
   for (const [alias, path] of Object.entries(FLAT_ALIASES)) {
@@ -343,7 +407,7 @@ function normaliseRaw(raw) {
 export function resolveConfig(raw = {}, { env = process.env } = {}) {
   const input = normaliseRaw(raw);
 
-  for (const group of ['retrieval', 'context', 'temp', 'decay', 'activeSet', 'raw', 'delete', 'review', 'migration', 'identity']) {
+  for (const group of ['retrieval', 'context', 'index', 'temp', 'decay', 'activeSet', 'raw', 'delete', 'review', 'migration', 'identity', 'tools']) {
     if (group in input && input[group] !== undefined && !isPlainObject(input[group])) {
       throw configError(ErrorCodes.CONFIG_INVALID_TYPE, `config.${group} must be an object`, { key: group });
     }
@@ -417,10 +481,53 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
   }
   const contextInjectPrompt =
     contextIn.injectPrompt === undefined ? defaults.context.injectPrompt : requireBoolean(contextIn.injectPrompt, 'context.injectPrompt');
-  const contextMinInjectConfidence = requireNumberInRange(
-    contextIn.minInjectConfidence === undefined ? defaults.context.minInjectConfidence : contextIn.minInjectConfidence,
-    'context.minInjectConfidence',
-    { min: 0, max: 1 },
+  // REMOVED KEY (v1.5.3), loud on purpose: nested groups normally ignore unknown
+  // keys, but silently ignoring a removed confidence knob would let a profile run
+  // with a false belief about token behaviour. Fail fast with the exact path.
+  if (contextIn.minInjectConfidence !== undefined) {
+    throw configError(
+      ErrorCodes.CONFIG_UNKNOWN_KEY,
+      'config.context.minInjectConfidence was removed in v1.5.3 (it never demonstrably saved tokens); delete the key from the profile',
+      { key: 'context.minInjectConfidence', removedIn: '1.5.3', replacement: null },
+    );
+  }
+  // ---- multi-space routing + session handoff (v1.5.0) ----------------------
+  const contextAutoSpaceFollow = requireBoolean(
+    contextIn.autoSpaceFollow === undefined ? defaults.context.autoSpaceFollow : contextIn.autoSpaceFollow,
+    'context.autoSpaceFollow',
+  );
+  const contextAutoRolloverEnabled = requireBoolean(
+    contextIn.autoRolloverEnabled === undefined ? defaults.context.autoRolloverEnabled : contextIn.autoRolloverEnabled,
+    'context.autoRolloverEnabled',
+  );
+  // 0.85 by default. Below 0.5 a handoff would fire on every short session; at 1.0
+  // it could never fire (the native window is already exhausted), so both ends are
+  // rejected instead of silently clamped.
+  const contextAutoRolloverThreshold = requireNumberInRange(
+    contextIn.autoRolloverThreshold === undefined ? defaults.context.autoRolloverThreshold : contextIn.autoRolloverThreshold,
+    'context.autoRolloverThreshold',
+    { min: 0.5, max: 0.99 },
+  );
+  const contextNativeTokenLimit = requireInteger(
+    contextIn.nativeTokenLimit === undefined ? defaults.context.nativeTokenLimit : contextIn.nativeTokenLimit,
+    'context.nativeTokenLimit',
+    { min: 512, max: 1_000_000 },
+  );
+  // Security red line (v1.5.1): default TRUE. Only an explicit operator choice may
+  // disable the consent gate; a malformed value is a config error, never "false".
+  const contextRequireExplicitConsentForTransfer = requireBoolean(
+    contextIn.requireExplicitConsentForTransfer === undefined
+      ? defaults.context.requireExplicitConsentForTransfer
+      : contextIn.requireExplicitConsentForTransfer,
+    'context.requireExplicitConsentForTransfer',
+  );
+
+  // ---- inverted-index physical limits (v1.5.0) -----------------------------
+  const indexIn = input.index ?? {};
+  const indexMaxPostingsPerTag = requireInteger(
+    indexIn.maxPostingsPerTag === undefined ? defaults.index.maxPostingsPerTag : indexIn.maxPostingsPerTag,
+    'index.maxPostingsPerTag',
+    { min: 1, max: 100_000 },
   );
 
   const tempIn = input.temp ?? {};
@@ -500,6 +607,11 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     'raw.maxScanMb',
     { min: 1, max: 256 },
   );
+  const rawMaxScanTurns = requireInteger(
+    rawIn.maxScanTurns === undefined ? defaults.raw.maxScanTurns : rawIn.maxScanTurns,
+    'raw.maxScanTurns',
+    { min: 500, max: 50_000 },
+  );
   const rawMaxResultTokens = requireInteger(
     rawIn.maxResultTokens === undefined ? defaults.raw.maxResultTokens : rawIn.maxResultTokens,
     'raw.maxResultTokens',
@@ -562,6 +674,57 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     pruneBatchSize: treeNumber('pruneBatchSize', defaults.tagTree.pruneBatchSize, 10, 500),
     leafDecayFloor: treeNumber('leafDecayFloor', defaults.tagTree.leafDecayFloor, 0, 1),
   };
+
+  // ---- tool schema pruning (v1.5.3) ---------------------------------------
+  // Fail-fast, with NO clamping and NO silent ignore: an unknown name (typo),
+  // a full prefixed name, a duplicate, or an attempt to disable a core tool all
+  // abort activation with MEM_E_INVALID_TOOL_NAME. A profile is either honest or
+  // it does not boot.
+  const toolsIn = input.tools ?? {};
+  if (!isPlainObject(toolsIn)) {
+    throw configError(ErrorCodes.CONFIG_INVALID_TYPE, 'config.tools must be an object', { key: 'tools' });
+  }
+  const disabledIn = toolsIn.disabled === undefined ? defaults.tools.disabled : toolsIn.disabled;
+  if (!Array.isArray(disabledIn)) {
+    throw configError(ErrorCodes.CONFIG_INVALID_TYPE, 'config.tools.disabled must be an array of tool suffixes', {
+      key: 'tools.disabled',
+      expected: 'string[]',
+      got: Array.isArray(disabledIn) ? 'array' : typeof disabledIn,
+    });
+  }
+  const disabledTools = [];
+  for (const [index, rawName] of disabledIn.entries()) {
+    if (typeof rawName !== 'string') {
+      throw configError(ErrorCodes.CONFIG_INVALID_TYPE, `config.tools.disabled[${index}] must be a string`, {
+        key: `tools.disabled[${index}]`,
+        got: typeof rawName,
+      });
+    }
+    const name = rawName;
+    if (!TOOL_SUFFIXES.includes(name)) {
+      throw configError(
+        ErrorCodes.INVALID_TOOL_NAME,
+        `config.tools.disabled contains unknown tool "${name}"; use the suffix without the toolPrefix`,
+        { key: 'tools.disabled', name, known: [...TOOL_SUFFIXES], hint: 'suffixes only, e.g. "capture" (not "memory_capture")' },
+      );
+    }
+    if (CORE_TOOL_SUFFIXES.includes(name)) {
+      throw configError(
+        ErrorCodes.INVALID_TOOL_NAME,
+        `config.tools.disabled cannot disable core tool "${name}" (remember/recall/admin are required to operate the plugin)`,
+        { key: 'tools.disabled', name, reason: 'core', core: [...CORE_TOOL_SUFFIXES] },
+      );
+    }
+    if (disabledTools.includes(name)) {
+      throw configError(ErrorCodes.INVALID_TOOL_NAME, `config.tools.disabled lists "${name}" twice`, {
+        key: 'tools.disabled',
+        name,
+        reason: 'duplicate',
+      });
+    }
+    disabledTools.push(name);
+  }
+  const toolsConfig = Object.freeze({ disabled: Object.freeze([...disabledTools]) });
 
   const policyIn = input.policy === undefined ? {} : input.policy;
   if (!isPlainObject(policyIn)) {
@@ -630,12 +793,18 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     storageBudgetMb,
     maxRecallTopK,
     retrieval: { topK: retrievalTopK },
+    index: { maxPostingsPerTag: indexMaxPostingsPerTag },
     context: {
       maxTokens: contextMaxTokens,
       threshold: contextThreshold,
       target: contextTarget,
       injectPrompt: contextInjectPrompt,
-      minInjectConfidence: contextMinInjectConfidence,
+      // v1.5.0 routing knobs below; v1.5.3 removed minInjectConfidence entirely.
+      autoSpaceFollow: contextAutoSpaceFollow,
+      autoRolloverEnabled: contextAutoRolloverEnabled,
+      autoRolloverThreshold: contextAutoRolloverThreshold,
+      nativeTokenLimit: contextNativeTokenLimit,
+      requireExplicitConsentForTransfer: contextRequireExplicitConsentForTransfer,
     },
     temp: { ttlDays: tempTtlDays, promotionWindowDays: tempPromotionWindowDays },
     decay: { halfLifeDays: decayHalfLifeDays },
@@ -651,6 +820,7 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
       maxTotalMb: rawMaxTotalMb,
       retentionDays: rawRetentionDays,
       maxScanMb: rawMaxScanMb,
+      maxScanTurns: rawMaxScanTurns,
       maxResultTokens: rawMaxResultTokens,
     },
     delete: { graceHours: deleteGraceHours },
@@ -658,6 +828,7 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     migration: { timeoutMs: migrationTimeoutMs },
     tagTree: tagTreeConfig,
     identity: { eventTimePolicy },
+    tools: toolsConfig,
     policy: policyIn,
   };
   return resolved;
@@ -682,6 +853,7 @@ export function toMemoryOptions(config) {
     policy,
     config: {
       context: config.context,
+      index: config.index,
       maintenanceCron: config.maintenanceCron,
       temp: config.temp,
       identity: config.identity,

@@ -33,16 +33,27 @@ export class IndexManager {
    * @param {() => Readonly<object>} opts.getPolicy resolved policy getter
    * @param {{now: () => number}} opts.clock
    * @param {() => Set<string>} opts.getTombstones tombstone ids (registry ∪ log)
+   * @param {() => number} [opts.getMaxPostingsPerTag] live cap on postings per tag
    */
-  constructor({ store, logStore, getPolicy, clock, getTombstones }) {
+  constructor({ store, logStore, getPolicy, clock, getTombstones, getMaxPostingsPerTag = () => 500 }) {
     this.store = store;
     this.logStore = logStore;
     this.getPolicy = getPolicy;
     this.clock = clock;
     this.getTombstones = getTombstones;
+    // Read on EVERY build (never captured once): config/profiles can change at
+    // runtime, and a rebuild must honour the cap in force at build time.
+    this.getMaxPostingsPerTag = getMaxPostingsPerTag;
     /** @type {object|null} */ this._active = null;
     /** @type {object|null} */ this._standby = null;
     /** @type {object[]} */ this._records = [];
+    /**
+     * Appends land in `_records` and mark the view dirty instead of rebuilding the
+     * whole index on every write. The next read rebuilds ONCE (lazily), so a burst
+     * of N writes costs one index build, not N — and read-your-writes still holds:
+     * `snapshot()` never returns a view older than the last awaited append.
+     */
+    this._dirty = false;
     /** Generation the store will publish into next (survives live-only updates). */
     this._pendingGen = store.currentGeneration?.() ?? null;
     this._chain = Promise.resolve();
@@ -52,11 +63,52 @@ export class IndexManager {
 
   /** The current immutable view. Synchronous by design: the read path never awaits. */
   snapshot() {
+    if (this._dirty) this._ensureFresh();
     return this._active;
+  }
+
+  /**
+   * Fold pending appends into the view, once. Synchronous: `buildIndex` is a pure
+   * fold over records already in memory. The build is in-process only (the on-disk
+   * generation is still published by `rebuild()` during maintenance), so A/B
+   * semantics and the `generation` value are identical to the eager path it
+   * replaces — only the timing moves from write to first read.
+   */
+  _ensureFresh() {
+    this._dirty = false;
+    if (!this._active) return null;
+    const built = buildIndex({
+      records: this._records,
+      policy: this.getPolicy(),
+      now: this.clock.now(),
+      tombstones: this.getTombstones(),
+      sourceLogGen: this._active.sourceLogGen ?? null,
+      previous: this._active,
+      maxPostingsPerTag: this._maxPostingsPerTag(),
+    });
+    built.generation = this._active.generation ?? this._pendingGen ?? null;
+    built.revision = this._swaps + 1;
+    this._swap(built);
+    return built;
   }
 
   get generation() {
     return this._active?.generation ?? null;
+  }
+
+  /**
+   * Posting cap in force for the next build. The callback is optional (a bare
+   * IndexManager in a test gets the documented default), and a callback that throws
+   * or returns garbage must not take the index down: an uncapped build is a far
+   * smaller failure than a read path that cannot build at all.
+   */
+  _maxPostingsPerTag() {
+    try {
+      const value = this.getMaxPostingsPerTag?.();
+      return Number.isFinite(value) && value >= 1 ? Math.floor(value) : 500;
+    } catch {
+      return 500;
+    }
   }
 
   /** Load the persisted generation into buffer A, or build once if none exists. */
@@ -65,6 +117,7 @@ export class IndexManager {
     if (disk) {
       this._active = disk;
       this._records = await this._readLogRecords();
+      this._dirty = false;
       return this._active;
     }
     const records = await this._readLogRecords();
@@ -97,6 +150,7 @@ export class IndexManager {
         tombstones,
         sourceLogGen: opened.gen,
         previous: this._active,
+        maxPostingsPerTag: this._maxPostingsPerTag(),
       });
 
       // ---- phase 2: CATCH-UP (replay what landed while we were building) ---
@@ -112,6 +166,7 @@ export class IndexManager {
           tombstones: this.getTombstones(),
           sourceLogGen: tail.gen ?? opened.gen,
           previous: this._active,
+          maxPostingsPerTag: this._maxPostingsPerTag(),
         });
       }
 
@@ -123,6 +178,7 @@ export class IndexManager {
       await this._beforeSwap(built);
       this._swap(built);
       this._records = records;
+      this._dirty = false;
       this.store.prune({ keep: 2 });
       await this._afterSwap(built);
       built.reason = reason;
@@ -138,31 +194,17 @@ export class IndexManager {
   }
 
   /**
-   * Online append: the delta is folded into the standby buffer and published by a
-   * pointer flip. Readers keep the old view for the duration of the build.
+   * Online append: record the delta and mark the view dirty. Nothing is rebuilt
+   * here — the next `snapshot()` folds all pending records into a fresh view. This
+   * keeps a sequential write burst linear instead of quadratic, while a reader that
+   * arrives right after an awaited append still sees it (the fold happens on read).
    */
   async applyRecords(records) {
     if (!Array.isArray(records) || records.length === 0) return this._active;
     return this._enqueue(async () => {
-      const nextRecords = this._records.concat(records);
-      // Yield first: a reader that arrives now still gets buffer A.
-      await Promise.resolve();
-      const built = buildIndex({
-        records: nextRecords,
-        policy: this.getPolicy(),
-        now: this.clock.now(),
-        tombstones: this.getTombstones(),
-        sourceLogGen: this._active?.sourceLogGen ?? null,
-        previous: this._active,
-      });
-      built.generation = this._active?.generation ?? this._pendingGen ?? null;
-      built.revision = this._swaps + 1;
-      this._standby = built;
-      await this._beforeSwap(built);
-      this._swap(built);
-      this._records = nextRecords;
-      await this._afterSwap(built);
-      return built;
+      this._records = this._records.concat(records);
+      this._dirty = true;
+      return this._active;
     });
   }
 
@@ -174,6 +216,7 @@ export class IndexManager {
     this._standby = view;
     this._swap(view);
     if (records) this._records = records;
+    this._dirty = false;
     return view;
   }
 
@@ -204,7 +247,7 @@ export class IndexManager {
 
   /** Boot-time consistency check: does the persisted index still match the log? */
   bootCheck() {
-    const view = this._active;
+    const view = this.snapshot();
     const logCount = this._records.length;
     if (!view) return { status: 'missing', logRecordCount: logCount, indexRecordCount: 0 };
     const indexCount = view.stats?.recordCount ?? 0;
@@ -215,14 +258,17 @@ export class IndexManager {
   }
 
   status() {
+    const view = this.snapshot();
     return {
-      generation: this._active?.generation ?? null,
+      generation: view?.generation ?? null,
       swaps: this._swaps,
-      builtAt: this._active?.builtAt ?? null,
-      policyHash: this._active?.policyHash ?? null,
-      sourceLogGen: this._active?.sourceLogGen ?? null,
-      stats: this._active?.stats ?? {},
-      pendingRecords: 0,
+      builtAt: view?.builtAt ?? null,
+      policyHash: view?.policyHash ?? null,
+      sourceLogGen: view?.sourceLogGen ?? null,
+      // The cap in force, so the panel can explain why postingsTruncated > 0.
+      maxPostingsPerTag: this._maxPostingsPerTag(),
+      stats: view?.stats ?? {},
+      pendingRecords: this._dirty ? Math.max(0, this._records.length - (view?.stats?.recordCount ?? 0)) : 0,
     };
   }
 }
