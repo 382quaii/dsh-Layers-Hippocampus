@@ -4,6 +4,53 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.4.2] — 2026-11-01
+
+### Added
+
+- **L1.5 标签层级树**: hierarchical tags (`tech/frontend/vue3`) now have a
+  three-level lifecycle — immortal roots, leaves that die when their reference
+  count reaches zero, and mids that enter a grace window when they lose their last
+  child. A mid inside that window is a **ghost**: it can be revived by a new leaf,
+  and it is what the UI's history view shows. The tree is a **derived cache**
+  (`state/tag-tree.json`) built by `maintain()` from the converged index; the
+  previous cache is carried forward (`refCount = 0`, orphans dropped) so the
+  lifecycle is observable across maintenance runs. Deleting the file loses only
+  ghost history.
+- **Bounded prune queue**: dead leaves are queued and consumed one
+  `tagTree.pruneBatchSize` batch per maintenance run; the remaining queue is
+  persisted in the same atomic write, so a 10k-leaf storm drains across runs
+  instead of causing a maintenance storm.
+- **Anti-hallucination recall degradation**: a `memory_recall` hit reached only
+  through a fading mid is **removed from `hits` entirely** (body, snippet and score
+  never reach the model or the prompt window) and replaced by one metadata hint per
+  mid: path, count, remaining grace days and the exact `deep_raw` time window. A
+  query that names a fading mid with no live episode returns a `count: 0` hint
+  instead of silence.
+- **`panel.tagTree`**: node/root/mid/leaf/ghost/queue counts for the Web panel, and
+  `GET /api/hippocampus/graph` now returns `tagTree.ghosts` in the same response as
+  the cached graph.
+- **UI**: `tagTree.*` sliders with numeric boxes and hover tooltips in the settings
+  section; ghost nodes rendered in the force graph as translucent dashed circles
+  hanging under their parent root, with a `仅活跃 / 历史全貌` toggle that cross-fades
+  them via CSS opacity (the force layout does not re-run when toggling).
+- **Config `tagTree` group** (fail-fast, editable over HTTP and in the UI):
+  `midHalfLifeMultiplier` (1–10), `midGracePeriodDays` (7–180),
+  `pruneBatchSize` (10–500), `leafDecayFloor` (0–1). `midHalfLifeMultiplier` is the
+  only source of the mid half-life — no silent hard-coded lifetime.
+
+### Changed
+
+- `maintain()` now rebuilds/prunes/persists the tag tree after the index
+  generation converges; a tag-tree failure is reported as `report.tagTreeError`
+  and can never fail maintenance or block recall.
+- `applyConfig` now projects the validated config onto the running `Memory` facade,
+  so live UI edits (raw limits, tagTree lifetimes, …) actually reach the running
+  objects instead of waiting for a reload.
+- `pruneBatch` re-derives decay against the pass's `now` (a frozen build-time score
+  made grace windows meaningless), rejects `O(mids × nodes)` rescans, and keeps
+  parent child counts truthful when a mid dies.
+
 ## [1.4.1] — 2026-11-01
 
 ### Added

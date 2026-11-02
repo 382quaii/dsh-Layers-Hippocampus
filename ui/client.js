@@ -269,7 +269,7 @@
        * `config-changed` event refetches immediately with the current limit.
        */
       function useGraph(limit, available) {
-        const [state, setState] = React.useState({ graph: null, error: null, limit: null });
+        const [state, setState] = React.useState({ graph: null, tagTree: null, error: null, limit: null });
 
         React.useEffect(() => {
           if (!available) return undefined;
@@ -279,7 +279,7 @@
               .then(({ body }) => {
                 if (!alive) return;
                 if (body && body.ok && body.graph) {
-                  setState({ graph: body.graph, error: null, limit });
+                  setState({ graph: body.graph, tagTree: body.tagTree || null, error: null, limit });
                 } else {
                   setState((prev) => ({ ...prev, error: (body && body.error) || { code: 'MEM_E_GRAPH', message: 'graph unavailable' }, limit }));
                 }
@@ -728,17 +728,73 @@
        * On release the node is unpinned and a short local alpha relaxation runs
        * over its 1-hop neighbourhood — again writing straight to the DOM.
        */
+      /** Header pill button: the active/history switch. */
+      const toggleStyle = (active) => ({
+        padding: '2px 9px',
+        borderRadius: 999,
+        border: `1px solid ${active ? palette.accent : palette.border}`,
+        background: active ? 'rgba(79,140,255,0.14)' : 'transparent',
+        color: active ? palette.accent : palette.muted,
+        fontSize: 11,
+        cursor: 'pointer',
+      });
+
+      /**
+       * Pure ghost-graph projection for the history view.
+       *
+       * `ghosts` is the tag tree's grace list (`{id, name, parentId, graceUntil}`).
+       * Each ghost becomes a translucent node under a synthetic root anchor, so the
+       * picture answers "this branch is fading" without touching the live graph.
+       * Exported for the bundle-contract tests: the component itself cannot render
+       * in Node, and this is the only geometry decision worth locking.
+       */
+      function ghostGraphParts(ghosts) {
+        const rootNodes = new Map();
+        const nodes = [];
+        const edges = [];
+        for (const ghost of Array.isArray(ghosts) ? ghosts : []) {
+          if (!ghost || typeof ghost.name !== 'string') continue;
+          const rootName = typeof ghost.parentId === 'string' ? ghost.parentId.replace(/^root:/, '') : 'history';
+          const rootId = 'ghostroot:' + rootName;
+          if (!rootNodes.has(rootId)) rootNodes.set(rootId, { id: rootId, label: rootName, ghostRoot: true, weight: 0.4, events: 0 });
+          const ghostId = 'ghost:' + (typeof ghost.id === 'string' ? ghost.id : ghost.name);
+          nodes.push({
+            id: ghostId,
+            label: ghost.name,
+            ghost: true,
+            weight: 0.2,
+            events: 0,
+            graceUntil: Number.isFinite(ghost.graceUntil) ? ghost.graceUntil : null,
+            path: typeof ghost.parentId === 'string' ? rootName + '/' + ghost.name : ghost.name,
+          });
+          edges.push({ source: rootId, target: ghostId, weight: 0.5, ghost: true });
+        }
+        return { rootNodes: [...rootNodes.values()], nodes, edges };
+      }
+
       function KnowledgeGraph(props) {
         const graph = props.graph;
         const width = 640;
         const height = 320;
         const nodes = (graph && graph.nodes) || [];
         const edges = (graph && graph.edges) || [];
+        // Ghost nodes come from the tag tree's grace window (state/tag-tree.json via
+        // the graph route). They are laid out WITH the live graph but painted with
+        // opacity 0 until "历史全貌" is on — a fade, never a re-layout jump.
+        const ghosts = Array.isArray(props.ghosts) ? props.ghosts : [];
+        const [history, setHistory] = React.useState(false);
+        const ghostParts = ghostGraphParts(ghosts);
+        const ghostRootNodes = ghostParts.rootNodes;
+        const ghostNodes = ghostParts.nodes;
+        const ghostEdges = ghostParts.edges;
+        const allNodes = [...nodes, ...ghostRootNodes, ...ghostNodes];
+        const allEdges = [...edges, ...ghostEdges];
 
         const layoutRef = React.useRef(null);
-        const layoutKey = nodes.length + ':' + edges.length + ':' + (graph ? graph.generatedAt : 0);
+        const layoutKey =
+          allNodes.length + ':' + allEdges.length + ':' + (graph ? graph.generatedAt : 0) + ':' + ghostNodes.map((node) => node.id).join(',');
         if (!layoutRef.current || layoutRef.current.key !== layoutKey) {
-          layoutRef.current = { key: layoutKey, positions: computeLayout(nodes, edges, width, height) };
+          layoutRef.current = { key: layoutKey, positions: computeLayout(allNodes, allEdges, width, height) };
         }
         const positions = layoutRef.current.positions;
         const byId = new Map(positions.map((position) => [position.id, position]));
@@ -784,18 +840,18 @@
         const [revealed, setRevealed] = React.useState(0);
         React.useEffect(() => {
           setRevealed(0);
-          if (nodes.length === 0) return undefined;
+          if (allNodes.length === 0) return undefined;
           let current = 0;
           const timer = setInterval(() => {
-            current = Math.min(nodes.length, current + Math.max(1, Math.ceil(nodes.length / 24)));
+            current = Math.min(allNodes.length, current + Math.max(1, Math.ceil(allNodes.length / 24)));
             setRevealed(current);
-            if (current >= nodes.length) clearInterval(timer);
+            if (current >= allNodes.length) clearInterval(timer);
           }, 70);
           return () => clearInterval(timer);
-        }, [layoutKey, nodes.length]);
+        }, [layoutKey, allNodes.length]);
 
         const [focus, setFocus] = React.useState(null);
-        const maxWeight = Math.max(1, ...nodes.map((node) => node.weight || 0));
+        const maxWeight = Math.max(1, ...allNodes.map((node) => node.weight || 0));
 
         /** Repaint node transforms + every rendered line from the frozen array. */
         const paint = () => {
@@ -803,11 +859,11 @@
             const el = nodeEls.current[i];
             if (el) el.setAttribute('transform', `translate(${positions[i].x}, ${positions[i].y})`);
           }
-          for (let i = 0; i < edges.length; i += 1) {
+          for (let i = 0; i < allEdges.length; i += 1) {
             const el = lineEls.current[i];
             if (!el) continue;
-            const a = byId.get(edges[i].source);
-            const b = byId.get(edges[i].target);
+            const a = byId.get(allEdges[i].source);
+            const b = byId.get(allEdges[i].target);
             if (!a || !b) continue;
             el.setAttribute('x1', a.x);
             el.setAttribute('y1', a.y);
@@ -831,13 +887,13 @@
           const centerIndex = indexOfId.get(centerId);
           if (centerIndex === undefined) return;
           const local = new Set([centerIndex]);
-          for (const edge of edges) {
+          for (const edge of allEdges) {
             if (edge.source === centerId) local.add(indexOfId.get(edge.target));
             else if (edge.target === centerId) local.add(indexOfId.get(edge.source));
           }
           const localIndexes = [...local].filter((index) => Number.isInteger(index));
           const localSet = new Set(localIndexes);
-          const links = edges
+          const links = allEdges
             .map((edge) => ({ a: indexOfId.get(edge.source), b: indexOfId.get(edge.target), weight: edge.weight || 1 }))
             .filter((link) => link.a !== undefined && link.b !== undefined && (localSet.has(link.a) || localSet.has(link.b)));
 
@@ -953,7 +1009,7 @@
           relaxAround(drag.id);
         };
 
-        if (nodes.length === 0) {
+        if (allNodes.length === 0) {
           return h('div', { style: { ...cardStyle, color: palette.muted, fontSize: 13 } }, '暂无图谱：维护完成后由日志（去墓碑）离线生成。');
         }
 
@@ -962,9 +1018,32 @@
           { style: cardStyle },
           h(
             'div',
-            { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 6 } },
+            { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 6 } },
             h('div', { style: { fontSize: 13, fontWeight: 600 } }, '知识图谱'),
-            h('div', { style: { ...labelStyle, marginBottom: 0 } }, `${fmtNumber(graph.nodeCount)} 节点 · ${fmtNumber(graph.edgeCount)} 边${graph.truncated ? '（已截断）' : ''}`),
+            h(
+              'div',
+              { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+              h('div', { style: { ...labelStyle, marginBottom: 0 } }, `${fmtNumber(graph.nodeCount)} 节点 · ${fmtNumber(graph.edgeCount)} 边${graph.truncated ? '（已截断）' : ''}`),
+              ghostNodes.length > 0
+                ? h(
+                    'div',
+                    {
+                      style: { display: 'flex', gap: 4 },
+                      title: '仅活跃 = 只看当前图谱；历史全貌 = 叠加宽限期内的幽灵节点（半透明、虚线、挂在父 root 下）',
+                    },
+                    h(
+                      'button',
+                      { type: 'button', 'aria-pressed': history ? 'false' : 'true', onClick: () => setHistory(false), style: toggleStyle(!history) },
+                      '仅活跃',
+                    ),
+                    h(
+                      'button',
+                      { type: 'button', 'aria-pressed': history ? 'true' : 'false', onClick: () => setHistory(true), style: toggleStyle(history) },
+                      `历史全貌 · ${fmtNumber(ghostNodes.length)}`,
+                    ),
+                  )
+                : null,
+            ),
           ),
           h(
             'svg',
@@ -978,7 +1057,7 @@
               onPointerCancel: endDrag,
             },
             // Edges first, and only when BOTH endpoints are painted: no dangling lines.
-            edges.map((edge, i) => {
+            allEdges.map((edge, i) => {
               const a = byId.get(edge.source);
               const b = byId.get(edge.target);
               if (!a || !b) return null;
@@ -994,17 +1073,22 @@
                 y1: a.y,
                 x2: b.x,
                 y2: b.y,
-                stroke: palette.border,
+                stroke: edge.ghost ? palette.warn : palette.border,
+                strokeDasharray: edge.ghost ? '3 4' : undefined,
                 strokeWidth: Math.min(2.5, 0.4 + (edge.weight || 1) * 0.25),
-                opacity: 0.8,
+                opacity: edge.ghost ? 0.7 : 0.8,
+                // Smooth fade in/out: the coordinate is already frozen, only alpha moves.
+                style: edge.ghost ? { opacity: history ? 0.7 : 0, transition: 'opacity 420ms ease' } : undefined,
               });
             }),
-            nodes.map((node, i) => {
+            allNodes.map((node, i) => {
               if (i >= revealed) return null;
               const position = positions[i];
               if (!position) return null;
-              const radius = 3 + (Math.sqrt((node.weight || 0) / maxWeight) || 0) * 7;
-              const core = i < 5;
+              const ghost = node.ghost === true;
+              const ghostRoot = node.ghostRoot === true;
+              const radius = ghost ? 4 : ghostRoot ? 6 : 3 + (Math.sqrt((node.weight || 0) / maxWeight) || 0) * 7;
+              const core = !ghost && !ghostRoot && i < 5;
               const active = focus === node.id;
               return h(
                 'g',
@@ -1014,23 +1098,43 @@
                     nodeEls.current[i] = el;
                   },
                   transform: `translate(${position.x}, ${position.y})`,
-                  style: { cursor: 'grab', touchAction: 'none' },
+                  style: {
+                    cursor: 'grab',
+                    touchAction: 'none',
+                    opacity: ghost || ghostRoot ? (history ? 1 : 0) : 1,
+                    transition: 'opacity 420ms ease',
+                    pointerEvents: ghost || ghostRoot ? (history ? 'auto' : 'none') : 'auto',
+                  },
                   onPointerDown: (evt) => onPointerDown(node, i, evt),
                   onPointerEnter: () => setFocus(node.id),
                   onPointerLeave: () => {
                     if (!dragRef.current) setFocus(null);
                   },
                 },
+                ghost
+                  ? h('title', null, `幽灵节点 ${node.path}${node.graceUntil ? ' · 宽限期至 ' + fmtTime(node.graceUntil) : ''}：仅元数据，不注入正文`)
+                  : null,
                 h('circle', {
                   r: radius + 6,
                   fill: 'transparent', // larger hit target, invisible
                 }),
-                h('circle', { r: radius, fill: active ? palette.accent : 'rgba(79,140,255,0.55)', stroke: palette.border, strokeWidth: 1 }),
-                (core || active) && h('text', { x: radius + 4, y: 4, fill: palette.text, style: { fontSize: 10, pointerEvents: 'none' } }, node.label),
+                h('circle', {
+                  r: radius,
+                  fill: ghost ? 'rgba(217,155,43,0.22)' : ghostRoot ? 'transparent' : active ? palette.accent : 'rgba(79,140,255,0.55)',
+                  stroke: ghost || ghostRoot ? palette.warn : palette.border,
+                  strokeDasharray: ghost || ghostRoot ? '4 3' : undefined,
+                  strokeWidth: 1,
+                }),
+                (core || active || (history && (ghost || ghostRoot))) &&
+                  h(
+                    'text',
+                    { x: radius + 4, y: 4, fill: palette.text, style: { fontSize: 10, pointerEvents: 'none' } },
+                    ghost ? `${node.label} · 幽灵` : node.label,
+                  ),
               );
             }),
           ),
-          h('div', { style: { ...labelStyle, marginTop: 6, marginBottom: 0 } }, '拖拽节点可移动；单击查看标签；核心节点常显。'),
+          h('div', { style: { ...labelStyle, marginTop: 6, marginBottom: 0 } }, '拖拽节点可移动；单击查看标签；核心节点常显。幽灵节点＝宽限期内的层级记忆，仅在"历史全貌"可见（半透明、虚线、挂在父 root 下）。'),
         );
       }
 
@@ -1083,6 +1187,7 @@
         const maintenance = panel.maintenance || {};
         const generations = panel.generations || {};
         const graphInfo = panel.graph || {};
+        const tagTreeInfo = panel.tagTree || {};
 
         return h(
           'div',
@@ -1112,10 +1217,15 @@
               h(StatCard, { label: '活跃标签', value: fmtNumber(global.activeTags), hint: '常驻活跃集合' }),
               h(StatCard, { label: '累计节省 Token', value: fmtNumber(tokens.cumulativeSavedTokens), hint: `${fmtNumber(tokens.evictedBlocks)} 块已驱逐` }),
               h(StatCard, { label: '图谱', value: `${fmtNumber(graphInfo.nodeCount)} / ${fmtNumber(graphInfo.edgeCount)}`, hint: `上限 ${fmtNumber(graphInfo.limit)} 边` }),
+              h(StatCard, {
+                label: '标签树',
+                value: `${fmtNumber(tagTreeInfo.nodeCount)} 节点`,
+                hint: `幽灵 ${fmtNumber(tagTreeInfo.ghostCount)} · 待修剪 ${fmtNumber(tagTreeInfo.pendingQueue)}`,
+              }),
             ),
           ),
           graphState.graph
-            ? h(KnowledgeGraph, { graph: graphState.graph })
+            ? h(KnowledgeGraph, { graph: graphState.graph, ghosts: (graphState.tagTree && graphState.tagTree.ghosts) || [] })
             : h('div', { style: { ...cardStyle, color: palette.muted, fontSize: 13 } }, graphState.error ? `图谱不可用：${graphState.error.code}` : '正在读取图谱缓存…'),
           h(
             'div',
@@ -1125,6 +1235,7 @@
             h(Row, { label: '下次预计', value: fmtTime(maintenance.nextRunAt) }),
             h(Row, { label: 'Cron', value: maintenance.maintenanceCron || '—' }),
             h(Row, { label: '图谱生成于', value: fmtTime(graphInfo.generatedAt) }),
+            h(Row, { label: '标签树生成于', value: fmtTime(tagTreeInfo.generatedAt) }),
           ),
           h('div', { style: { ...labelStyle, marginTop: 2 } }, '数据每 3 秒自动刷新；配置请到 设置 → 海马体记忆。'),
         );
@@ -1206,6 +1317,59 @@
         );
       }
 
+      /**
+       * Slider + numeric box for the L1.5 lifetime knobs. The label carries a
+       * `title` tooltip (hover) with the scenario hint, and the hint is also
+       * rendered below so it is readable on touch devices.
+       */
+      function Slider(props) {
+        const value = Number(props.value);
+        const boxStyle = {
+          width: 88,
+          marginLeft: 10,
+          padding: '4px 6px',
+          borderRadius: 8,
+          border: `1px solid ${palette.border}`,
+          background: 'transparent',
+          color: palette.text,
+        };
+        return h(
+          'label',
+          { style: { display: 'block', padding: '8px 0' }, title: props.hint || '' },
+          h(
+            'div',
+            { style: { display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8, marginBottom: 4 } },
+            h('span', { style: { fontSize: 13 } }, props.label),
+            h('span', { style: { ...labelStyle, marginBottom: 0, fontVariantNumeric: 'tabular-nums' } }, `${value}${props.suffix || ''}`),
+          ),
+          h(
+            'div',
+            { style: { display: 'flex', alignItems: 'center' } },
+            h('input', {
+              type: 'range',
+              value,
+              min: props.min,
+              max: props.max,
+              step: props.step,
+              disabled: Boolean(props.disabled),
+              onChange: (event) => props.onChange(Number(event.target.value)),
+              style: { flex: '1 1 180px', maxWidth: 260, accentColor: palette.accent },
+            }),
+            h('input', {
+              type: 'number',
+              value,
+              min: props.min,
+              max: props.max,
+              step: props.step,
+              disabled: Boolean(props.disabled),
+              onChange: (event) => props.onChange(Number(event.target.value)),
+              style: boxStyle,
+            }),
+          ),
+          props.hint ? h('div', { style: { ...labelStyle, marginTop: 4, marginBottom: 0 } }, props.hint) : null,
+        );
+      }
+
       function Section(props) {
         return h(
           'div',
@@ -1234,6 +1398,14 @@
           dreamIdleMinutes: Number(config.dreamIdleMinutes),
           graphMaxEdges: Number(config.graphMaxEdges),
           storageBudgetMb: Number(config.storageBudgetMb),
+          // L1.5 tag-tree lifecycle. Defaults mirror config.js; the form sends the
+          // four dotted keys back in the same patch as every other setting.
+          tagTree: {
+            midHalfLifeMultiplier: Number((config.tagTree && config.tagTree.midHalfLifeMultiplier) ?? 3),
+            midGracePeriodDays: Number((config.tagTree && config.tagTree.midGracePeriodDays) ?? 30),
+            pruneBatchSize: Number((config.tagTree && config.tagTree.pruneBatchSize) ?? 100),
+            leafDecayFloor: Number((config.tagTree && config.tagTree.leafDecayFloor) ?? 0),
+          },
           decayHalfLifeDays: Number((config.decay && config.decay.halfLifeDays) ?? 30),
           activeSetCap: Number((config.activeSet && config.activeSet.cap) ?? 200),
           maxRecallTopK: Number(config.maxRecallTopK),
@@ -1277,6 +1449,10 @@
         { key: 'rawMaxTotalMb', label: 'raw 总量', min: 16, max: 4096 },
         { key: 'rawRetentionDays', label: 'raw 保留期', min: 1, max: 365 },
         { key: 'deleteGraceHours', label: '删除宽限期', min: 0, max: 168 },
+        { key: 'tagTree.midHalfLifeMultiplier', label: 'mid 半衰期倍率', min: 1, max: 10 },
+        { key: 'tagTree.midGracePeriodDays', label: 'mid 宽限天数', min: 7, max: 180 },
+        { key: 'tagTree.pruneBatchSize', label: '标签树批大小', min: 10, max: 500 },
+        { key: 'tagTree.leafDecayFloor', label: 'leaf 衰减地板', min: 0, max: 1 },
       ];
 
       const readPath = (object, dotted) => dotted.split('.').reduce((cursor, part) => (cursor == null ? cursor : cursor[part]), object);
@@ -1307,7 +1483,7 @@
         const edit = (path, value) => {
           setStatus(null);
           setDraft((prev) => {
-            const next = { ...prev, context: { ...(prev.context || {}) }, temp: { ...(prev.temp || {}) } };
+            const next = { ...prev, context: { ...(prev.context || {}) }, temp: { ...(prev.temp || {}) }, tagTree: { ...(prev.tagTree || {}) } };
             if (path.indexOf('.') >= 0) {
               const [group, leaf] = path.split('.');
               next[group] = { ...(next[group] || {}), [leaf]: value };
@@ -1387,6 +1563,10 @@
             'raw.retentionDays': Number(draft.rawRetentionDays),
             'delete.graceHours': Number(draft.deleteGraceHours),
             'review.enabled': Boolean(draft.reviewEnabled),
+            'tagTree.midHalfLifeMultiplier': Number(draft.tagTree.midHalfLifeMultiplier),
+            'tagTree.midGracePeriodDays': Number(draft.tagTree.midGracePeriodDays),
+            'tagTree.pruneBatchSize': Number(draft.tagTree.pruneBatchSize),
+            'tagTree.leafDecayFloor': Number(draft.tagTree.leafDecayFloor),
             'identity.eventTimePolicy': draft.eventTimePolicy,
           };
           try {
@@ -1674,6 +1854,54 @@
           ),
           h(
             Section,
+            {
+              title: '标签树（L1.5 幽灵宽限）',
+              hint: '层级标签的生死节奏：root 永生、leaf 引用归零即死、mid 在宽限期内变"幽灵"（recall 只给元数据、引导 deep_raw），过期未复活才消亡。四个值都在下一次维护生效。',
+            },
+            h(Slider, {
+              label: 'mid 半衰期倍率（tagTree.midHalfLifeMultiplier）',
+              hint: 'mid 半衰期 = 倍率 × leaf 半衰期（1 天）。默认 3：mid 比叶子多活 3 倍。调大→幽灵留存更久，历史更完整；调小→层级更快被清理。',
+              value: draft.tagTree.midHalfLifeMultiplier,
+              min: 1,
+              max: 10,
+              step: 0.5,
+              onChange: (value) => edit('tagTree.midHalfLifeMultiplier', value),
+              disabled,
+            }),
+            h(Slider, {
+              label: 'mid 宽限期（tagTree.midGracePeriodDays）',
+              hint: 'mid 失去最后一个叶子后的宽限天数（默认 30）。期内新叶子可立即复活它；期内召回只返回"存在模糊记忆"的元数据，绝不注入正文。',
+              value: draft.tagTree.midGracePeriodDays,
+              min: 7,
+              max: 180,
+              step: 1,
+              suffix: '天',
+              onChange: (value) => edit('tagTree.midGracePeriodDays', value),
+              disabled,
+            }),
+            h(Slider, {
+              label: '剪枝批大小（tagTree.pruneBatchSize）',
+              hint: '每次维护最多消费的待修剪叶子数（默认 100）。调小→死叶分批消失、队列落盘跨重启排空，避免一次维护风暴。',
+              value: draft.tagTree.pruneBatchSize,
+              min: 10,
+              max: 500,
+              step: 10,
+              onChange: (value) => edit('tagTree.pruneBatchSize', value),
+              disabled,
+            }),
+            h(Slider, {
+              label: 'leaf 衰减地板（tagTree.leafDecayFloor）',
+              hint: '0 = 只按引用归零死亡（严格 forget 驱动）；>0 时衰减低于该分数、又被排队的叶子会被修剪。0.05 ≈ 5 个叶子寿命后进入历史视图。',
+              value: draft.tagTree.leafDecayFloor,
+              min: 0,
+              max: 1,
+              step: 0.01,
+              onChange: (value) => edit('tagTree.leafDecayFloor', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
             { title: '老化与活跃集合', hint: '这两个值同时是策略参数：写入 config 即进入 policy，下一次维护生效。' },
             h(Field, {
               label: '记忆半衰期（decay.halfLifeDays）',
@@ -1764,6 +1992,8 @@
         // Exported for the bundle-contract tests: the pure retry decision is the
         // piece the P0 fix depends on, so it must be testable without a browser.
         retryPolicy: decideRetry,
+        // Pure geometry for the history view: testable without a DOM.
+        ghostGraphParts,
         apply(ctx) {
           let slots = null;
           try {

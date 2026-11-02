@@ -36,12 +36,16 @@ semantic/sem.log.jsonl           语义事件流（semantic_upsert / semantic_re
 semantic/temp.log.jsonl          L2.5 趋势隔离层（temp_observe / temp_promote / temp_purge）
 journal/delete-dl_*.json         每个删除任务的阶段状态机
 state/maintenance.json           最近一次维护报告
+state/graph.json                 知识图谱缓存（派生）
+state/tag-tree.json              L1.5 标签层级树 + 幽灵宽限 + 待修剪队列（派生）
 ```
 
 **身份三层（不可混用）**：`entity_id` = 实体（跨修订恒定）；`event_id` = 某一次发生，`ev_` + 26 位，由 `content_hash + event_time + occurrence_index` 确定性推出；`content_hash` = 载荷等价类（JSON 键排序、空白折叠、`1.0 → 1`、全半角统一后哈希）。**随机数与写入时钟都不进哈希**，所以同一输入重放得到同一 id 序列。
 
 **真相源**：`log/gen-*/seg-*.jsonl`、`log/tombstones.jsonl`、`identity/ledger.jsonl` 与 `semantic/sem.log.jsonl`（+ `semantic/temp.log.jsonl` 的隔离账本）。
-**可重建**：`index/**`、`active-set.json`、`diary.json`、`temp.log.jsonl` 的折叠视图。删掉 `index/` 后 `action=maintain` 可逐字节重建（digest 相同，见测试）；重建的输入是 **日志 − 墓碑**，因此已删事件不会被"重建复活"。
+**可重建**：`index/**`、`active-set.json`、`diary.json`、`temp.log.jsonl` 的折叠视图、`state/graph.json`、`state/tag-tree.json`。删掉 `index/` 后 `action=maintain` 可逐字节重建（digest 相同，见测试）；重建的输入是 **日志 − 墓碑**，因此已删事件不会被"重建复活"。
+
+**L1.5 的例外与代价**：标签树的**活树**同样由 `maintain()` 从索引重建；但"幽灵"（宽限中的 mid）是**跨维护的生命周期状态**，纯重建看不到已经死掉的子树，所以维护会读取上一份 `state/tag-tree.json` 做 carry-forward（失去全部活引用的节点以 `refCount=0` 接回，孤儿丢弃）。因此删除该文件只会丢失**幽灵历史**，不会影响活树——与 `graph.json` 同级的派生缓存定位。
 
 ## 配置
 
@@ -72,6 +76,12 @@ state/maintenance.json           最近一次维护报告
     temp:
       ttlDays: 30
       promotionWindowDays: 20         # 必须 ≤ ttlDays
+    # ---- L1.5 标签层级树（幽灵宽限）----
+    tagTree:
+      midHalfLifeMultiplier: 3        # mid 半衰期 = 倍率 × leaf 半衰期（1 天）
+      midGracePeriodDays: 30          # 失去最后一个叶子后的宽限天数
+      pruneBatchSize: 100             # 每次维护最多修剪的叶子数（有界批次）
+      leafDecayFloor: 0               # 0 = 只按引用归零死亡
     # ---- 事件时间来源 ----
     identity:
       eventTimePolicy: content        # content | explicit | ingest
@@ -117,6 +127,10 @@ state/maintenance.json           最近一次维护报告
 | `context.injectPrompt` | boolean | `CONFIG_INVALID_TYPE` | 决定 `memory:window` 提示节是否注册 |
 | `temp.ttlDays` | 正整数天 | `CONFIG_OUT_OF_RANGE` | `temp.log.jsonl: expiresAt = observedAt + ttlDays·86400s` |
 | `temp.promotionWindowDays` | 正整数天，`≤ ttlDays` | `CONFIG_OUT_OF_RANGE` | 晋升判定窗口（不落盘） |
+| `tagTree.midHalfLifeMultiplier` | 1 – 10 | `CONFIG_OUT_OF_RANGE` | mid 半衰期；`state/tag-tree.json: nodes[].halfLifeDays` |
+| `tagTree.midGracePeriodDays` | 7 – 180 | `CONFIG_OUT_OF_RANGE` | `state/tag-tree.json: nodes[].graceUntil` |
+| `tagTree.pruneBatchSize` | 10 – 500 | `CONFIG_OUT_OF_RANGE` | 每次维护的修剪批上限；剩余队列落盘 |
+| `tagTree.leafDecayFloor` | 0 – 1 | `CONFIG_OUT_OF_RANGE` | 排队的死叶是否按衰减地板修剪 |
 | `identity.eventTimePolicy` | `content\|explicit\|ingest` | `CONFIG_UNKNOWN_ENUM` | `log` 记录 `time_source`、`time_uncertain` |
 | `policy.*` | 见"策略表" | `MEM_E_INVALID_POLICY` | `index/gen-*/manifest.json: policyHash` |
 | 其它未知键（非 `_` 前缀） | — | `CONFIG_UNKNOWN_KEY` | — |
@@ -177,6 +191,18 @@ state/maintenance.json           最近一次维护报告
 - 检索兼容：隔离条目可被召回，但 `priority: "temp"`，分数乘 `retrievalPenalty=0.4`，并带 `ttlDays`/`expiresAt`；已过期未裁决的不返回（否则 TTL 是假的）。
 - 幂等与不复活：已晋升的条目再被提及 → `{action:"ignored", reason:"status:permanent"}`，不会重新进入隔离。
 
+## L1.5 标签层级树（幽灵宽限）
+
+层级标签（`tech/frontend/vue3`）先于 L2.5 成为"记忆的形状"：一棵**派生**的三层树，由 `maintain()` 从收敛后的索引投影，写在 `state/tag-tree.json`。宪章约束与实现纪律：
+
+- **引擎主导**：树的生长/衰亡只在维护时钟上发生；读取路径（`memory_recall`、图谱路由）只读缓存，绝不扫描或裁决。
+- **三种寿命**：`root` 永生（含无 `/` 的扁平根 `project:dsh`）；`leaf` 引用归零即死；`mid` 失去最后一个孩子后进入 `midGracePeriodDays` 宽限，期内**幽灵**（可被新叶子复活），到期且衰减 `decayScore < 0.05` 才消亡。
+- **有界批次 + 落盘队列**：死叶先入 `pendingQueue`，每次维护只消费 `pruneBatchSize` 条，剩余队列与整棵树在**同一次原子写**里落盘。10k 死叶分多次排空，绝不制造"剪枝风暴"；重启不丢队列。
+- **衰减按实时 `now` 重算**：节点上的 `decayScore` 只是上一轮投影的展示值；生死判定一律以 `updatedAt` 与本次维护的 `now` 现算。冻结分数会让宽限期永远不到期——这是 v1.4.2 修掉的真实缺陷。
+- **carry-forward**：纯重建只看活事件，一个只剩死亡的子树会在同一次 rebuild 里整体消失，宽限/幽灵就永远观察不到。因此维护把上一份缓存里"失去全部活引用"的节点以 `refCount=0` 接回（**孤儿直接丢弃，不伪造根**），再走同一套 prune。这使 `tag-tree.json` 成为与 `graph.json` 同级的派生缓存：可删，代价仅是幽灵历史。
+- **反幻觉降级（`memory_recall`）**：只经由宽限 mid 到达的命中，其正文（`snippet`/`content`/`score`）被**整条移除**，改为一组元数据 `ghostHints[]`：`mid / path / count / graceUntil / graceDaysLeft / window / hint`；`hint` 引导 `deep_raw` 并给出时间窗（取 `day`＝anchorTime 的日界，而非可能由内容哈希推导的 `event_time`）。查询点名宽限 mid 而索引无实体命中时返回 `count:0` 的同一提示，绝不静默空答。语义层（L3）**豁免**：它是蒸馏出的模式而非模糊的实例，"用户以前做前端"不是幻觉。
+- **UI 历史视图**：图谱路由同响应带 `tagTree.ghosts`（渲染上限 **50** 条 + `totalGhosts/truncated`；图谱是 O(n²) 力导向，历史全量灌进去就是 UI 性能风暴）；前端把幽灵画成半透明虚线圆节点、挂在父 `root` 下，用 CSS `opacity 420ms` 做"仅活跃 / 历史全貌"的淡入淡出，布局键不含开关状态，切换不重排。
+
 ## 上下文窗口分页（模块 3，引擎驱动）
 
 "上下文太长就自己精简"是**请求**，模型会漂移；测量 token 再按确定性分数淘汰**无法漂移**。
@@ -236,6 +262,12 @@ state/maintenance.json           最近一次维护报告
 | `generations.indexGen` | 索引当前代（双缓冲的 A 面） | `index/CURRENT` |
 | `generations.logGeneration` | 日志代序号（整数，便于比较单调性） | `genNumber(logGen)` |
 | `generations.indexGeneration` | 索引代序号（每次 rebuild +1） | `genNumber(indexGen)` |
+| `tagTree.available` | 标签树缓存是否已生成（首次维护前为 `false`） | `state/tag-tree.json` 是否存在且 schema 匹配 |
+| `tagTree.nodeCount` | 树节点总数（root+mid+leaf） | `state/tag-tree.json: stats.nodes` |
+| `tagTree.ghostCount` | 宽限期内的 mid 数（幽灵） | `stats.ghosts` |
+| `tagTree.roots` / `mids` / `leaves` | 各层节点数 | `stats.*` |
+| `tagTree.pendingQueue` | 待修剪队列剩余条数（跨维护排空中） | `state/tag-tree.json: pendingQueue` |
+| `tagTree.generatedAt` / `sourceIndexGeneration` / `stale` | 生成时刻、来源索引代、与当前索引代是否不一致 | 缓存文件与 `indexManager.generation` |
 
 `boot` 是开机一致性检查结果：`{status: ok|stale|missing|rebuilt, logGen, indexGen, reason?}`。
 
@@ -318,19 +350,23 @@ window.__ModuleLoader__.load({
 
 状态渲染：`pending/in_progress` 显示"正在迁移/加载索引…"，`failed` 显示 `phaseError` 的 code 与 message 以及 `dataDir`，`ready` 才显示卡片。
 
+- **L1.5 设置**：四个 `tagTree.*` 旋钮用"滑块 + 数字框"双控件（滑块探索、数字框精确），label 的 `title` 是场景化 Tooltip，hint 同时渲染在下方（触屏可读）；保存时以点号路径随整份 patch 提交，最终仍由后端 `resolveConfig` fail-fast 裁决。
+- **幽灵节点**：`GET /api/hippocampus/graph` 的 `tagTree.ghosts` 与本图谱同响应返回；前端合成 `root → ghost` 两条边和半透明虚线节点，`仅活跃 / 历史全貌` 只改 CSS opacity（420ms 过渡），不触发力导向重排。`title` 元素展示路径与剩余宽限期。
+
 ## HTTP 路由（Client → Host 的唯一通道）
 
 浏览器不能调 Agent 工具，面板数据与配置写回都走这两条路由（`src/webRoutes.js`，挂在 `ctx.webServer.register`，`kind:'exact'`，同源，无需鉴权）：
 
 | 方法 | 路径 | 返回 / 语义 |
 | --- | --- | --- |
-| `GET` | `/api/memory/stats` | `{ok, phase, phaseError, panel, briefing, config}`；**未 READY 回 503**（`{ok:false, code:'MEM_E_NOT_READY', phase}`），面板据此渲染启动态 |
-| `GET` | `/api/memory/config` | 只含可编辑子集：`enableDream/enableReflection/dreamIdleMinutes/context.{maxTokens,threshold,target}/temp.ttlDays` |
-| `POST` | `/api/memory/config` | body `{patch:{...}}`（≤16 KiB）→ 校验 → 内存生效 → 尝试持久化 → `{ok, config, persisted, note?}` |
+| `GET` | `/api/hippocampus/stats` | `{ok, phase, phaseError, panel, briefing, config}`；**未 READY 回 503**（`{ok:false, code:'MEM_E_NOT_READY', phase}`），面板据此渲染启动态 |
+| `GET` | `/api/hippocampus/config` | 只含可编辑子集：`enableDream/enableReflection/dreamIdleMinutes/context.{maxTokens,threshold,target}/temp.ttlDays/tagTree.*/…` |
+| `POST` | `/api/hippocampus/config` | body `{patch:{...}}`（≤16 KiB）→ 校验 → 内存生效 → 尝试持久化 → `{ok, config, persisted, note?}` |
+| `GET` | `/api/hippocampus/graph` | 缓存图谱 `.slice(0, graphMaxEdges)` + `tagTree.ghosts`（历史视图元数据，≤200 条） |
 
 - 未知键 → `400 MEM_E_CONFIG_UNKNOWN_KEY`；值越界 → `400 MEM_E_CONFIG_OUT_OF_RANGE`；坏 JSON → `400 MEM_E_INVALID_INPUT`；非 GET/POST → `405`。
 - **生效与持久化分离**：`runtime.updateConfig(patch)` 先 `resolveConfig` 校验再原子替换运行配置（失败则运行配置不动）；持久化走 `configEditor.entries()/edit()`（Loader 自己的写配置路径）。没有 `configEditor` 时返回 `persisted:false` 与 `note`，前端如实显示"已生效，重启前不持久"。
-- 热更新的落地字段：`context.maxTokens/threshold/target` 直接写 `ContextEngine` 的 override（下一次 `enforce()` 即生效）；`dreamIdleMinutes/enableDream/enableReflection` 由 runtime 每 tick 读取。
+- 热更新的落地字段：`context.maxTokens/threshold/target` 直接写 `ContextEngine` 的 override（下一次 `enforce()` 即生效）；`dreamIdleMinutes/enableDream/enableReflection` 由 runtime 每 tick 读取；其余分组（`raw.*`、`tagTree.*`、`delete.*`、`context.minInjectConfidence` 等）由 `applyConfig` 投影到运行中的 `Memory.config`，下一个使用点/下一次维护即生效——设置页"保存后立即生效"不是口号。
 
 ### 错误码表
 
@@ -369,7 +405,7 @@ window.__ModuleLoader__.load({
 
 运行器带**看门狗**：默认 **30s**（`MEM_TEST_TIMEOUT_MS` 可调）仍未退出，就打印**卡住时正在导入/执行的文件、最后完成的测试名与完成数、活动资源、尚未触发的定时器**，然后 `process.exit(1)`。它不会用 `process.exit(0)` 掩盖超时——挂起即失败。`MEM_TEST_TRACE=1` 可看文件级进度，`MEM_TEST_ONLY=<子串>` 只跑一组。
 
-95 个用例（14 个文件）覆盖：
+189 个用例（27 个文件）覆盖：
 
 - 索引与标签：重建 digest 一致、行号漂移防护（eventId 不变、行号变）、同义合并、活跃集 cap 挤出、规则变更不改清单、空活跃集降级、top-k 有界有序去重。
 - 衰减与删除：30 天半衰期、reinforce 移动锚点（不存字段）、仅文本粗筛、标签过滤、维护代切换且旧代可读、boot 检查、压缩不丢记录、并发维护串行化、四阶段删除、archive 可回滚 vs purge 不可、strict 巩固暂停与恢复、任务重放幂等、错误 id 零变更。
@@ -379,8 +415,10 @@ window.__ModuleLoader__.load({
 - 双缓冲与防复活：在 `beforeSwap` 屏障挂起写线程时，读线程解析到**完整旧快照**；放行后见到**完整新快照**。重建输入 = 日志 − 墓碑，按 tag 比对 `event_id` 集合（无序相等）、关联强度 1e-9 容差、共用同一注入时钟；`stats.suppressedByTombstone` 计数。
 - 配置与调度（新增 4 个文件 / 30 个用例）：默认值、非法 cron、越界阈值、未知枚举、未知键、别名冲突全为 `MEM_E_CONFIG_*` 硬失败；deprecated 键抛 `CONFIG_DEPRECATED` 并带 `replacement`；cron 匹配/步进/DOM-DOW OR/`nextRun` 严格递进；维护重入时下一 tick 跳过且不并发、错过窗口不补跑、失败记录后继续；迁移的已迁移幂等、无标记中断、源不存在、锁冲突、无源禁用。
 - 生命周期（`test/lifecycle.test.js`，10 个用例）：工具 schema 根对象（含 `memory_admin`）；READY 前读写均为 `MEM_E_NOT_READY`；迁移窗口读旧目录并标 `readFrom:"legacy"`；dream 空闲触发；重入只跑一次；反思段达阈值才出文本；迁移锁的活 pid/死 pid/释放；uiPayload 由 Host 提供而 Host 不注册视觉面；运行器看门狗断言。
-- HTTP 路由（`test/webRoutes.test.js`，10 个用例）：stats 的 200/503；config 的 GET 子集与 POST 生效+持久化；未知键/越界/坏 JSON 的 400 与错误码透传；405；`registerMemoryRoutes` 注册与 dispose；`validatePatch` 拒绝非对象。
-- Client 包（`test/clientSlot.test.js`，4 个用例）：`__ModuleLoader__` 工厂纯度、`inject:['slots']`、三个注册的 id/key 与顺序、dispose 全部执行、图标是纯 SVG、`index.js` 不含 React/DOM。
+- HTTP 路由（`test/webRoutes.test.js`，12 个用例）：stats 的 200/503；config 的 GET 子集与 POST 生效+持久化；未知键/越界/坏 JSON 的 400 与错误码透传；405；`registerMemoryRoutes` 注册与 dispose；`validatePatch` 拒绝非对象；四个 `tagTree.*` 在可编辑白名单内且嵌套成组。
+- Client 包（`test/clientSlot.test.js`，19 个用例）：`__ModuleLoader__` 工厂纯度、`inject:['slots']`、三个注册的 id/key 与顺序、dispose 全部执行、图标是纯 SVG、`index.js` 不含 React/DOM、设置页覆盖全部键、L1.5 滑块+数字框+Tooltip、幽灵节点与"仅活跃/历史全貌"淡入淡出（并锁定布局键不含开关状态）；`ghostGraphParts()` 纯函数直接断言幽灵节点/root 锚点/边。
+- L1.5 标签树（`test/tagTree.test.js` 11 + `test/tagTreeMaintenance.test.js` 8）：纯函数（层级解析、实时衰减重算、release 队列、carry-forward、孤儿丢弃、配置半衰期）；集成（原子发布/来源代/顺序稳定、leaf→ghost→mid 死亡级联、复活、25 死叶分批 10/10/5/0、损坏缓存自愈、删缓存只丢幽灵、`tagTreeView` 只发幽灵元数据）。
+- 反幻觉召回（`test/ghostRecall.test.js`，3 个用例 + `test/retrieval.test.js` 单元）：宽限 mid 命中正文被物理移除、按 mid 聚合计数、点名宽限 mid 无命中时 `count:0` 提示、维护复活后正文恢复、`panel.tagTree.ghostCount` 跟随。
 - 面板：`status().panel` 形状快照（键全集，防漏字段）+ 值快照；写入后 `events/activeTags` 跟随；`cumulativeSavedTokens` 跨 reopen 保持（`state/context.json`）；`queuedDeletes` 取自删除流水线而非独立计数器；`indexGeneration` 每次 rebuild 恰好 +1。
 
 
@@ -428,6 +466,7 @@ window.__ModuleLoader__.load({
 4. L2.5 只在维护时晋升/淘汰（不阻塞在线路径），代价是"热点趋势"最多延迟一个维护周期才被隔离；爆发检测用内容归一化分组（去掉空白/大小写差异），不做语义聚类。
 5. 上下文分页的 token 数是 `ceil(len/4)` 估算，不是真实 tokenizer：预算偏保守（少注入比溢出安全），接真实 tokenizer 只需替换 `estimateTokens()`。
 6. `event_time` 默认由内容推导意味着"日期是内容的函数、不是现实的函数"：这换来可重放的身份，但把日期当新鲜度用会失真。因此**检索新鲜度不用它**：`time_source==='content'` 的事件用 `log_time` 做 recency anchor（见"评分与预算"），推导日期只作为身份坐标与展示。调用方知道真实发生时间时仍应传 `happened_at`——它会把 `time_source` 变成 `explicit`，从而锚点也换成真实时间。
+7. **幽灵历史不是日志的纯函数**：L1.5 的活树可由索引逐字节重建，但"宽限中的 mid"依赖**死亡被观察到的时刻**。因此 `state/tag-tree.json` 采用 carry-forward，与 `graph.json` 同级视为派生缓存：删掉它 = 丢历史幽灵、保活树，不丢任何真相。这是为"不扫全量日志"付出的唯一代价，并且已被测试锁定。
 
 ## 身份、幂等与双缓冲（v2）
 

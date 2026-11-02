@@ -224,6 +224,10 @@ test('settings cover every documented config key, including storageBudgetMb', ()
     'promptSection',
     'autoMaintainOnBoot',
     'temp.promotionWindowDays',
+    'tagTree.midHalfLifeMultiplier',
+    'tagTree.midGracePeriodDays',
+    'tagTree.pruneBatchSize',
+    'tagTree.leafDecayFloor',
   ]) {
     assert.ok(source.includes(key), `settings must expose ${key}`);
   }
@@ -291,6 +295,74 @@ test('settings expose decay.halfLifeDays and activeSet.cap with the documented h
   }
 });
 
+test('the tag-tree knobs render as sliders with numeric boxes and hover tooltips', () => {
+  const source = fs.readFileSync(CLIENT_PATH, 'utf8');
+  // A real slider AND a number box: the slider is for exploration, the box for
+  // exact values, and both feed the same draft field.
+  assert.ok(source.includes("type: 'range'"), 'the L1.5 knobs are sliders');
+  assert.ok(source.includes("type: 'number'"), 'the slider keeps an exact numeric box');
+  // Tooltip: the label carries the scenario hint as a native title.
+  assert.ok(source.includes("title: props.hint"), 'each control exposes its hint as a tooltip');
+  for (const marker of [
+    'mid 半衰期', 'mid 宽限期', '剪枝批大小', '衰减地板',
+    '幽灵', '模糊记忆', '下一次维护生效',
+  ]) {
+    assert.ok(source.includes(marker), `tag-tree settings must explain ${marker}`);
+  }
+  assert.ok(source.includes("edit('tagTree.midHalfLifeMultiplier'"), 'the multiplier is wired to the draft');
+  assert.ok(source.includes("'tagTree.midHalfLifeMultiplier': Number(draft.tagTree.midHalfLifeMultiplier)"), 'the save patch carries the key');
+});
+
+test('the graph renders ghost nodes and toggles active/history with a CSS fade', () => {
+  const source = fs.readFileSync(CLIENT_PATH, 'utf8');
+  for (const marker of [
+    'ghostNodes', 'ghostEdges', 'ghostRoot', 'ghost: true',
+    '仅活跃', '历史全貌',
+    'strokeDasharray', 'setHistory',
+    "transition: 'opacity 420ms ease'",
+    'props.ghosts',
+    'body.tagTree',
+  ]) {
+    assert.ok(source.includes(marker), `graph must include ${marker}`);
+  }
+  // The fade must not re-run the layout: history is not part of the layout key.
+  const graph = source.slice(source.indexOf('function KnowledgeGraph'));
+  const keyLine = graph.slice(graph.indexOf('const layoutKey'), graph.indexOf('const layoutKey') + 260);
+  assert.ok(!keyLine.includes('history'), 'toggling history must not restart the force layout');
+});
+
+test('ghostGraphParts: a ghost hangs under its parent root as a translucent node', () => {
+  const { makeModule } = loadBundle();
+  const { ghostGraphParts } = makeModule();
+  assert.equal(typeof ghostGraphParts, 'function');
+
+  const parts = ghostGraphParts([
+    { id: 'mid:frontend', name: 'frontend', parentId: 'root:tech', graceUntil: 1_700_000_000_000 },
+    { id: 'mid:data', name: 'data', parentId: 'root:tech', graceUntil: 1_700_000_000_000 },
+    { id: 'mid:solo', name: 'solo', parentId: null, graceUntil: null },
+    null,
+    { name: 42 },
+  ]);
+
+  assert.deepEqual(parts.rootNodes.map((root) => root.id), ['ghostroot:tech', 'ghostroot:history'], 'roots are deduped');
+  assert.deepEqual(parts.nodes.map((node) => node.id), ['ghost:mid:frontend', 'ghost:mid:data', 'ghost:mid:solo']);
+  assert.deepEqual(parts.nodes[0], {
+    id: 'ghost:mid:frontend',
+    label: 'frontend',
+    ghost: true,
+    weight: 0.2,
+    events: 0,
+    graceUntil: 1_700_000_000_000,
+    path: 'tech/frontend',
+  });
+  assert.deepEqual(parts.edges, [
+    { source: 'ghostroot:tech', target: 'ghost:mid:frontend', weight: 0.5, ghost: true },
+    { source: 'ghostroot:tech', target: 'ghost:mid:data', weight: 0.5, ghost: true },
+    { source: 'ghostroot:history', target: 'ghost:mid:solo', weight: 0.5, ghost: true },
+  ]);
+  assert.deepEqual(ghostGraphParts(undefined), { rootNodes: [], nodes: [], edges: [] }, 'a missing list is empty, not a crash');
+});
+
 test('the manifest points ./client at a real file and declares a web client', () => {
   const manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, 'utf8'));
   assert.equal(manifest.exports['./client'], './ui/client.js');
@@ -300,6 +372,6 @@ test('the manifest points ./client at a real file and declares a web client', ()
   assert.equal(manifest.dsh.client.platform, 'web');
   assert.equal(manifest.dsh.client.immediately, undefined, 'the UI must not be boot-critical');
   assert.equal(manifest.name, 'dsh-layers-hippocampus');
-  assert.equal(manifest.version, '1.4.1');
+  assert.equal(manifest.version, '1.4.2');
   assert.ok(manifest.dsh.client.inject === undefined || Array.isArray(manifest.dsh.client.inject));
 });

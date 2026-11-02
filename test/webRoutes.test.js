@@ -232,8 +232,31 @@ test('validatePatch rejects non-objects and accepts only the editable set', () =
     'retrieval',
     'review',
     'storageBudgetMb',
+    'tagTree',
     'temp',
   ]);
+});
+
+test('the four tagTree lifetime keys are whitelisted and nest under the group', () => {
+  const patch = validatePatch({
+    'tagTree.midHalfLifeMultiplier': 2,
+    'tagTree.midGracePeriodDays': 14,
+    'tagTree.pruneBatchSize': 50,
+    'tagTree.leafDecayFloor': 0.05,
+  });
+  assert.deepEqual(patch, {
+    tagTree: { midHalfLifeMultiplier: 2, midGracePeriodDays: 14, pruneBatchSize: 50, leafDecayFloor: 0.05 },
+  });
+  for (const key of [
+    'tagTree.midHalfLifeMultiplier',
+    'tagTree.midGracePeriodDays',
+    'tagTree.pruneBatchSize',
+    'tagTree.leafDecayFloor',
+  ]) {
+    assert.ok(EDITABLE_CONFIG_KEYS.includes(key), `${key} must be editable over HTTP`);
+  }
+  // A key outside the group still fails loudly, even though the group is allowed.
+  assert.throws(() => validatePatch({ 'tagTree.unknown': 1 }), /not editable/);
 });
 
 test('dotted patches nest at any depth and reject unknown groups', () => {

@@ -66,6 +66,12 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   'raw.captureRatio',
   'delete.graceHours',
   'review.enabled',
+  // L1.5 tag-tree lifecycle. Rebuildable derived state, so a change is applied by
+  // the next maintenance pass, never by rewriting anything on the request path.
+  'tagTree.midHalfLifeMultiplier',
+  'tagTree.midGracePeriodDays',
+  'tagTree.pruneBatchSize',
+  'tagTree.leafDecayFloor',
   'identity.eventTimePolicy',
 ]);
 

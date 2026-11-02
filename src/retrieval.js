@@ -18,6 +18,7 @@
 
 import { decayFactor } from './decay.js';
 import { normaliseTagToken } from './policy.js';
+import { classifyHit, parseTagPath, DAY_MS } from './tagTreeRebuild.js';
 import { clamp, round, snippet } from './util.js';
 
 const TOKEN_RE = /[a-z0-9]{2,}|[\u4e00-\u9fff]{1,}/gi;
@@ -79,6 +80,163 @@ export function applyConfidence(hits = [], min = MIN_INJECT_CONFIDENCE) {
   });
   const low = out.filter((hit) => hit.lowConfidence === true).length;
   return { hits: out, notes: low > 0 ? [`low-confidence-hints:${low}`] : [] };
+}
+
+function isoTimestamp(epochMs) {
+  return new Date(epochMs).toISOString();
+}
+
+/**
+ * Ghost-mid degradation: anti-hallucination on a fading branch.
+ *
+ * A hit whose tags reach it ONLY through a mid-level tag (`tech/frontend`) is not
+ * concrete evidence once that mid is in its grace window — the leaf-level facts
+ * below it are dead, and injecting a broad summary as if it were a remembered
+ * detail is exactly how a model starts inventing the specifics. Such hits are
+ * removed from `hits` (body, snippet and score never reach the prompt) and replaced
+ * by one metadata hint per mid: path, count, remaining grace and the exact
+ * `deep_raw` time window that WOULD return the verbatim turns.
+ *
+ * Hits that carry a leaf path or a flat tag stay direct: a specific memory is
+ * specific, whatever state its siblings are in.
+ *
+ * A query that EXPLICITLY names a fading mid (`tags: ["tech/frontend"]`) but finds
+ * no live episode under it is not an empty answer either: it gets the same metadata
+ * hint (count 0) instead of silence, so the model knows a fuzzy memory exists and
+ * where the verbatim turns are.
+ *
+ * @param {Array<object>} hits retrieval hits (tags are canonical tag strings)
+ * @param {Array<{name: string, parentId?: string|null, graceUntil?: number|null}>} ghosts
+ * @param {{now?: number, queryTags?: string[]}} [options]
+ */
+export function degradeGhostHits(hits = [], ghosts = [], { now = 0, queryTags = [] } = {}) {
+  const list = Array.isArray(hits) ? hits : [];
+  const ghostList = (Array.isArray(ghosts) ? ghosts : []).filter(
+    (ghost) => ghost && typeof ghost.name === 'string' && ghost.name.length > 0,
+  );
+  if (ghostList.length === 0) return { hits: list, ghostHints: [], notes: [] };
+
+  const byName = new Map(ghostList.map((ghost) => [ghost.name, ghost]));
+  // Ghosts are matched by FULL path when the root is known: two namespaces can both
+  // have a mid called `frontend`, and `web/frontend` must not be degraded because
+  // `tech/frontend` is fading. A ghost without a root falls back to its name.
+  const ghostPathOf = (ghost) => {
+    const rootName = typeof ghost?.parentId === 'string' ? ghost.parentId.replace(/^root:/, '') : null;
+    return rootName ? `${rootName}/${ghost.name}` : null;
+  };
+  const byPath = new Map();
+  for (const ghost of ghostList) {
+    const path = ghostPathOf(ghost);
+    if (path !== null && !byPath.has(path)) byPath.set(path, ghost);
+  }
+  const ghostForPath = (root, mid) => {
+    if (!root || !mid) return null;
+    const byFull = byPath.get(`${root}/${mid}`);
+    if (byFull) return byFull;
+    // A rootless ghost is a last resort: the tree could not name its root.
+    const byNameGhost = byName.get(mid) ?? null;
+    return byNameGhost && ghostPathOf(byNameGhost) === null ? byNameGhost : null;
+  };
+  const kept = [];
+  const groups = new Map();
+
+  const groupFor = (ghost) => {
+    const ghostPath = ghostPathOf(ghost) ?? ghost.name;
+    let group = groups.get(ghostPath);
+    if (group) return group;
+    group = {
+      mid: ghost.name,
+      path: ghostPath,
+      count: 0,
+      tags: new Set(),
+      start: null,
+      end: null,
+      graceUntil: Number.isFinite(ghost?.graceUntil) ? ghost.graceUntil : null,
+    };
+    groups.set(ghostPath, group);
+    return group;
+  };
+
+  // Query-scoped hint: only when the recall found nothing at all. If concrete hits
+  // exist they already answer the query, and the per-hit rule above decides.
+  if (list.length === 0) {
+    for (const tag of Array.isArray(queryTags) ? queryTags : []) {
+      if (typeof tag !== 'string') continue;
+      const path = parseTagPath(tag);
+      if (!path || !path.mid) continue;
+      const ghost = ghostForPath(path.root, path.mid);
+      if (ghost) groupFor(ghost).tags.add(tag);
+    }
+  }
+
+  for (const hit of list) {
+    const tags = Array.isArray(hit?.tags) ? hit.tags.filter((tag) => typeof tag === 'string') : [];
+    if (classifyHit(tags, ghostList) !== 'path-only') {
+      kept.push(hit);
+      continue;
+    }
+    let ghost = null;
+    const matchedTags = [];
+    for (const tag of tags) {
+      const path = parseTagPath(tag);
+      if (!path || !path.mid) continue;
+      const candidate = ghostForPath(path.root, path.mid);
+      if (!candidate) continue;
+      if (ghost === null) ghost = candidate;
+      if (candidate === ghost) matchedTags.push(tag);
+    }
+    if (ghost === null) {
+      // Same mid name, different namespace: classifyHit is name-keyed, but the full
+      // path decides whether THIS hit really sits under a fading branch.
+      kept.push(hit);
+      continue;
+    }
+    const group = groupFor(ghost);
+    group.count += 1;
+    for (const tag of matchedTags) group.tags.add(tag);
+    // The deep_raw hint must point at a REAL time window: the raw shards are filed
+    // by the day the turn was logged, so use the diary `day` (anchor time). The
+    // event_time coordinate can be content-hash derived and is not a wall-clock fact.
+    const day = typeof hit?.day === 'string' ? hit.day : null;
+    const dayStart = day ? Date.parse(`${day}T00:00:00.000Z`) : null;
+    const at = Number.isFinite(dayStart) ? dayStart : Number.isFinite(hit?.eventTime) ? hit.eventTime : null;
+    if (at !== null) {
+      group.start = group.start === null ? at : Math.min(group.start, at);
+      const endAt = Number.isFinite(dayStart) ? dayStart + DAY_MS - 1 : at;
+      group.end = group.end === null ? endAt : Math.max(group.end, endAt);
+    }
+  }
+
+  if (groups.size === 0) return { hits: list, ghostHints: [], notes: [] };
+
+  const ghostHints = [...groups.values()]
+    .sort((a, b) => b.count - a.count || a.mid.localeCompare(b.mid))
+    .map((group) => {
+      const daysLeft = group.graceUntil === null ? null : Math.max(0, Math.ceil((group.graceUntil - now) / DAY_MS));
+      const window = group.start === null ? null : { start: group.start, end: group.end };
+      const range =
+        window === null
+          ? 'start_time="<起>", end_time="<止>"'
+          : `start_time="${isoTimestamp(window.start)}", end_time="${isoTimestamp(window.end)}"`;
+      const found = group.count > 0 ? `共 ${group.count} 条` : '索引中已无实体命中';
+      return {
+        mid: group.mid,
+        path: group.path,
+        count: group.count,
+        tags: [...group.tags].sort(),
+        graceUntil: group.graceUntil,
+        graceDaysLeft: daysLeft,
+        window,
+        hint: `检测到关于[${group.mid}]的模糊记忆（路径 ${group.path}），${found}；具体摘要未注入以防幻觉，请使用 memory_recall(mode="deep_raw", ${range}) 查阅原话`,
+      };
+    });
+
+  const degraded = list.length - kept.length;
+  return {
+    hits: kept,
+    ghostHints,
+    notes: [degraded > 0 ? `ghost-degraded:${degraded}:mids=${ghostHints.length}` : `ghost-hints:${ghostHints.length}`],
+  };
 }
 
 export function recall({ index, query = {}, policy, now, semantic = [], tempSemantic = [], associations = [] }) {

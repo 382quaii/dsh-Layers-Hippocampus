@@ -18,6 +18,7 @@ const PANEL_KEYS = [
   'maintenance',
   'generations',
   'graph',
+  'tagTree',
   'raw',
   'reviews',
   'pendingDeletes',
@@ -51,6 +52,18 @@ test('the status panel has the full documented shape', async () => {
       'logGen',
       'logGeneration',
     ]);
+    assert.deepEqual(Object.keys(panel.tagTree).sort(), [
+      'available',
+      'generatedAt',
+      'ghostCount',
+      'leaves',
+      'mids',
+      'nodeCount',
+      'pendingQueue',
+      'roots',
+      'sourceIndexGeneration',
+      'stale',
+    ]);
 
     // Values, not just keys.
     assert.equal(panel.generatedAt, T0);
@@ -67,6 +80,7 @@ test('the status panel has the full documented shape', async () => {
     assert.equal(panel.generations.indexGen, 'gen-000001', 'boot publishes an index generation (empty store)');
     assert.equal(panel.generations.indexGeneration, 1);
     assert.equal(panel.tokens.cumulativeSavedTokens, 0);
+    assert.equal(panel.tagTree.available, false, 'no tag tree exists before the first maintenance pass');
   } finally {
     cleanup();
   }
@@ -97,6 +111,10 @@ test('the panel follows writes: events, generations and last success', async () 
     );
     assert.equal(panel.maintenance.lastSuccessAt, clock.now());
     assert.ok(panel.storage.diskBytes > 0, 'the data directory is measured, not assumed');
+    assert.equal(panel.tagTree.available, true, 'maintenance publishes the tag tree');
+    assert.equal(panel.tagTree.nodeCount, 1, 'one flat root for the preference tag');
+    assert.equal(panel.tagTree.ghostCount, 0);
+    assert.equal(panel.tagTree.stale, false);
   } finally {
     cleanup();
   }

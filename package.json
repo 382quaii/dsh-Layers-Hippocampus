@@ -1,6 +1,6 @@
 {
   "name": "dsh-layers-hippocampus",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "private": false,
   "description": "Layered long-term memory for DeepSeek Harness: append-only event log, rebuildable tag index, day diaries, independent semantic layer, L2.5 trend quarantine, offline knowledge graph and a Web UI panel.",
   "type": "module",
@@ -53,7 +53,8 @@
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
-    "docs/*.md",
+    "docs/ARCHITECTURE.zh.md",
+    "docs/PUBLISHING.md",
     "market/**/*.yml",
     "market/*.md"
   ],

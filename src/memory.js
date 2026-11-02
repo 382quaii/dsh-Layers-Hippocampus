@@ -37,7 +37,8 @@ import { ReviewSchedule } from './schedule.js';
 import { PendingDeletes } from './pendingDelete.js';
 import { foldRecords } from './index/buildIndex.js';
 import { Maintenance } from './maintenance.js';
-import { applyConfidence, recall as runRecall, tokenize } from './retrieval.js';
+import { TagTreeCache, eventsFromIndex } from './tagTreeCache.js';
+import { applyConfidence, degradeGhostHits, recall as runRecall, tokenize } from './retrieval.js';
 import { SemanticStore } from './semantic/semanticStore.js';
 import { TempSemanticStore } from './semantic/tempSemantic.js';
 import { ContextEngine } from './context/contextEngine.js';
@@ -272,6 +273,8 @@ export class Memory {
     this.semanticStore = new SemanticStore({ root: this.paths.semantic });
     // Offline graph projection: rebuilt by maintain(), read as a slice by the API.
     this.graph = new GraphCache({ dataDir: this.dataDir, clock: this.clock });
+    // L1.5 tag tree: hierarchy/ghost projection, also rebuilt by maintain() only.
+    this.tagTree = new TagTreeCache({ dataDir: this.dataDir, clock: this.clock, getConfig: () => this.config });
     // Forensic raw turns: never indexed, never loaded at boot, only deep_raw/prune.
     this.raw = new RawStore({ dataDir: this.dataDir, clock: this.clock, getConfig: () => this.config });
     // Engine-owned review schedule and pending-delete queue.
@@ -729,6 +732,7 @@ export class Memory {
         degradedReason: 'no-index-yet',
         generation: null,
         hits: [],
+        ghostHints: [],
         semantic: [],
         tempSemantic: this.tempStore.list({ status: 'temp', now }),
         scanned: { blocks: 0, candidates: 0, scored: 0, tagHits: 0 },
@@ -750,10 +754,17 @@ export class Memory {
       associations,
     });
     const confidenceMin = this.config?.context?.minInjectConfidence ?? 0.6;
-    const confidence = applyConfidence(result.hits ?? [], confidenceMin);
+    // Anti-hallucination: a hit reached only through a mid inside its grace window
+    // loses its body before it can reach the model; the hint points at deep_raw.
+    const ghostPass = degradeGhostHits(result.hits ?? [], this.ghostHints(), {
+      now,
+      queryTags: result.query?.tags ?? [],
+    });
+    const confidence = applyConfidence(ghostPass.hits, confidenceMin);
     return {
       ...result,
       hits: confidence.hits,
+      ghostHints: ghostPass.ghostHints,
       stale: this._boot ? this._boot.status !== 'ok' : false,
       associations,
       // A count, not the resident list: the online queue may read the active set
@@ -761,11 +772,26 @@ export class Memory {
       activeTagCount: view.activeSet?.entries?.length ?? 0,
       notes: [
         ...(result.notes ?? []),
+        ...ghostPass.notes,
         ...confidence.notes,
         ...(associations.length > 0 ? [`graph-associations:${associations.length}`] : []),
         ...(this._boot && this._boot.status !== 'ok' ? [`boot-check:${this._boot.status}`] : []),
       ],
     };
+  }
+
+  /**
+   * Ghost mids from the cached tag tree, read-only. The cache is best-effort: a
+   * missing or unreadable file means "no ghosts to protect against", never a failed
+   * recall.
+   */
+  ghostHints() {
+    try {
+      const ghosts = this.tagTree.read()?.ghosts;
+      return Array.isArray(ghosts) ? ghosts : [];
+    } catch {
+      return [];
+    }
   }
 
   /**
@@ -938,6 +964,24 @@ export class Memory {
     } catch (error) {
       report.reviewsError = error instanceof Error ? error.message : String(error);
     }
+    // L1.5 tag tree: a projection of the NOW-converged index (pending deletes may
+    // have forced a nested rebuild above). Published to state/tag-tree.json with the
+    // ghost metadata and the persisted prune queue, so a failure here is a side
+    // effect — it must never fail the maintenance pass or block recall.
+    try {
+      const view = this.indexManager.snapshot();
+      const record = this.tagTree.rebuild({
+        events: eventsFromIndex(view?.events ?? []),
+        indexGeneration: this.indexManager.generation,
+        now: this.clock.now(),
+      });
+      report.tagTree = {
+        ...this.tagTree.status({ indexGeneration: this.indexManager.generation }),
+        prune: record.prune,
+      };
+    } catch (error) {
+      report.tagTreeError = error instanceof Error ? error.message : String(error);
+    }
     this.refreshBriefing();
     return report;
   }
@@ -955,6 +999,16 @@ export class Memory {
   graphView(limit) {
     this.assertOpen();
     return this.graph.view({ limit: limit ?? this.config?.graphMaxEdges ?? 500 });
+  }
+
+  /**
+   * Route payload for the graph's history view: the cached ghost metadata only.
+   * The full tag hierarchy stays in `state/tag-tree.json`; shipping it per request
+   * would put a derived cache on the request path for no benefit.
+   */
+  tagTreeView(options = {}) {
+    this.assertOpen();
+    return this.tagTree.view(options);
   }
 
   // ---- L2.5 trend quarantine ---------------------------------------------
@@ -1154,6 +1208,9 @@ export class Memory {
         generations: generation,
         // Cached graph summary: counts only, so the panel stays cheap.
         graph: this.graph.status({ limit: this.config?.graphMaxEdges ?? null, indexGeneration: index.generation ?? null }),
+        // L1.5 tag-tree summary: node/ghost counts only. The full hierarchy is read
+        // from state/tag-tree.json by the graph route, never assembled per request.
+        tagTree: this.tagTree.status({ indexGeneration: index.generation ?? null }),
         // v1.4.0 surfaces: raw shards, review queue, pending deletes.
         raw: { ...this.raw.stats(), mode: this.config?.raw?.mode ?? 'salience' },
         reviews: this.reviews.status({ now }),

@@ -690,6 +690,7 @@ export function toMemoryOptions(config) {
       delete: config.delete,
       review: config.review,
       migration: config.migration,
+      tagTree: config.tagTree,
     },
   };
 }

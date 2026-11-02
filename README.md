@@ -4,7 +4,7 @@
 
 | | |
 | --- | --- |
-| 版本 | **1.4.1** |
+| 版本 | **1.4.2** |
 | 包名 | `dsh-layers-hippocampus`（npm 只允许小写；仓库名保留 `dsh-Layers-Hippocampus`，*Hippocampus* 双 **p**） |
 | 仓库 | <https://github.com/382quaii/dsh-Layers-Hippocampus> |
 | 许可证 | MIT |
@@ -18,7 +18,7 @@
 ### 从 GitHub
 
 ```bash
-pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.4.1"
+pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.4.2"
 ```
 
 ### 从 npm
@@ -57,7 +57,7 @@ node scripts/wait-for-routes.mjs
 | --- | --- |
 | `remember` | 追加一条长期记忆（内容哈希幂等）；可带 `media_url` + `media_type` 指向附件 |
 | `checkpoint` | 记录**唯一**进行中的重任务：`task_id`、`progress`（0–100）、`updated_at` |
-| `recall` | 关键词 + 标签检索，衰减加权，含图谱联想；`mode: "deep_raw"` 走受限 raw 扫描 |
+| `recall` | 关键词 + 标签检索，衰减加权，含图谱联想；宽限中 mid 的命中只回**元数据**并引导 `deep_raw`；`mode: "deep_raw"` 走受限 raw 扫描 |
 | `capture` | 把**一轮原始对话**存入取证层（受门控与预算限制，不进索引） |
 | `reinforce` | 确认一次记忆，不重写内容，并推进复习档位 |
 | `forget` / `restore` | 两阶段删除（`pending_delete` 倒计时）与取消/反墓碑 |
@@ -109,9 +109,20 @@ node scripts/wait-for-routes.mjs
 
 1. **L1 事件日志**：追加式 JSONL 代际 + `CURRENT` 指针。
 2. **L2 索引**：标签表、活跃集合、日记、墓碑；A/B 双缓冲，读者永远看不到半成品。
-3. **L2.5 趋势隔离**：短命观察，经晋升窗口与突发检测才升级为记忆（情景可删，模式不删）。
-4. **L3 语义层**：摘要独立于原始日志生死。
-5. **图谱**：标签共现网络的离线投影。
+3. **L1.5 标签层级树**：root/mid/leaf 三层寿命 + 宽限幽灵；派生缓存，`state/tag-tree.json`。
+4. **L2.5 趋势隔离**：短命观察，经晋升窗口与突发检测才升级为记忆（情景可删，模式不删）。
+5. **L3 语义层**：摘要独立于原始日志生死。
+6. **图谱**：标签共现网络的离线投影。
+
+### L1.5 标签层级树与幽灵节点
+
+层级标签按 `/` 解析为 **root / mid / leaf** 三层（`tech/frontend/vue3`），三种寿命：
+
+- **root 永生**：`tech` 这类命名空间根，永不删除；无 `/` 的扁平标签（`project:dsh`）同样是受保护的根。
+- **leaf 引用归零即死**：它的所有事件被遗忘后进入待修剪队列；`maintain()` 每次只消费 `tagTree.pruneBatchSize`（默认 100）条，队列落盘、跨重启分批排空——**绝不一次维护风暴**。
+- **mid 宽限**：失去最后一个叶子后进入 `midGracePeriodDays`（默认 30 天）宽限期（`graceUntil`）。期内挂上新叶子会立即复活；期内它叫**幽灵节点（ghost）**，只存在于 `state/tag-tree.json` 的 `ghosts` 里；宽限到期且衰减低于地板后才真正消亡。
+- **反幻觉降级**：`memory_recall` 对只经由宽限 mid 到达的命中，**整条正文（snippet/content）不会进入结果或提示词**，只返回一条元数据：`幽灵节点 path、共 N 条、宽限期还剩几天、deep_raw 时间窗`，引导模型去查原话。点名一个宽限 mid 却没有实体命中时，也返回 `count: 0` 的同一提示而不是静默空结果。
+- **派生缓存**：整个标签树由 `maintain()` 从收敛后的索引投影，随后与上一份缓存**carry-forward**（已失去全部活引用的节点以 `refCount=0` 接回，孤儿丢弃），所以生命周期跨维护可观察。`state/tag-tree.json` 可随时删除——只会丢失幽灵历史，活树下次维护照常重建。
 
 ### 身份纪律
 
@@ -157,6 +168,10 @@ node scripts/wait-for-routes.mjs
 | `raw.captureTools` | `false` | 布尔（`isError` 工具结果始终捕获） |
 | `delete.graceHours` | `24` | 0 – 168（0 = 立即执行） |
 | `review.enabled` | `true` | 布尔 |
+| `tagTree.midHalfLifeMultiplier` | `3` | 1 – 10；mid 半衰期 = 倍率 × leaf 半衰期（1 天） |
+| `tagTree.midGracePeriodDays` | `30` | 7 – 180；mid 失去最后一个叶子后的宽限天数（幽灵期） |
+| `tagTree.pruneBatchSize` | `100` | 10 – 500；每次维护最多修剪的待删叶子数（有界批次） |
+| `tagTree.leafDecayFloor` | `0` | 0 – 1；0 = 只按引用归零死亡，>0 时低于地板的排队叶子被修剪 |
 | `migration.timeoutMs` | `600000` | 10000 – 3600000 |
 
 错误码稳定：`MEM_E_CONFIG_INVALID_CRON`、`MEM_E_CONFIG_OUT_OF_RANGE`、`MEM_E_CONFIG_UNKNOWN_KEY` 等。
@@ -199,7 +214,8 @@ Cron **和** 空闲 Dream 触发调用同一个入口 `runtime.runMaintenance(so
 - **环形图**：纯 SVG，预算来自 `storageBudgetMb`；中心同时显示用量与百分比，超预算时弧线截断为整圈并整体标红。
 - **知识图谱**：力导向布局**只计算一次**并冻进 ref（弹簧 + 斥力 + 向心），随后节点逐个入场；边只在**两端节点都已入场**后绘制，不会有悬空线；孤立节点带随机抖动。
   - **拖拽**：`onPointerDown/Move/Up` + `setPointerCapture`；拖拽期间只改 ref 坐标并直接写 DOM（`transform` 与线段端点），**不触发 setState**；松手后解除 pin，对 1 跳邻域做 alpha 衰减的局部松弛；位移 < 4px 仍算点击（切换标签）。
-- **设置页**：开关（Dream / Reflection / briefing / promptSection / autoMaintainOnBoot / injectPrompt）、数字（含上下限与客户端预检）、下拉（`identity.eventTimePolicy`）、Cron 文本框；保存一次性提交带点号路径的 patch，后端 fail-fast 失败时顶部红色横幅显示 `MEM_E_CONFIG_*`，成功后广播 `config-changed`，面板立即重拉 stats 与 graph。
+  - **幽灵节点与历史开关**：图谱接口在同一次响应里带 `tagTree.ghosts`（渲染上限 50 条，含 `totalGhosts`/`truncated`）；"仅活跃 / 历史全貌"开关用 CSS `opacity` 420ms 过渡淡入淡出（布局键不含开关状态，切换**不会重排**）。历史里的 mid 渲染为半透明虚线圆，挂在父 root 下，hover 有 `title` 提示剩余宽限期。
+- **设置页**：开关（Dream / Reflection / briefing / promptSection / autoMaintainOnBoot / injectPrompt）、数字（含上下限与客户端预检）、滑块 + 数字框（L1.5 四个寿命旋钮，label 的 `title` 是场景化 Tooltip）、下拉（`identity.eventTimePolicy`）、Cron 文本框；保存一次性提交带点号路径的 patch，后端 fail-fast 失败时顶部红色横幅显示 `MEM_E_CONFIG_*`，成功后广播 `config-changed`，面板立即重拉 stats 与 graph。
 - UI 不调用 Agent 工具，只读下面的 JSON 路由。
 
 ### 截图
@@ -221,7 +237,7 @@ Cron **和** 空闲 Dream 触发调用同一个入口 `runtime.runMaintenance(so
 | `GET` | `/api/hippocampus/stats` | `{ ok, state, phase, panel, briefing, config }`；未就绪 `503` |
 | `GET` | `/api/hippocampus/config` | 可编辑配置子集（`ready` 前也可读，用于回填表单） |
 | `POST` | `/api/hippocampus/config` | `{ patch }` → fail-fast 校验 → 生效 → 尽量持久化 |
-| `GET` | `/api/hippocampus/graph` | 缓存图谱，`.slice(0, graphMaxEdges)` |
+| `GET` | `/api/hippocampus/graph` | 缓存图谱，`.slice(0, graphMaxEdges)`；同时带 `tagTree.ghosts`（历史视图的幽灵元数据） |
 | `POST` | `/api/hippocampus/retry` | 重试 `failed` 启动（`202`） |
 
 图谱路由**不排序、不读日志**：缓存由 `maintain()` 写入，路由只做切片。
@@ -236,11 +252,11 @@ Cron **和** 空闲 Dream 触发调用同一个入口 `runtime.runMaintenance(so
   index/        gen-*/ + CURRENT          A/B 投影
   identity/     ledger.json               幂等 + 墓碑
   semantic/     摘要 + temp.json          独立语义流
-  state/        context.json、maintenance.json、graph.json、months.json、active-task.json
+  state/        context.json、maintenance.json、graph.json、tag-tree.json、months.json、active-task.json
   journal/      删除流水账
 ```
 
-删掉 `index/`、`state/graph.json`、`state/months.json` 都安全：它们会从日志重建（月记会按已生成月份重新补齐）。
+删掉 `index/`、`state/graph.json`、`state/tag-tree.json`、`state/months.json` 都安全：它们会从日志重建（月记会按已生成月份重新补齐；标签树会重建活树，只丢失幽灵历史）。
 
 ## 从旧名字迁移
 
@@ -251,7 +267,7 @@ Cron **和** 空闲 Dream 触发调用同一个入口 `runtime.runMaintenance(so
 ## 开发与验证
 
 ```bash
-npm test      # node test/run.mjs —— 160 个进程内用例，30 秒看门狗
+npm test      # node test/run.mjs —— 189 个进程内用例，30 秒看门狗
 npm run check # 语法检查 + 全量测试
 ```
 
@@ -280,7 +296,7 @@ node scripts/check-binding.mjs --port 55879
 
 ## 变更记录
 
-见 [CHANGELOG.md](CHANGELOG.md)（当前 **1.4.0**：raw 原始回合取证 / 间隔重复 / 两阶段删除 / UI 数据目录迁移；1.3.1：冷启动 404；1.3.0：折叠 / 联想 / 月记）。
+见 [CHANGELOG.md](CHANGELOG.md)（当前 **1.4.2**：L1.5 标签层级树 / 宽限幽灵 / 检索降级 / 图谱历史视图；1.4.1：提示词软引导 / 工具瘦身 / 置信度 / 洪峰防护；1.4.0：raw 原始回合取证 / 间隔重复 / 两阶段删除 / UI 数据目录迁移）。
 
 ## 许可
 

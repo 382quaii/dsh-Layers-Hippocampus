@@ -467,12 +467,32 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
   runtime.graphPayload = async () => {
     const view = runtime.phaseView();
     if (runtime.phase !== 'ready') {
-      return { ok: false, ...view, graph: { available: false, nodes: [], edges: [], totalEdges: 0, limit: runtime.config.graphMaxEdges } };
+      return {
+        ok: false,
+        ...view,
+        graph: { available: false, nodes: [], edges: [], totalEdges: 0, limit: runtime.config.graphMaxEdges },
+        tagTree: { available: false, ghosts: [] },
+      };
     }
     try {
-      return { ok: true, phase: runtime.phase, state: runtime.phase, graph: runtime.memory.graphView(runtime.config.graphMaxEdges) };
+      const graph = runtime.memory.graphView(runtime.config.graphMaxEdges);
+      // The same response carries the ghost metadata the history view needs: a
+      // derived cache read, never a scan. No nodes are shipped twice (ghosts only).
+      return {
+        ok: true,
+        phase: runtime.phase,
+        state: runtime.phase,
+        graph,
+        tagTree: runtime.memory.tagTreeView(),
+      };
     } catch (error) {
-      return { ok: false, ...view, error: asMemoryError(error).toJSON(), graph: { available: false, nodes: [], edges: [], limit: runtime.config.graphMaxEdges } };
+      return {
+        ok: false,
+        ...view,
+        error: asMemoryError(error).toJSON(),
+        graph: { available: false, nodes: [], edges: [], limit: runtime.config.graphMaxEdges },
+        tagTree: { available: false, ghosts: [] },
+      };
     }
   };
 
@@ -502,6 +522,13 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
         ...liveMemory.policy,
         candidates: { ...liveMemory.policy.candidates, topK: next.retrieval.topK },
       };
+    }
+    // Live config groups (raw limits, retrieval confidence, tagTree lifetimes, …)
+    // are read through `memory.config` on every pass. Project the validated config
+    // onto the running facade instead of waiting for a reload: the settings page
+    // promises "保存后立即生效".
+    if (liveMemory) {
+      liveMemory.config = { ...(liveMemory.config ?? {}), ...toMemoryOptions(next).config };
     }
     emit({ type: 'config', config: uiConfig(next) });
     return next;
@@ -712,6 +739,8 @@ function uiConfig(config) {
     review: config.review,
     migration: config.migration,
     identity: { eventTimePolicy: config.identity.eventTimePolicy },
+    // L1.5: the four editable knobs are nested so the form's dotted keys map 1:1.
+    tagTree: config.tagTree,
     // Convenience mirrors kept for older clients; the form uses the nested form.
     eventTimePolicy: config.identity.eventTimePolicy,
     retrievalTopK: config.retrieval.topK,
@@ -945,7 +974,9 @@ export async function apply(ctx, rawConfig = {}) {
         description:
           'Retrieve memories: diary blocks coarsely filter, then events are ranked by tag match, lexical overlap and ' +
           'decay x salience, with graph-neighbour association (0.5 penalty). Read-only — no adjudication, no writes. ' +
-          'Use mode="deep_raw" to search the bounded raw-turn shards when episode-level detail is not enough; that ' +
+          'A hit reached only through a fading (ghost) mid returns metadata in ghostHints instead of its body — ' +
+          'do not reconstruct its detail from memory; use mode="deep_raw" with the hinted time window for the verbatim ' +
+          'turns. Use mode="deep_raw" to search the bounded raw-turn shards when episode-level detail is not enough; that ' +
           'scan has a byte/turn budget and reports truncated=true when it stops early.',
         parameters: {
           text: { type: 'string', description: 'What to search for' },
@@ -999,7 +1030,9 @@ export async function apply(ctx, rawConfig = {}) {
               tags: args.tags ?? [],
               topK: Math.min(args.top_k ?? config.retrieval.topK, config.maxRecallTopK),
             });
-            runtime.recordToolCall({ landed: (result.hits ?? []).length > 0 });
+            runtime.recordToolCall({
+              landed: (result.hits ?? []).length > 0 || (result.ghostHints ?? []).length > 0,
+            });
             if (runtime.phase === 'ready' && config.context.injectPrompt) {
               injectRecall(runtime, result);
             }
