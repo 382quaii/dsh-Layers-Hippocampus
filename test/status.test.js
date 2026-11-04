@@ -26,6 +26,12 @@ const PANEL_KEYS = [
   // space panel read these two groups; they are part of the UI contract.
   'session',
   'spaces',
+  // v1.5.5: offline Dream circuit + last fallback (never a silent degradation).
+  'dream',
+  // v1.5.6: pre-ingest tagging health (applied anchors / anchorless misses).
+  'autoTag',
+  // v1.5.6: L2 multi-merge bookkeeping.
+  'l2Merge',
 ].sort();
 
 test('the status panel has the full documented shape', async () => {
@@ -35,7 +41,7 @@ test('the status panel has the full documented shape', async () => {
     const panel = status.panel;
 
     assert.deepEqual(Object.keys(panel).sort(), PANEL_KEYS);
-    assert.deepEqual(Object.keys(panel.global).sort(), ['activeTags', 'events', 'semanticSummaries', 'tempQuarantined']);
+    assert.deepEqual(Object.keys(panel.global).sort(), ['activeTags', 'events', 'pinned', 'semanticSummaries', 'tempQuarantined']);
     assert.deepEqual(Object.keys(panel.tokens).sort(), [
       'contextMaxTokens',
       'contextTokens',

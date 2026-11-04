@@ -21,7 +21,7 @@ import {
   SPACE_ID_PATTERN,
   SpaceRouter,
   normaliseSpaceId,
-} from '../src/spaces/spaceRouter.js';
+} from '../../dsh-orchestrator/src/spaceRouter.js';
 import { FakeClock, T0, tempDir } from './helpers.js';
 
 /**
@@ -145,6 +145,7 @@ test('spaces are isolated directories and unsafe ids are rejected', async () => 
     assert.deepEqual(router.all(), ['default', 'a', 'b']);
     assert.deepEqual(router.status(), {
       available: true,
+      multiSpace: true,
       ids: ['default', 'a', 'b'],
       open: ['a', 'b'],
       defaultSpaceId: 'default',

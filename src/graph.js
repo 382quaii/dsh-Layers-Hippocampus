@@ -22,6 +22,7 @@
 
 import path from 'node:path';
 import { ensureDir, readJson, round, writeJsonAtomic } from './util.js';
+import { isSystemReservedTag } from './utils/reservedTags.js';
 
 /** Hard ceiling of the cached graph (not the read-time limit). */
 export const GRAPH_HARD_CAP = 2000;
@@ -49,7 +50,8 @@ export function buildGraph(events = [], { maxEdges = GRAPH_HARD_CAP, topNeighbor
   const nodeEvents = new Map(); // tag -> event count
 
   for (const event of events) {
-    const tags = (event?.tags ?? []).map((entry) => nodeId(entry.tag)).filter(Boolean);
+    // v1.5.6: system bookkeeping tags never enter the user-facing graph.
+    const tags = (event?.tags ?? []).map((entry) => nodeId(entry.tag)).filter((tag) => tag && !isSystemReservedTag(tag));
     if (tags.length === 0) continue;
     const unique = [...new Set(tags)].sort();
     const salience = Number.isFinite(event?.salience) ? event.salience : 0.5;
@@ -198,7 +200,10 @@ export class GraphCache {
       return { available: false, nodes: [], edges: [], totalEdges: 0, edgeCount: 0, nodeCount: 0, generatedAt: null, limit };
     }
     const safeLimit = Math.max(0, Math.min(Number(limit) || 0, GRAPH_HARD_CAP));
-    const edges = graph.edges.slice(0, safeLimit);
+    // Defensive filter: an older cached graph may still contain reserved nodes.
+    const edges = graph.edges
+      .filter((edge) => !isSystemReservedTag(edge.source) && !isSystemReservedTag(edge.target))
+      .slice(0, safeLimit);
     const visible = new Set();
     for (const edge of edges) {
       visible.add(edge.source);
@@ -206,7 +211,7 @@ export class GraphCache {
     }
     return {
       available: true,
-      nodes: graph.nodes.filter((node) => visible.has(node.id)),
+      nodes: graph.nodes.filter((node) => visible.has(node.id) && !isSystemReservedTag(node.id)),
       edges,
       nodeCount: graph.nodeCount,
       edgeCount: edges.length,

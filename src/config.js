@@ -82,6 +82,9 @@ export const CONFIG_KEYS = Object.freeze([
   'autoMaintainOnBoot',
   'enableDream',
   'dreamIdleMinutes',
+  // Offline LLM distillation (v1.5.5). The endpoint/model/key are injected here or
+  // through DSH_DREAM_LLM_* env; the plugin itself never hard-codes a credential.
+  'dream',
   'enableReflection',
   'graphMaxEdges',
   'storageBudgetMb',
@@ -103,6 +106,14 @@ export const CONFIG_KEYS = Object.freeze([
   // Tool schema pruning (v1.5.3): every registered tool costs prompt tokens on
   // every turn through its JSON schema, so low-frequency tools are opt-out.
   'tools',
+  // Pre-ingest tagging (v1.5.6): engine-side tag extraction for untagged writes.
+  'tagging',
+  // Optional capabilities (v1.5.6): the microkernel boundary. Turning these off
+  // removes the space tools and makes the space/transfer routes answer
+  // MEM_E_FEATURE_DISABLED instead of silently doing nothing.
+  'features',
+  // L2 multi-merge (v1.5.6): offline condensation of duplicate same-tag episodes.
+  'l2Merge',
   'policy',
 ]);
 
@@ -127,6 +138,27 @@ export const DEFAULT_CONFIG = Object.freeze({
   autoMaintainOnBoot: true,
   enableDream: true,
   dreamIdleMinutes: 180,
+  // v1.5.5: offline semantic distillation. The LLM leg is optional — when
+  // `dream.llm` is not configured the engine silently uses the deterministic local
+  // merge (and logs MEM_E_DREAM_LLM_FALLBACK), so Dream always completes.
+  dream: Object.freeze({
+    useLlm: true,
+    minGroupSize: 3,
+    maxGroupsPerRun: 5,
+    maxSummaryChars: 200,
+    maxSourceChars: 400,
+    maxEventsPerGroup: 8,
+    llmTimeoutMs: 15_000,
+    failureThreshold: 3,
+    cooldownMinutes: 60,
+    // Host lifecycle compensation (P1-7): on a session start, if no Dream ran for
+    // this many hours AND the price window permits, run one compensating Dream.
+    compensateAfterHours: 24,
+    // v1.5.6 local scheduler: LLM Dream waits for the DeepSeek low-valley window
+    // (Beijing 09–12 / 14–18 are peak) instead of requiring an external price plugin.
+    onlyLowValley: true,
+    llm: Object.freeze({ baseUrl: null, model: null, apiKey: null }),
+  }),
   enableReflection: true,
   // Edges returned by /api/memory/graph. The offline cache may hold up to
   // GRAPH_HARD_CAP; this is the read-time ceiling, so changing it is cheap.
@@ -141,6 +173,10 @@ export const DEFAULT_CONFIG = Object.freeze({
   index: Object.freeze({ maxPostingsPerTag: 500 }),
   context: Object.freeze({
     maxTokens: 4000,
+    // v1.5.6: hard ceiling on the JSON payload ONE recall may hand back. Distinct
+    // from the window budget: this bounds the response itself, so a broad query
+    // cannot flood the caller's context before the window engine ever sees it.
+    maxInjectTokens: 4000,
     threshold: 0.85,
     target: 0.7,
     injectPrompt: true,
@@ -201,6 +237,18 @@ export const DEFAULT_CONFIG = Object.freeze({
   // Default is "everything on" so behaviour is unchanged unless an operator opts
   // out; core tools (remember/recall/admin) can never be listed here.
   tools: Object.freeze({ disabled: [] }),
+  // Pre-ingest tagging (v1.5.6): model tags win; when a write carries none, the
+  // engine derives up to `maxTags` anchors from content shape (error type, errno,
+  // code fence, HTTP status, file path, task statement). `autoTag:false` disables
+  // the heuristic entirely (manual behaviour stays unchanged either way).
+  tagging: Object.freeze({ autoTag: true, maxTags: 2 }),
+  // v1.5.6 microkernel boundary. Default ON so behaviour is unchanged; turning
+  // multiSpace off makes the engine a strict single-space core (targetSpaceId must
+  // be "default"), and crossSpaceTransfer requires multiSpace.
+  features: Object.freeze({ multiSpace: true, crossSpaceTransfer: true, crossSpaceRecall: false }),
+  // v1.5.6 L2 multi-merge: condense duplicate same-tag episodes into one record,
+  // pinned and ordinary groups strictly separated. Offline (maintain) only.
+  l2Merge: Object.freeze({ enabled: true, minGroupSize: 2, maxGroupsPerRun: 5, maxSummaryChars: 400 }),
   policy: Object.freeze({}),
 });
 
@@ -379,7 +427,7 @@ function normaliseRaw(raw) {
   }
 
   const out = { ...nested };
-  for (const group of ['retrieval', 'context', 'index', 'temp', 'decay', 'activeSet', 'raw', 'delete', 'review', 'migration', 'identity', 'tools']) {
+  for (const group of ['retrieval', 'context', 'index', 'temp', 'decay', 'activeSet', 'raw', 'delete', 'review', 'migration', 'identity', 'tools', 'dream', 'tagging', 'features', 'l2Merge']) {
     if (isPlainObject(nested[group])) out[group] = { ...nested[group] };
   }
   for (const [alias, path] of Object.entries(FLAT_ALIASES)) {
@@ -398,6 +446,15 @@ function normaliseRaw(raw) {
 }
 
 /**
+ * v1.5.6: multi-space is a CAPABILITY, not a config promise. It is active only when
+ * the Host provides the Orchestrator service AND the profile has not turned
+ * `features.multiSpace` off; otherwise the engine runs the strict single-space core.
+ */
+export function multiSpaceActive(config, hasOrchestrator) {
+  return hasOrchestrator === true && config?.features?.multiSpace !== false;
+}
+
+/**
  * Validate and resolve. Throws `MemoryError` with a `MEM_E_CONFIG_*` code; never
  * clamps, never defaults a bad value.
  *
@@ -407,7 +464,7 @@ function normaliseRaw(raw) {
 export function resolveConfig(raw = {}, { env = process.env } = {}) {
   const input = normaliseRaw(raw);
 
-  for (const group of ['retrieval', 'context', 'index', 'temp', 'decay', 'activeSet', 'raw', 'delete', 'review', 'migration', 'identity', 'tools']) {
+  for (const group of ['retrieval', 'context', 'index', 'temp', 'decay', 'activeSet', 'raw', 'delete', 'review', 'migration', 'identity', 'tools', 'dream', 'tagging', 'features', 'l2Merge']) {
     if (group in input && input[group] !== undefined && !isPlainObject(input[group])) {
       throw configError(ErrorCodes.CONFIG_INVALID_TYPE, `config.${group} must be an object`, { key: group });
     }
@@ -466,6 +523,13 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     contextIn.threshold === undefined ? defaults.context.threshold : contextIn.threshold,
     'context.threshold',
     { min: 0, max: 1, exclusiveMin: true },
+  );
+  // One recall's response cap (v1.5.6). Fail-fast, never clamped: a sub-256-token
+  // budget would make every recall a single hit, and a >100k budget is a bug.
+  const contextMaxInjectTokens = requireInteger(
+    contextIn.maxInjectTokens === undefined ? defaults.context.maxInjectTokens : contextIn.maxInjectTokens,
+    'context.maxInjectTokens',
+    { min: 256, max: 100_000 },
   );
   const contextTarget = requireNumberInRange(
     contextIn.target === undefined ? defaults.context.target : contextIn.target,
@@ -726,6 +790,93 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
   }
   const toolsConfig = Object.freeze({ disabled: Object.freeze([...disabledTools]) });
 
+  // ---- pre-ingest tagging (v1.5.6) ---------------------------------------
+  // Fail-fast: this changes what lands in the index, so a wrong value must abort
+  // activation rather than silently disable tagging or ask for 100 tags.
+  const taggingIn = input.tagging ?? {};
+  if (!isPlainObject(taggingIn)) {
+    throw configError(ErrorCodes.CONFIG_INVALID_TYPE, 'config.tagging must be an object', { key: 'tagging' });
+  }
+  const taggingAutoTag = requireBoolean(
+    taggingIn.autoTag === undefined ? defaults.tagging.autoTag : taggingIn.autoTag,
+    'tagging.autoTag',
+  );
+  const taggingMaxTags = requireInteger(
+    taggingIn.maxTags === undefined ? defaults.tagging.maxTags : taggingIn.maxTags,
+    'tagging.maxTags',
+    { min: 1, max: 5 },
+  );
+  const taggingConfig = Object.freeze({ autoTag: taggingAutoTag, maxTags: taggingMaxTags });
+
+  // ---- optional capabilities / microkernel boundary (v1.5.6) --------------
+  const featuresIn = input.features ?? {};
+  if (!isPlainObject(featuresIn)) {
+    throw configError(ErrorCodes.CONFIG_INVALID_TYPE, 'config.features must be an object', { key: 'features' });
+  }
+  const featureMultiSpace = requireBoolean(
+    featuresIn.multiSpace === undefined ? defaults.features.multiSpace : featuresIn.multiSpace,
+    'features.multiSpace',
+  );
+  const featureCrossSpaceTransfer = requireBoolean(
+    featuresIn.crossSpaceTransfer === undefined
+      ? // Turning multi-space off implies no cross-space transfer: require the
+        // operator to opt back IN explicitly, never the other way around.
+        featureMultiSpace
+        ? defaults.features.crossSpaceTransfer
+        : false
+      : featuresIn.crossSpaceTransfer,
+    'features.crossSpaceTransfer',
+  );
+  if (featureCrossSpaceTransfer && !featureMultiSpace) {
+    throw configError(
+      ErrorCodes.CONFIG_OUT_OF_RANGE,
+      'config.features.crossSpaceTransfer requires features.multiSpace (a single-space core has no target space)',
+      { key: 'features.crossSpaceTransfer', multiSpace: false },
+    );
+  }
+  // v1.5.6: cross-space recall aggregation is OPT-IN (and off by default): it
+  // queries every open space on each recall, so an operator must ask for it.
+  const featureCrossSpaceRecall = requireBoolean(
+    featuresIn.crossSpaceRecall === undefined ? defaults.features.crossSpaceRecall : featuresIn.crossSpaceRecall,
+    'features.crossSpaceRecall',
+  );
+  if (featureCrossSpaceRecall && !featureMultiSpace) {
+    throw configError(
+      ErrorCodes.CONFIG_OUT_OF_RANGE,
+      'config.features.crossSpaceRecall requires features.multiSpace (a single-space core has only one space)',
+      { key: 'features.crossSpaceRecall', multiSpace: false },
+    );
+  }
+  const featuresConfig = Object.freeze({
+    multiSpace: featureMultiSpace,
+    crossSpaceTransfer: featureCrossSpaceTransfer,
+    crossSpaceRecall: featureCrossSpaceRecall,
+  });
+
+  // ---- L2 multi-merge (v1.5.6) -------------------------------------------
+  const l2In = input.l2Merge === undefined ? {} : input.l2Merge;
+  if (!isPlainObject(l2In)) {
+    throw configError(ErrorCodes.CONFIG_INVALID_TYPE, 'config.l2Merge must be an object', { key: 'l2Merge' });
+  }
+  const l2MergeConfig = Object.freeze({
+    enabled: requireBoolean(l2In.enabled === undefined ? defaults.l2Merge.enabled : l2In.enabled, 'l2Merge.enabled'),
+    minGroupSize: requireInteger(
+      l2In.minGroupSize === undefined ? defaults.l2Merge.minGroupSize : l2In.minGroupSize,
+      'l2Merge.minGroupSize',
+      { min: 2, max: 20 },
+    ),
+    maxGroupsPerRun: requireInteger(
+      l2In.maxGroupsPerRun === undefined ? defaults.l2Merge.maxGroupsPerRun : l2In.maxGroupsPerRun,
+      'l2Merge.maxGroupsPerRun',
+      { min: 1, max: 50 },
+    ),
+    maxSummaryChars: requireInteger(
+      l2In.maxSummaryChars === undefined ? defaults.l2Merge.maxSummaryChars : l2In.maxSummaryChars,
+      'l2Merge.maxSummaryChars',
+      { min: 100, max: 2000 },
+    ),
+  });
+
   const policyIn = input.policy === undefined ? {} : input.policy;
   if (!isPlainObject(policyIn)) {
     throw configError(ErrorCodes.CONFIG_INVALID_TYPE, 'config.policy must be an object', { key: 'policy' });
@@ -754,6 +905,82 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     'dreamIdleMinutes',
     { min: 1, max: 525_600 },
   );
+
+  // ---- offline Dream distillation (v1.5.5) --------------------------------
+  // Every tunable is bounded and fail-fast. The LLM leg itself is OPTIONAL: an
+  // unconfigured endpoint is a legal state (the engine degrades to the local merge
+  // and records MEM_E_DREAM_LLM_FALLBACK), so only a malformed value is rejected.
+  // Credentials live in this config (or DSH_DREAM_LLM_* env) and are never
+  // hard-coded in the plugin, never logged, and never returned by the HTTP routes.
+  const dreamIn = input.dream === undefined ? {} : input.dream;
+  if (!isPlainObject(dreamIn)) {
+    throw configError(ErrorCodes.CONFIG_INVALID_TYPE, 'config.dream must be an object', { key: 'dream' });
+  }
+  const dreamLlmIn = dreamIn.llm === undefined ? {} : dreamIn.llm;
+  if (!isPlainObject(dreamLlmIn)) {
+    throw configError(ErrorCodes.CONFIG_INVALID_TYPE, 'config.dream.llm must be an object', { key: 'dream.llm' });
+  }
+  const optionalString = (value, key) => {
+    if (value === undefined || value === null || value === '') return null;
+    return requireString(value, key);
+  };
+  const dreamConfig = {
+    useLlm: requireBoolean(dreamIn.useLlm === undefined ? defaults.dream.useLlm : dreamIn.useLlm, 'dream.useLlm'),
+    minGroupSize: requireInteger(
+      dreamIn.minGroupSize === undefined ? defaults.dream.minGroupSize : dreamIn.minGroupSize,
+      'dream.minGroupSize',
+      { min: 2, max: 50 },
+    ),
+    maxGroupsPerRun: requireInteger(
+      dreamIn.maxGroupsPerRun === undefined ? defaults.dream.maxGroupsPerRun : dreamIn.maxGroupsPerRun,
+      'dream.maxGroupsPerRun',
+      { min: 1, max: 50 },
+    ),
+    maxSummaryChars: requireInteger(
+      dreamIn.maxSummaryChars === undefined ? defaults.dream.maxSummaryChars : dreamIn.maxSummaryChars,
+      'dream.maxSummaryChars',
+      { min: 40, max: 2000 },
+    ),
+    maxSourceChars: requireInteger(
+      dreamIn.maxSourceChars === undefined ? defaults.dream.maxSourceChars : dreamIn.maxSourceChars,
+      'dream.maxSourceChars',
+      { min: 80, max: 4000 },
+    ),
+    maxEventsPerGroup: requireInteger(
+      dreamIn.maxEventsPerGroup === undefined ? defaults.dream.maxEventsPerGroup : dreamIn.maxEventsPerGroup,
+      'dream.maxEventsPerGroup',
+      { min: 2, max: 50 },
+    ),
+    llmTimeoutMs: requireInteger(
+      dreamIn.llmTimeoutMs === undefined ? defaults.dream.llmTimeoutMs : dreamIn.llmTimeoutMs,
+      'dream.llmTimeoutMs',
+      { min: 500, max: 120_000 },
+    ),
+    failureThreshold: requireInteger(
+      dreamIn.failureThreshold === undefined ? defaults.dream.failureThreshold : dreamIn.failureThreshold,
+      'dream.failureThreshold',
+      { min: 1, max: 20 },
+    ),
+    cooldownMinutes: requireInteger(
+      dreamIn.cooldownMinutes === undefined ? defaults.dream.cooldownMinutes : dreamIn.cooldownMinutes,
+      'dream.cooldownMinutes',
+      { min: 1, max: 1440 },
+    ),
+    compensateAfterHours: requireInteger(
+      dreamIn.compensateAfterHours === undefined ? defaults.dream.compensateAfterHours : dreamIn.compensateAfterHours,
+      'dream.compensateAfterHours',
+      { min: 1, max: 720 },
+    ),
+    onlyLowValley: requireBoolean(
+      dreamIn.onlyLowValley === undefined ? defaults.dream.onlyLowValley : dreamIn.onlyLowValley,
+      'dream.onlyLowValley',
+    ),
+    llm: {
+      baseUrl: optionalString(dreamLlmIn.baseUrl, 'dream.llm.baseUrl'),
+      model: optionalString(dreamLlmIn.model, 'dream.llm.model'),
+      apiKey: optionalString(dreamLlmIn.apiKey, 'dream.llm.apiKey'),
+    },
+  };
   const enableReflection = requireBoolean(
     input.enableReflection === undefined ? defaults.enableReflection : input.enableReflection,
     'enableReflection',
@@ -788,6 +1015,7 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     ),
     enableDream,
     dreamIdleMinutes,
+    dream: dreamConfig,
     enableReflection,
     graphMaxEdges,
     storageBudgetMb,
@@ -796,6 +1024,7 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     index: { maxPostingsPerTag: indexMaxPostingsPerTag },
     context: {
       maxTokens: contextMaxTokens,
+      maxInjectTokens: contextMaxInjectTokens,
       threshold: contextThreshold,
       target: contextTarget,
       injectPrompt: contextInjectPrompt,
@@ -829,6 +1058,9 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     tagTree: tagTreeConfig,
     identity: { eventTimePolicy },
     tools: toolsConfig,
+    tagging: taggingConfig,
+    features: featuresConfig,
+    l2Merge: l2MergeConfig,
     policy: policyIn,
   };
   return resolved;
@@ -863,6 +1095,15 @@ export function toMemoryOptions(config) {
       review: config.review,
       migration: config.migration,
       tagTree: config.tagTree,
+      // v1.5.5: Dream options are engine config, not policy. The llm block can hold
+      // an injected credential; it is never projected into the HTTP/UI config.
+      dream: config.dream,
+      // v1.5.6: pre-ingest tagging knobs (read at the write gate).
+      tagging: config.tagging,
+      // v1.5.6: capability flags gate the space tools/routes at their use sites.
+      features: config.features,
+      // v1.5.6: L2 multi-merge tunables (offline maintain phase).
+      l2Merge: config.l2Merge,
     },
   };
 }

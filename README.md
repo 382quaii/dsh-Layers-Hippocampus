@@ -4,7 +4,7 @@
 
 | | |
 | --- | --- |
-| 版本 | **1.5.4** |
+| 版本 | **1.5.6** |
 | 包名 | `dsh-layers-hippocampus`（npm 只允许小写；仓库名保留 `dsh-Layers-Hippocampus`，*Hippocampus* 双 **p**） |
 | 仓库 | <https://github.com/382quaii/dsh-Layers-Hippocampus> |
 | 许可证 | MIT |
@@ -18,7 +18,7 @@
 ### 从 GitHub
 
 ```bash
-pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.5.4"
+pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.5.6"
 ```
 
 ### 从 npm
@@ -55,7 +55,7 @@ node scripts/wait-for-routes.mjs
 
 | 工具（`memory_*`） | 用途 |
 | --- | --- |
-| `remember` | 追加一条长期记忆（内容哈希幂等）；可带 `media_url` + `media_type` 指向附件 |
+| `remember` | 追加一条长期记忆（内容哈希幂等）；可带 `media_url` + `media_type` 指向附件；`pinned: true` 表示“永不衰减、命中标签时置顶”的经验教训（**必须带 tags**，否则 `MEM_E_PINNED_TAG_REQUIRED`） |
 | `checkpoint` | 记录**唯一**进行中的重任务：`task_id`、`progress`（0–100）、`updated_at` |
 | `space_transfer` | 跨空间原子迁移：`event_ids` + `target_space_id` + `transfer_mode: copy \| move`；**必须 `user_approved: true`**（AI 自行调用会被引擎拦截）；隐私词拦截、剥离 `raw_turn`、目标空间重新生成 `event_id` 并打标 |
 | `transfer_to_global` | 迁移到 `global` 空间，参数与安全门禁同 `space_transfer`（`memory_transfer_to_global`） |
@@ -186,6 +186,8 @@ node scripts/wait-for-routes.mjs
 | `briefing` / `promptSection` / `autoMaintainOnBoot` | `true` | 布尔 |
 | `enableDream` | `true` | 布尔 |
 | `dreamIdleMinutes` | `180` | 1 – 525 600 |
+| `dream.compensateAfterHours` | `24` | 1 – 720；会话开始时若上次 Dream 超过该时长且价格窗口允许，补跑一次 Dream（`DSH_DREAM_PRICE=low\|high` 或注入价格探针） |
+| `dream.useLlm` / `dream.*` 调优项 | 见默认值 | 设置页「离线 Dream（LLM 蒸馏）」可调：成组条数 / 组数 / 摘要与来源字数 / 超时 / 熔断 / 冷却 / 补偿阈值；**`dream.llm.{baseUrl,model,apiKey}` 永不下发浏览器**（1.5.6） |
 | `enableReflection` | `true` | 布尔 |
 | `graphMaxEdges` | `500` | 100 – 2000 |
 | `storageBudgetMb` | `50` | 10 – 1000（软上限：超限只标红，不删档） |
@@ -194,6 +196,7 @@ node scripts/wait-for-routes.mjs
 | `maxRecallTopK` | `100` | 1 – 1000 |
 | `retrieval.topK` | `20` | 1 – `maxRecallTopK` |
 | `context.maxTokens` | `4000` | 256 – 1 000 000 |
+| `context.maxInjectTokens` | `4000` | 256 – 100 000；单次 recall 返回 JSON 的硬上限，超限截断并带 `truncated:true` |
 | `context.threshold` / `context.target` | `0.85` / `0.7` | target < threshold < 1 |
 | `context.injectPrompt` | `true` | 布尔 |
 | `context.autoSpaceFollow` | `false` | 布尔；开启后跨空间操作完成时 UI 自动切换空间 |
@@ -203,6 +206,12 @@ node scripts/wait-for-routes.mjs
 | `context.requireExplicitConsentForTransfer` | `true` | 布尔；开启时 AI 直接调用迁移工具返回 `MEM_E_REQUIRE_USER_CONSENT`，仅 UI 人工通道放行（1.5.1） |
 | `index.maxPostingsPerTag` | `500` | 1 – 100 000；每个标签在内存索引中最多保留的指针数 |
 | `tools.disabled` | `[]` | 工具后缀数组（如 `["capture","bulk_ingest"]`）；核心 remember/recall/admin 不可关闭；未知/重复/带前缀名称 fail-fast 抛 `MEM_E_INVALID_TOOL_NAME` |
+| `tagging.autoTag` | `true` | 布尔；未手传 tags 时由引擎从内容形态提取锚点（错误类型 / errno / 代码块语言 / HTTP 状态 / 文件路径 / 任务语句）（1.5.6） |
+| `tagging.maxTags` | `2` | 1 – 5；每次自动打标最多输出的标签数；模型手传 tags 时启发式不运行 |
+| `features.multiSpace` | `true` | 关闭后本体退化为严格单空间：非 `default` 的 targetSpaceId 一律 `MEM_E_FEATURE_DISABLED`，空间工具不注册（1.5.6） |
+| `features.crossSpaceTransfer` | `true` | 关闭后 `space_transfer` / `transfer_to_global` 不注册、迁移引擎直接拒绝；关多空间时自动跟随关闭 |
+| `l2Merge.enabled` | `true` | 维护时把同标签重复 L2 经验合并为一条；pinned 与普通严格分组，`meta.global_tags` 只进 meta 不进倒排（1.5.6） |
+| `l2Merge.minGroupSize` / `maxGroupsPerRun` / `maxSummaryChars` | `2` / `5` / `400` | 2–20 / 1–50 / 100–2000；合并文本用 ASCII 省略号，受身份规范化后仍不超上限 |
 | `temp.ttlDays` / `temp.promotionWindowDays` | `30` / `20` | promotion ≤ ttl |
 | `identity.eventTimePolicy` | `content` | `content` \| `explicit` \| `ingest` |
 | `raw.mode` | `salience` | `off` \| `salience` \| `all` |
@@ -380,7 +389,7 @@ node scripts/check-binding.mjs --port 55879
 
 ## 变更记录
 
-见 [CHANGELOG.md](CHANGELOG.md)（当前 **1.5.4**：自动交接死锁修复 / 摘要递归切断 / ratio 基线重置 / handoff 隔离降权 / 逃生舱与脏数据修复；1.5.3：空间创建热修 / 路由漂移锁定 / 能力握手 / `MEM_E_SPACE_INVALID` / 人话降级 / `tools.disabled` 工具裁剪 / 基准协议 / 移除死配置 `minInjectConfidence` / 多空间固定开销测试；1.5.2：UI 架构纠偏 / 物理迁移与业务迁移解耦 / 全局空间选择器 / 按空间路由隔离 / 迁移显式二次授权；1.5.1：跨空间迁移显式用户授权 / 提示词安全红线 / `memory_transfer_to_global`；1.5.0：大标签治理 / 多空间路由 / 会话交接 / 跨空间安全迁移；1.4.3：写入批量化 / deep_raw 最新优先 / 日志缓冲与崩溃可见；1.4.2：L1.5 标签层级树 / 宽限幽灵 / 检索降级 / 图谱历史视图；1.4.1：提示词软引导 / 工具瘦身 / 置信度 / 洪峰防护；1.4.0：raw 原始回合取证 / 间隔重复 / 两阶段删除 / UI 数据目录迁移）。
+见 [CHANGELOG.md](CHANGELOG.md)（当前 **1.5.6**：`deep_raw` 按行游标扫描（最新优先、O(chunk) 内存、`hit.line` 仍为绝对行号）/ 引擎级结果硬上限 500 / 流式 tombstone 与 hash 恢复；同版本硬化：recall 单次 `context.maxInjectTokens` 上限 + `truncated` / `Memory.close()` 释放 raw flush timer 与索引视图 / maintain 事件循环延迟监控（`eventLoop` 报告 + 阶段间让渡）/ 入库自动打标（`tagging.autoTag`，模型 tags 优先、raw 保持纯净、miss 记 `MEM_E_AUTO_TAG_MISS`）/ L2 Pinned（`remember({pinned:true})` 永不衰减、命中标签置顶、缺 tags 抛 `MEM_E_PINNED_TAG_REQUIRED`）/ 提示词「相关性线索」（移除全局最活跃标签，只注入与当前输入词法匹配的最多 5 个标签，位于易变尾巴不破坏前缀缓存）/ 能力开关（`features.multiSpace` / `features.crossSpaceTransfer`，关闭即工具与路由显式消失，`MEM_E_FEATURE_DISABLED`）/ `Memory.open('/abs/dir')` 单空间入口与只读 `warmup()` / 宿主生命周期补偿 Dream（`agent/created`/`session/created` → 到期且价格允许时经同一维护闸门补跑一次，未知价格对 LLM Dream 跳过）/ Dream 调优项进设置页（`dream.llm.*` 凭据永不下发）/ L2 多合一蒸馏（同标签重复经验合并、pinned 与普通严格分组、`global_tags` 只进 meta）/ L3 标签不变量（显式写入空标签抛 `MEM_E_SEMANTIC_TAG_REQUIRED`；离线路径自动派生锚点，历史空标签摘要标 `degraded`）/ 工作模式跨交接保持（marker 记录 `agentPreset`，新会话首轮前经 `agentPresets.select` 恢复；旧 marker 自动补写；`/stats` 暴露 `agentPreset` / `presetInherit`）/ **物理切割**（`src/spaces/spaceRouter.js`、`transfer.js` 移入 `dsh-orchestrator`；本体只留严格单空间核心，无 Orchestrator 时 8 工具 + `capabilities.spaces=false`，命名空间操作返回 `MEM_E_FEATURE_DISABLED`）/ **第一批冲刺**（Orchestrator `ctx.provide('orchestrator')` 服务注册；`status:*`/`folded-summary` 图谱与标签树隔离；`[Active Task]` 强注 + 短输入兜底标签；会话级注入去重）/ 空间删除（引擎 + HTTP `action:'delete'` + UI `🗑 删除空间`，仅命名空间、二次确认，`default` 永不删除；`capabilities.spacesDelete` 版本握手旧宿主隐藏按钮；无多空间能力时空间 UI 静默隐藏）/ **图谱交互**（Ctrl/Cmd+拖拽平移画布、Ctrl/Cmd+滚轮按光标缩放、双击空白重置、冻结布局初始防重叠）/ **纯本地低谷调度**（北京时间峰谷判断、`dream.onlyLowValley`、峰时 Dream 持久化延后并在谷时自动补跑；Phase 2 唤醒定时器 + 睡过头补偿）/ **联邦与跨空间去重**（业务标签注册进 Orchestrator 全局映射；月记按内容哈希认领、兄弟空间跳过重复月记；recall 按 `source_event_ids`/`content_hash` 做读时合并，跨空间聚合由 `features.crossSpaceRecall` 控制、默认关闭））；1.5.5：离线 Dream LLM 语义提炼（原生 fetch、零依赖、可配置超时）/ 本地启发式降级 + `MEM_E_DREAM_LLM_FALLBACK` / `source_event_ids` 溯源 / 连续失败熔断与半开试探；1.5.4：自动交接死锁修复 / 摘要递归切断 / ratio 基线重置 / handoff 隔离降权 / 逃生舱与脏数据修复；1.5.3：空间创建热修 / 路由漂移锁定 / 能力握手 / `MEM_E_SPACE_INVALID` / 人话降级 / `tools.disabled` 工具裁剪 / 基准协议 / 移除死配置 `minInjectConfidence` / 多空间固定开销测试；1.5.2：UI 架构纠偏 / 物理迁移与业务迁移解耦 / 全局空间选择器 / 按空间路由隔离 / 迁移显式二次授权；1.5.1：跨空间迁移显式用户授权 / 提示词安全红线 / `memory_transfer_to_global`；1.5.0：大标签治理 / 多空间路由 / 会话交接 / 跨空间安全迁移；1.4.3：写入批量化 / deep_raw 最新优先 / 日志缓冲与崩溃可见；1.4.2：L1.5 标签层级树 / 宽限幽灵 / 检索降级 / 图谱历史视图；1.4.1：提示词软引导 / 工具瘦身 / 置信度 / 洪峰防护；1.4.0：raw 原始回合取证 / 间隔重复 / 两阶段删除 / UI 数据目录迁移）。
 
 ## 许可
 

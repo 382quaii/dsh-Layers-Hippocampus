@@ -503,7 +503,9 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
     const handoffFactor = handoffInternal ? HANDOFF_INTERNAL_PENALTY : 1;
     // A monthly memo is a stable summary, not a fading episode: no decay at all,
     // and a small boost when the query is about a fuzzy historical period.
-    const decay = monthly
+    // v1.5.6: pinned records never decay either — they are lessons, not episodes.
+    const pinned = event.pinned === true;
+    const decay = monthly || pinned
       ? 1
       : decayFactor({
           eventTime: event.anchorTime ?? event.eventTime,
@@ -531,6 +533,7 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
       lexical: round(lexical, 4),
       tags,
       monthly,
+      ...(pinned ? { pinned: true } : {}),
       ...(association ? { association } : {}),
       // Marks the two hits that exist because the caller insisted on an oversized
       // tag, so the model knows this is a bounded preview, not the answer set.
@@ -541,13 +544,22 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
   }
 
   scored.sort((a, b) => b.score - a.score || a.eventId.localeCompare(b.eventId));
+  // v1.5.6: a pinned record that matches the query is returned FIRST, before any
+  // higher-scoring episode — that is the whole point of "pinned".
+  if (scored.some((hit) => hit.pinned === true)) {
+    scored = [
+      ...scored.filter((hit) => hit.pinned === true),
+      ...scored.filter((hit) => hit.pinned !== true),
+    ];
+    base.notes.push(`pinned-first:${scored.filter((hit) => hit.pinned === true).length}`);
+  }
   if (scored.length > policy.retrieval.maxScannedEvents) {
     base.notes.push(`scan-capped:${policy.retrieval.maxScannedEvents}`);
     scored = scored.slice(0, policy.retrieval.maxScannedEvents);
   }
 
   const minScore = policy.candidates.minScore;
-  let filtered = scored.filter((hit) => hit.score >= minScore);
+  let filtered = scored.filter((hit) => hit.pinned === true || hit.score >= minScore);
   if (filtered.length === 0 && scored.length > 0) {
     // Never silently return nothing when there is something: return it, say so.
     filtered = scored;

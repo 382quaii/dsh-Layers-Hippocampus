@@ -21,6 +21,8 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import readline from 'node:readline';
+import { StringDecoder } from 'node:string_decoder';
 import { createHash } from 'node:crypto';
 import { MemoryError, ErrorCodes } from './errors.js';
 import { dayKey, ensureDir, sha256 } from './util.js';
@@ -38,6 +40,10 @@ export const TRUNCATE_MARKER = '…[truncated]…';
 export const TOKEN_TRUNCATION_NOTE = '由于预算限制，部分原始记录已被截断';
 /** Characters per token estimate for the result budget. */
 const CHARS_PER_TOKEN = 4;
+/** Streaming read granularity. Peak scan memory is one chunk plus one partial line. */
+export const READ_CHUNK_BYTES = 64 * 1024;
+/** Engine-side hard ceiling on one scan's result set (never trust the caller). */
+export const MAX_SCAN_RESULTS = 500;
 
 const RUNTIME_CONTEXT_MARKER = /^Current runtime context\./i;
 const SECRET_PATTERNS = [
@@ -70,6 +76,122 @@ function looksLikeStack(text) {
 
 const GATED_KINDS = new Set(['code', 'error', 'tool_output']);
 
+/** Strip a trailing carriage return (CRLF files) without copying the line twice. */
+function stripCr(line) {
+  return line.endsWith('\r') ? line.slice(0, -1) : line;
+}
+
+/**
+ * Forward line iterator with O(chunk) memory: `readline` over a file stream.
+ * Used by restore/hash/tombstone passes, which must not load a whole shard.
+ */
+export async function* readLinesForward(file, { chunkSize = READ_CHUNK_BYTES } = {}) {
+  const stream = fs.createReadStream(file, { encoding: 'utf8', highWaterMark: chunkSize });
+  const reader = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const line of reader) yield line;
+  } finally {
+    reader.close();
+    stream.destroy();
+  }
+}
+
+/**
+ * NEWEST-FIRST line iterator: reads the file backwards in bounded chunks and
+ * splits it into lines without ever materialising the whole shard. This is the
+ * primitive that makes `deep_raw`'s tail scan O(chunk) instead of O(file).
+ *
+ * A file produced by this store never contains blank lines, so the trailing
+ * newline does not yield a phantom empty line: the first yield of a file that
+ * ends with '\n' is its final record.
+ *
+ * @param {string} file
+ * @param {{chunkSize?: number, onBuffer?: (bytes: number) => void}} [options]
+ *   `onBuffer` reports the current buffer size (chunk + carry) after each read;
+ *   tests use it to prove peak memory stays bounded.
+ */
+export async function* readLinesReverse(file, { chunkSize = READ_CHUNK_BYTES, onBuffer = null } = {}) {
+  let handle;
+  try {
+    handle = await fs.promises.open(file, 'r');
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return;
+    throw error;
+  }
+  try {
+    const { size } = await handle.stat();
+    let position = size;
+    let carry = Buffer.alloc(0);
+    let firstChunk = true;
+    while (position > 0) {
+      const length = Math.min(chunkSize, position);
+      position -= length;
+      const chunk = Buffer.allocUnsafe(length);
+      await handle.read(chunk, 0, length, position);
+      const combined = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
+      onBuffer?.(combined.length);
+      let end = combined.length;
+      for (let index = combined.length - 1; index >= 0; index -= 1) {
+        if (combined[index] !== 0x0a) continue;
+        let line = combined.subarray(index + 1, end).toString('utf8');
+        end = index;
+        line = stripCr(line);
+        // A file ending in '\n' would otherwise yield one phantom empty line.
+        if (firstChunk && index === combined.length - 1 && line === '') {
+          firstChunk = false;
+          continue;
+        }
+        firstChunk = false;
+        if (line.length > 0) yield line;
+      }
+      carry = combined.subarray(0, end);
+      onBuffer?.(carry.length);
+    }
+    if (carry.length > 0) {
+      const line = stripCr(carry.toString('utf8'));
+      if (line.length > 0) yield line;
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Synchronous forward iterator (StringDecoder keeps multi-byte boundaries
+ * intact). Only `stats()`/tombstone loading need a sync pass; memory is still
+ * bounded by `chunkSize`, never by the file.
+ */
+export function* readLinesForwardSync(file, { chunkSize = READ_CHUNK_BYTES } = {}) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return;
+    throw error;
+  }
+  const decoder = new StringDecoder('utf8');
+  const buffer = Buffer.allocUnsafe(chunkSize);
+  try {
+    let carry = '';
+    for (;;) {
+      const bytes = fs.readSync(fd, buffer, 0, chunkSize, null);
+      if (bytes === 0) break;
+      const text = carry + decoder.write(buffer.subarray(0, bytes));
+      const lines = text.split('\n');
+      carry = lines.pop() ?? '';
+      for (const line of lines) {
+        const clean = stripCr(line);
+        if (clean.length > 0) yield clean;
+      }
+    }
+    carry += decoder.end();
+    const last = stripCr(carry);
+    if (last.length > 0) yield last;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 export class RawStore {
   constructor({ dataDir, clock, getConfig }) {
     this.dir = path.join(dataDir, RAW_DIR);
@@ -100,12 +222,11 @@ export class RawStore {
       .sort();
   }
 
-  _hashesFor(day) {
+  async _hashesFor(day) {
     if (this._hashes.has(day)) return this._hashes.get(day);
     const set = new Set();
-    const file = this.dayFile(day);
-    if (fs.existsSync(file)) {
-      for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+    try {
+      for await (const line of readLinesForward(this.dayFile(day))) {
         if (!line) continue;
         let record;
         try {
@@ -115,6 +236,8 @@ export class RawStore {
         }
         if (typeof record.turn_id === 'string' && typeof record.content === 'string') set.add(sha256(record.content));
       }
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') throw error;
     }
     this._hashes.set(day, set);
     return set;
@@ -160,7 +283,7 @@ export class RawStore {
    * Queue one raw turn. Returns a verdict synchronously (dedupe/budget/gate);
    * the bytes land on disk via the background flush.
    */
-  capture(turn = {}) {
+  async capture(turn = {}) {
     const config = this.config();
     const text = typeof turn.content === 'string' ? turn.content : '';
     if (!text.trim()) throw new MemoryError(ErrorCodes.INVALID_INPUT, 'raw turn content must be a non-empty string');
@@ -170,7 +293,7 @@ export class RawStore {
     const now = this.clock.now();
     const day = dayKey(now);
     const hash = sha256(text);
-    const hashes = this._hashesFor(day);
+    const hashes = await this._hashesFor(day);
     if (hashes.has(hash)) return { stored: false, reason: 'duplicate', sha256: hash };
 
     const maxBytes = Math.max(1024, (config.maxTurnKb ?? 64) * 1024);
@@ -231,6 +354,41 @@ export class RawStore {
     return this._flushChain;
   }
 
+  /**
+   * Release the raw store (v1.5.6): clear the flush timer, persist anything still
+   * queued synchronously (close must not lose the last turns), and drop every
+   * in-memory cache so the instance can be GC'd. Idempotent.
+   */
+  close() {
+    if (this._closed === true) return;
+    this._closed = true;
+    if (this._flushTimer) {
+      clearTimeout(this._flushTimer);
+      this._flushTimer = null;
+    }
+    if (this.queue.length > 0) {
+      const pending = this.queue.splice(0, this.queue.length);
+      try {
+        ensureDir(this.dir);
+        const byDay = new Map();
+        for (const item of pending) {
+          if (!byDay.has(item.day)) byDay.set(item.day, []);
+          byDay.get(item.day).push(item.line);
+        }
+        for (const [day, lines] of byDay) {
+          fs.appendFileSync(this.dayFile(day), `${lines.join('\n')}\n`, 'utf8');
+        }
+      } catch {
+        /* best effort: a failing disk must not make close() throw */
+      }
+    }
+    this._flushChain = Promise.resolve();
+    this._hashes.clear();
+    this._dayBytes.clear();
+    this._tombstones = null;
+    this._total = null;
+  }
+
   /** Tombstone content hashes at the raw layer (called after a purge). */
   async tombstone(hashes = [], { at = this.clock.now() } = {}) {
     const unique = [...new Set(hashes)].filter(Boolean);
@@ -249,24 +407,36 @@ export class RawStore {
     if (this._tombstones) return this._tombstones;
     const set = new Set();
     for (const name of this.listShards()) {
-      let text = '';
       try {
-        text = fs.readFileSync(path.join(this.dir, name), 'utf8');
-      } catch {
-        continue;
-      }
-      for (const line of text.split('\n')) {
-        if (!line.includes('"raw_tombstone"')) continue;
-        try {
-          const record = JSON.parse(line);
-          if (record.type === 'raw_tombstone' && record.hash) set.add(record.hash);
-        } catch {
-          /* torn line */
+        for (const line of readLinesForwardSync(path.join(this.dir, name))) {
+          if (!line.includes('"raw_tombstone"')) continue;
+          try {
+            const record = JSON.parse(line);
+            if (record.type === 'raw_tombstone' && record.hash) set.add(record.hash);
+          } catch {
+            /* torn line */
+          }
         }
+      } catch (error) {
+        // A shard pruned between listShards() and the read is not an error.
+        if (!error || error.code !== 'ENOENT') throw error;
       }
     }
     this._tombstones = set;
     return set;
+  }
+
+  /** Non-empty line count of one shard (bounded streaming pass, no full read). */
+  async _countLines(file) {
+    let total = 0;
+    try {
+      for await (const line of readLinesForward(file)) {
+        if (line.length > 0) total += 1;
+      }
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') throw error;
+    }
+    return total;
   }
 
   /**
@@ -317,79 +487,94 @@ export class RawStore {
       .reverse();
 
     const hits = [];
-    const scanned = { turns: 0, bytes: 0, shards: 0, tombstonesSkipped: 0 };
+    const scanned = { turns: 0, bytes: 0, shards: 0, tombstonesSkipped: 0, peakBufferBytes: 0 };
+    // The caller's `limit` is advisory; the engine enforces its own ceiling so a
+    // direct embedder can never request an unbounded result set.
+    const effectiveLimit = Math.min(Math.max(1, Math.floor(Number(limit) || 20)), MAX_SCAN_RESULTS);
     let truncated = false;
     let tokensUsed = 0;
     for (const name of shards) {
       if (truncated) break;
       const file = path.join(this.dir, name);
       scanned.shards += 1;
-      let text = '';
+      const shardHits = [];
+      let tailIndex = 0; // 0 = the shard's last physical line
       try {
-        text = await fs.promises.readFile(file, 'utf8');
+        // NEWEST FIRST, one line at a time: the file is read backwards in fixed
+        // chunks, so peak memory is O(chunk + one line), never O(file).
+        for await (const line of readLinesReverse(file, {
+          onBuffer: (bytes) => {
+            if (bytes > scanned.peakBufferBytes) scanned.peakBufferBytes = bytes;
+          },
+        })) {
+          const lineBytes = Buffer.byteLength(line, 'utf8') + 1;
+          scanned.bytes += lineBytes;
+          if (scanned.bytes > maxBytes || scanned.turns >= maxTurns) {
+            truncated = true;
+            break;
+          }
+          scanned.turns += 1;
+          const fromTail = tailIndex;
+          tailIndex += 1;
+          let record;
+          try {
+            record = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (record.type === 'raw_tombstone') continue;
+          // A raw turn carries no `type`: the four-field shape is the record.
+          if (typeof record.turn_id !== 'string' || typeof record.content !== 'string') continue;
+          if (record.timestamp < startTime || record.timestamp > endTime) continue;
+          if (tombstones.has(sha256(record.content))) {
+            scanned.tombstonesSkipped += 1;
+            continue;
+          }
+          const haystack = record.content;
+          if (!matcher.test(haystack)) continue;
+          const at = needle ? haystack.toLowerCase().indexOf(needle.toLowerCase()) : 0;
+          const snippet = redactSecrets(haystack.slice(Math.max(0, at - 120), at + 120 + needle.length));
+          const snippetTokens = Math.ceil(snippet.text.length / CHARS_PER_TOKEN);
+          if (tokensUsed + snippetTokens > tokenBudget) {
+            truncated = true;
+            break;
+          }
+          tokensUsed += snippetTokens;
+          shardHits.push({
+            turnId: record.turn_id,
+            timestamp: record.timestamp,
+            role: record.role,
+            snippet: snippet.text,
+            redactions: snippet.redactions,
+            shard: name,
+            fromTail,
+          });
+          if (hits.length + shardHits.length >= effectiveLimit) break;
+        }
       } catch (error) {
         if (error && error.code === 'ENOENT') continue;
         throw error;
       }
-      const lines = text.split(/\r?\n/);
-      let end = lines.length;
-      while (end > 0 && lines[end - 1] === '') end -= 1;
-      // NEWEST FIRST: walk the shard from its tail backwards. A day file is bounded
-      // by raw.maxBytesPerDay, so this read is bounded too; the byte/turn budget
-      // below still stops the scan long before the head when the shard is huge.
-      for (let index = end - 1; index >= 0; index -= 1) {
-        const line = lines[index];
-        const lineBytes = Buffer.byteLength(line, 'utf8') + 1;
-        scanned.bytes += lineBytes;
-        if (scanned.bytes > maxBytes || scanned.turns >= maxTurns) {
-          truncated = true;
-          break;
+      if (shardHits.length > 0) {
+        // Absolute line numbers need the shard's line count: ONE extra bounded
+        // streaming pass, paid only when this shard actually produced hits.
+        const total = await this._countLines(file);
+        for (const hit of shardHits) {
+          hit.line = total - hit.fromTail;
+          delete hit.fromTail;
         }
-        scanned.turns += 1;
-        let record;
-        try {
-          record = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        if (record.type === 'raw_tombstone') continue;
-        // A raw turn carries no `type`: the four-field shape is the record.
-        if (typeof record.turn_id !== 'string' || typeof record.content !== 'string') continue;
-        if (record.timestamp < startTime || record.timestamp > endTime) continue;
-        if (tombstones.has(sha256(record.content))) {
-          scanned.tombstonesSkipped += 1;
-          continue;
-        }
-        const haystack = record.content;
-        if (!matcher.test(haystack)) continue;
-        const at = needle ? haystack.toLowerCase().indexOf(needle.toLowerCase()) : 0;
-        const snippet = redactSecrets(haystack.slice(Math.max(0, at - 120), at + 120 + needle.length));
-        const snippetTokens = Math.ceil(snippet.text.length / CHARS_PER_TOKEN);
-        if (tokensUsed + snippetTokens > tokenBudget) {
-          truncated = true;
-          break;
-        }
-        tokensUsed += snippetTokens;
-        hits.push({
-          turnId: record.turn_id,
-          timestamp: record.timestamp,
-          role: record.role,
-          snippet: snippet.text,
-          redactions: snippet.redactions,
-          shard: name,
-          line: index + 1,
-        });        if (hits.length >= limit) break;
+        hits.push(...shardHits);
       }
     }
     const notes = [];
-    const notesTruncated = truncated || hits.length >= limit;
+    const notesTruncated = truncated || hits.length >= effectiveLimit;
     if (notesTruncated) notes.push(TOKEN_TRUNCATION_NOTE);
     return {
       mode: 'deep_raw',
       hits,
       scanned,
       truncated: notesTruncated,
-      budget: { maxBytes, maxTurns, maxTokens: tokenBudget, tokensUsed },
+      budget: { maxBytes, maxTurns, maxTokens: tokenBudget, tokensUsed, maxHits: MAX_SCAN_RESULTS },
       notes,
     };
   }
@@ -400,17 +585,25 @@ export class RawStore {
     const tombstones = this._loadTombstones();
     const hits = [];
     for (const name of this.listShards().reverse()) {
-      let text = '';
-      try { text = fs.readFileSync(path.join(this.dir, name), 'utf8'); } catch { continue; }
       let line = 0;
-      for (const raw of text.split(/\r?\n/)) {
-        if (!raw.trim()) continue;
-        line += 1;
-        let record; try { record = JSON.parse(raw); } catch { continue; }
-        if (record.type === 'raw_tombstone' || typeof record.content !== 'string') continue;
-        const digest = sha256(record.content);
-        if (!digest.startsWith(wanted) || tombstones.has(digest)) continue;
-        hits.push({ turnId: record.turn_id, timestamp: record.timestamp, role: record.role, content: record.content, hash: digest, shard: name, line, restored: true });
+      try {
+        for await (const rawLine of readLinesForward(path.join(this.dir, name))) {
+          if (!rawLine.trim()) continue;
+          line += 1;
+          let record;
+          try {
+            record = JSON.parse(rawLine);
+          } catch {
+            continue;
+          }
+          if (record.type === 'raw_tombstone' || typeof record.content !== 'string') continue;
+          const digest = sha256(record.content);
+          if (!digest.startsWith(wanted) || tombstones.has(digest)) continue;
+          hits.push({ turnId: record.turn_id, timestamp: record.timestamp, role: record.role, content: record.content, hash: digest, shard: name, line, restored: true });
+        }
+      } catch (error) {
+        if (error && error.code === 'ENOENT') continue;
+        throw error;
       }
     }
     return { mode: 'deep_raw', hits: hits.slice(0, 5), truncated: hits.length > 5, notes: hits.length === 0 ? ['hash not found'] : [], restored: hits.length > 0 };

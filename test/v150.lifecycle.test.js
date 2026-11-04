@@ -19,7 +19,7 @@ import test from 'node:test';
 import { HANDOFF_TAG, FOLDED_TAG } from '../src/memory.js';
 import { resolveConfig, toMemoryOptions } from '../src/config.js';
 import { apply, createRuntime, getRuntime } from '../index.js';
-import { FakeClock, T0, fakeCtx, makeMemory, tempDir } from './helpers.js';
+import { createOrchestratorStub, FakeClock, T0, fakeCtx, makeMemory, tempDir } from './helpers.js';
 
 const TAGS_OF = (event) => (event.tags ?? []).map((tag) => tag.tag ?? tag);
 
@@ -78,7 +78,7 @@ test('reaching autoRolloverThreshold distils one L1.5 summary, marks the handoff
     context: { nativeTokenLimit: 1000, autoRolloverThreshold: 0.85, maxTokens: 100_000 },
   });
   const clock = new FakeClock(T0);
-  const runtime = createRuntime({ config, options: toMemoryOptions(config), clock });
+  const runtime = createRuntime({ config, options: toMemoryOptions(config), clock, orchestrator: createOrchestratorStub() });
   try {
     runtime.start();
     await runtime.ready;

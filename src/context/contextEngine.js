@@ -312,8 +312,14 @@ export class ContextEngine {
     };
   }
 
-  render() {
+  /**
+   * Render the surviving blocks. v1.5.6: `excludeIds` lets prompt assembly drop
+   * blocks already injected earlier in the SAME session (dedup by block id).
+   */
+  render({ excludeIds = null } = {}) {
+    const excluded = excludeIds instanceof Set ? excludeIds : null;
     return this.blocks
+      .filter((block) => !(excluded && excluded.has(block.id)))
       .map((block) => (block.kind === 'briefing' ? block.text : `- [memory ${block.id}] ${snippet(block.text, 200)}`))
       .join('\n');
   }

@@ -4,6 +4,471 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.6] — 2026-11-03
+
+**`deep_raw` now scans by line cursor: a huge day shard is never loaded whole.**
+The black box is read newest-first in fixed chunks; peak memory is one chunk plus
+one partial line (test-locked), not the file size. `hit.line` keeps its absolute
+1-based semantics. **389 tests green** (was 303).
+
+### Changed — raw scan / restore (zero-dependency, O(chunk) memory)
+
+- **`readLinesReverse(file, {chunkSize, onBuffer})`** (`src/rawStore.js`): reads a
+  file backwards in 64 KiB chunks, yielding one line at a time; the trailing
+  newline does not produce a phantom empty line. `onBuffer` reports the live
+  buffer size for tests.
+- **`deep_raw` scan** rewrote the whole-shard `readFileSync + split` path:
+  newest-first, one `JSON.parse` per line, line bytes counted as they are read,
+  hit results collected per shard. `hit.line` is computed from the shard's line
+  count via ONE extra bounded streaming pass, paid only when that shard produced
+  a hit (so a miss costs no counting pass).
+- **`restoreByHash`** streams forward via `readline`; **`_loadTombstones`** streams
+  synchronously with a `StringDecoder` (multi-byte boundaries preserved);
+  **`_hashesFor`** streams asynchronously (so `RawStore.capture()` is now async —
+  only internal callers exist; the public `captureRaw()` contract is unchanged).
+- **Engine-side result ceiling**: `MAX_SCAN_RESULTS = 500` caps one scan even if an
+  embedder passes `limit: 5000`; `budget.maxHits` is reported, `truncated` is true
+  when the cap is reached.
+- **Observability**: `scanned.peakBufferBytes` exposes the largest buffer the
+  scanner ever held (proves the memory bound).
+
+### Added — stability hardening (same 1.5.6, no extra version bump)
+
+- **Recall response cap**: `context.maxInjectTokens` (default 4000, 256–100 000,
+  fail-fast) bounds the JSON one recall returns. `Memory.applyPayloadBudget()`
+  keeps hits in rank order (the first is always kept), then semantic/temp summaries;
+  a cut is loud: `truncated: true`, `payload: {maxTokens, estimatedTokens, dropped}`
+  and a `payload-budget` note. Editable over HTTP and rendered in the settings page
+  with a tooltip.
+- **`Memory.close()` releases resources**: `RawStore.close()` clears the flush timer
+  and synchronously persists queued turns before the log closes; `Memory.close()`
+  then detaches the scheduler, clears oversized-tag hints and calls
+  `IndexManager.release()` to drop the A/B views. Idempotent.
+- **Event-loop lag monitoring**: `src/eventLoop.js` (`createLagMonitor`) wraps
+  `perf_hooks.monitorEventLoopDelay`; `maintain()` yields 50ms between phases and
+  `IndexManager.rebuild` yields between read/build/catch-up/swap once the measured
+  max delay crosses 100ms. The report carries
+  `eventLoop: {maxMs, p99Ms, meanMs, yields, thresholdMs}`. Honest boundary: a
+  synchronous builder cannot be preempted, so the granularity is phase-level and the
+  numbers expose an oversized phase.
+
+### Added — pre-ingest tagging (same 1.5.6, no extra version bump)
+
+- **`src/tagging.js` / `extractTags()`**: deterministic anchors derived from content
+  shape — named error types (`error:typeerror`), Node errno codes
+  (`error:econnrefused`), fenced-code language (`lang:python`), HTTP status
+  (`http:500`), file path basename (`file:index.js`) and explicit task statements
+  (`task:…`). No LLM, no dependencies, stable ordering.
+- **Write gate** (`Memory.stage`): model-provided tags always win; only an untagged
+  write runs the heuristic. Tags are deduplicated and capped by `tagging.maxTags`
+  (1–5, default 2). Inferred anchors are recorded on `meta.auto_tagged` /
+  `meta.auto_tags` (provenance, not a silent rewrite of what the caller asserted).
+- **raw stays pure**: the black box still receives exactly
+  `{turn_id, timestamp, role, content}` — the test locks the four-field shape.
+- **Miss is a warning**: `MEM_E_AUTO_TAG_MISS` goes to the Host log via
+  `Memory.setWarnHook` (wired in `index.js`) and increments
+  `panel.autoTag.misses`; the write proceeds untagged.
+- **Config**: `tagging.autoTag` (default true) and `tagging.maxTags` (1–5), both
+  fail-fast, HTTP-editable and rendered in the settings page.
+
+### Added — pinned memory (same 1.5.6, no extra version bump)
+
+- **`remember({ pinned: true })`**: a lesson/experience that must survive time.
+  It stores `meta.pinned = true` (provenance included in `content_hash`) and is
+  refused with **`MEM_E_PINNED_TAG_REQUIRED`** unless the caller supplies at least
+  one tag — an untriggerable lesson would be dead memory.
+- **Never decays**: `projectEpisode` exposes `pinned`; `deriveTagTable` gives a
+  pinned event `decay = 1`, keeps its tag un-archived, and protected from the
+  `maxPostingsPerTag` drop; `deriveActiveSet` admits pinned tags regardless of
+  score or the cap.
+- **Ranks first**: recall gives every matching pinned record `decay = 1`, exempts
+  it from `minScore`, and orders pinned hits ahead of all others
+  (`pinned-first:N` note).
+- **Observability**: `panel.global.pinned` counts pinned records.
+- Tool surface: `memory_remember.pinned` (boolean) is documented and passed
+  through; `bulk_ingest` items accept the same field.
+
+### Changed — relevance-first prompt hints (same 1.5.6, no extra version bump)
+
+- **Global "most active tags" map removed from the prompt.** `runtime.promptState()`
+  now renders only tags that lexically overlap the CURRENT user turn (max 5), via
+  `src/utils/memoryHints.js` (`selectRelevantTags` / `renderMemoryHints`).
+  Internal bookkeeping tags (`status:*`, `month:*`, `context:*`, `active_task`)
+  are never hinted; no match means the section is simply absent (no padding).
+- **Cache-safe placement**: `[Memory Hints]` is rendered AFTER `[Memory Blocks]`,
+  so a per-turn hint never disturbs the cacheable prefix (rules only).
+- **Input source**: prompt assembly receives no message text, so the plugin tracks
+  the last `user/message` from `session/event` (`runtime.lastUserText`); other
+  surface events never overwrite it.
+- The legacy `renderMemoryMap` / `composePrompt({map})` API remains for callers
+  and is still unit-tested, but the plugin no longer injects the map.
+
+### Added — capability flags & microkernel boundary (same 1.5.6, no extra version bump)
+
+- **`features.multiSpace` (default true)** and **`features.crossSpaceTransfer`**
+  (default mirrors multiSpace). Both are fail-fast, HTTP-editable and rendered in
+  the settings page; turning multiSpace off implies crossSpaceTransfer off, and the
+  explicit contradictory combination is refused.
+- **Strict single-space mode**: with multiSpace off, every routed read/write whose
+  `targetSpaceId` is not `default` answers **`MEM_E_FEATURE_DISABLED`** (before any
+  I/O); `createSpace` / `ensureSpace` / `warmup` refuse too, and the `/spaces` route
+  reports `['default']` with `capabilities.spaces=false` so the client hides
+  create/selector affordances instead of 404-ing.
+- **Tools follow the flags**: `space_transfer` / `transfer_to_global` are neither
+  registered nor advertised in the prompt section when the capability is off.
+- **`Memory.open('/abs/dir')`** is now the single-space form (the Orchestrator owns
+  the multi-space walk); the options-object form stays supported.
+- **`Memory.warmup({targetSpaceId?, dataDir?})`**: lazy, read-only index warm-up for
+  the UI / Orchestrator — no maintenance, no writes; unknown/relative dataDir fails
+  fast.
+
+### Added — host lifecycle: compensating Dream (same 1.5.6, no extra version bump)
+
+- **`src/hostBridge.js`** subscribes to the Host's process-local events
+  `agent/created` and `session/created` (the "session start" signals) through a plain
+  `{on, off}` bus seam, plus `agent/disposed` for teardown.
+- **Compensation rule**: on a session start, if no Dream ran for
+  `dream.compensateAfterHours` (default 24, 1–720, fail-fast) AND the price window
+  permits, run exactly ONE compensating Dream through the shared
+  `runtime.runMaintenance('compensate')` gate — never a second concurrent run, never
+  a queue.
+- **Price is injected, never guessed**: `setPriceProbe(fn)` / `DSH_DREAM_PRICE=low|high`.
+  Unknown price + an LLM-backed Dream ⇒ skip (`price-unknown`); unknown + local-only
+  Dream ⇒ allowed. A known peak ⇒ skip (`peak`).
+- **Observability**: `runtime.hostStatus()` and `/stats`'s top-level `host` report
+  `sessionStarts / compensations / skipped / lastSkipReason / dreamDue / lowValley`.
+- `enableDream:false` disables compensation; `agent/created`/`session/created` do not
+  otherwise affect memory writes (raw capture remains on `session/event`).
+
+### Added — Dream tunables in the settings page (same 1.5.6, no extra version bump)
+
+- The **safe** Dream subset is now exposed to `/stats` + `/config` and rendered in
+  the settings page: `useLlm`, `minGroupSize`, `maxGroupsPerRun`, `maxSummaryChars`,
+  `maxSourceChars`, `maxEventsPerGroup`, `llmTimeoutMs`, `failureThreshold`,
+  `cooldownMinutes`, `compensateAfterHours` (all fail-fast validated).
+- **Credentials stay private**: `dream.llm.{baseUrl,model,apiKey}` is neither exposed
+  by the routes nor editable over HTTP nor rendered in the form; it comes only from
+  the profile or `DSH_DREAM_LLM_*` env. A test asserts the key never appears in the
+  `/stats` payload.
+
+### Added — L2 multi-merge (`merged_into`, same 1.5.6, no extra version bump)
+
+- **`src/l2Merge.js`** condenses duplicate same-tag L2 episodes into ONE durable
+  record, offline at the end of `maintain()` (after monthly memos; a failure never
+  fails maintenance).
+- **Pinned and ordinary groups are strictly separated** — pinned merges only with
+  pinned; ordinary only with ordinary. A pinned merge keeps `pinned: true` and
+  inherits every tag.
+- **Text**: earliest/latest time + deduplicated core text (each source capped), the
+  whole line capped by `l2Merge.maxSummaryChars` (ASCII ellipsis so identity
+  canonicalisation cannot make it longer).
+- **Federated metadata**: `meta.global_tags` is copied into the merged record's
+  `meta` and **never becomes a tag**, so it cannot enter the sub-space inverted index;
+  `projectEpisode` exposes it as `event.globalTags` for the merge layer only.
+- **Append-only marking**: sources are recorded as merged in
+  `state/l2-merge.json` (`mergedSourceIds`); the log is untouched and originals stay
+  recoverable. A second pass merges nothing (idempotent) and `status().panel.l2Merge`
+  reports the bookkeeping.
+- **Config `l2Merge`**: `enabled` (default true), `minGroupSize` (2–20, default 2),
+  `maxGroupsPerRun` (1–50, default 5), `maxSummaryChars` (100–2000, default 400);
+  fail-fast, HTTP-editable and rendered in the settings page.
+
+### Added — L3 semantic tag invariant (same 1.5.6, no extra version bump)
+
+- **`SemanticStore.upsert` is strict**: an L3 summary with zero usable tags is
+  refused with **`MEM_E_SEMANTIC_TAG_REQUIRED`** — such a summary could never be
+  reached by tag-driven retrieval (dead knowledge).
+- **Offline paths degrade instead of failing**: delete-consolidation and trend
+  promotion derive tags from content heuristics (`extractTags`) and, if even that
+  yields nothing, write an explicit provenance anchor (`origin:unlabelled-episode` /
+  `origin:unlabelled-trend`). Maintenance and the two-phase delete pipeline therefore
+  never break on historical untagged events.
+- **Historical data is read-only degraded**: summaries written before the invariant
+  remain readable and are marked `degraded: true` in `list()` /
+  `semanticSummaries()`; nothing is silently rewritten.
+
+### Added — working mode survives a handoff (same 1.5.6, no extra version bump)
+
+- **Handoff marker carries the Host agent preset** (the UI's “工作模式”): the marker
+  written at rollover now records `agentPreset`, fed by the live adapter through
+  `memory.setHandoffPresetProvider()`.
+- **A new conversation restores it before its first turn**: `agent/created` is a
+  serial Host event, so the bridge awaits `agentPresets.select(agent, preset)` for
+  `source === 'startup'` from a different session. `resume`, the marker-owner session
+  and markers without a preset are never overridden.
+- **Never breaks agent creation**: a failed `select` is reported in
+  `runtime.lastPresetInherit` and the log, then creation proceeds.
+- **Tracking**: `agent-preset/selected` updates the mode; tool boundaries and prompt
+  assembly opportunistically read `agents.currentInitiator()` + `agentPresets
+  .composedPreset()` and **backfill an older marker** that predates this feature.
+- **Observability**: `/stats` exposes `agentPreset` + `presetInherit`, and
+  `hostStatus().presetSelections` counts observed selections.
+
+### Changed — physical split: multi-space engine moved out (same 1.5.6)
+
+- **`src/spaces/spaceRouter.js` and `src/spaces/transfer.js` are GONE from this
+  package.** The full multi-space router (per-space FIFO chains, lazy child stores,
+  `MEM_E_*` validation) and the cross-space transfer engine now live in
+  `dsh-orchestrator` (`src/spaceRouter.js`, `src/transfer.js`).
+- The core compiles only `src/spaces/singleSpace.js`: the `default` space is the
+  owner handle; every named-space operation answers **`MEM_E_FEATURE_DISABLED`** with
+  an explicit "install dsh-orchestrator" hint. No silent fallback to `default`.
+- **Adapter injection is the wiring seam**: the Host's optional `orchestrator`
+  service supplies `createSpaceAdapter({owner, dataDir, openChild})` and `transfer`;
+  `Memory.open({spaces|spacesFactory, transfer})` accepts the same seam for embedders.
+  Without the service the plugin advertises `capabilities.spaces=false`, registers
+  only the eight single-space tools, and `/spaces` reports `default` only.
+- A profile with `features.multiSpace:true` but no Orchestrator logs a loud warning
+  and runs the strict single-space core (visible in `/stats.capabilities`), instead
+  of pretending the capability exists.
+
+### Added — first batch: orchestrator service + 3 experience fixes (same 1.5.6)
+
+- **Orchestrator service registration**: `apply()` now installs a real Host service
+  (`ctx.provide('orchestrator', …)` inside `ctx.effect`, so unloading removes it).
+  It exposes `createSpaceAdapter`, `transfer`, `dirFor`, `status`, `federation`,
+  `dedupe`, `consent` and `router`. The core decides the capability through
+  `config.multiSpaceActive(config, hasOrchestrator)`.
+- **Reserved system tags isolated from display**: `status:*`, `folded-summary` and
+  `active_task` are filtered out of the knowledge graph (`buildGraph` + defensive
+  `view`) and the L1.5 tag tree (`rebuildTree` + persisted-tree/ghost filtering).
+  The inverted index still keeps them (handoff/recall internals need them).
+- **`[Active Task]` injection**: prompt assembly prefers the active handoff summary,
+  otherwise the newest event carrying a `task:` tag, and renders it as an
+  unconditional top block (`[Active Task]`) once per session.
+- **Fallback hints**: `selectRelevantTags` accepts `fallbackTags`; when the current
+  input has no lexical overlap (e.g. “继续”), the previous turn's matched tags (max 2)
+  are carried into `[Memory Hints]`.
+- **Session-scoped injection dedup**: `runtime.injection` keeps per-session `ids` and
+  `tags`; hints, `[Active Task]` and recall blocks already injected are filtered on
+  later turns. SessionStart and rollover reset the pool, so the next session receives
+  the handoff content again.
+- **Space deletion (UI + engine)**: `SpaceRouter.deleteSpace(id, {confirm})` closes
+  the child handle, evicts its queues/caches and removes the directory (refusing
+  `default` and requiring `confirm:true`). `Memory.deleteSpace` / `runtime.deleteSpace`
+  gate the same rules (named space only; `MEM_E_FEATURE_DISABLED` in the strict
+  single-space core). The HTTP route reuses `POST /spaces` with
+  `{action:'delete', space_id, confirm:true}`; an **unknown action is a 400** and
+  never falls through to CREATE. The SpaceSelector renders `🗑 删除空间` only for a
+  named space AND only when the new **`capabilities.spacesDelete`** handshake is
+  true — an old/pre-delete host therefore hides the button instead of answering the
+  misleading “空间已存在”. When `capabilities.spaces` is false the entire space UI
+  (selector, create/delete, current-space chip) disappears silently.
+
+### Added — local low-valley Dream scheduling (same 1.5.6)
+
+- **No external price plugin required**: `src/priceWindow.js` computes Beijing-time
+  peak/valley locally (weekday 09–12 / 14–18 peak; lunch, nights and weekends low).
+  Chinese holidays are NOT modelled (the calendar moves yearly); `DSH_DREAM_PRICE=low|high`
+  or a Host price probe still override it.
+- **The Host bridge gets a default probe** from `isLowValley()`, so a compensating
+  Dream skips peaks (`reason:'peak'`) and runs locally in the valley.
+- **Idle LLM Dream defers instead of spending at peak**: `runtime.tick()` writes a
+  durable `state/dream-queue.json` (`pending, dueAt, reason:'peak-hour'`), emits
+  `dream-deferred`, and runs the queued Dream as soon as the valley opens — the queue
+  survives a restart, so a missed window is not lost.
+- **Config `dream.onlyLowValley`** (default true; fail-fast, HTTP-editable, settings
+  toggle). A local-only Dream (no LLM) is never gated by price.
+- `/stats` exposes `dreamWindow` (low/reason/nextLowAt), `dreamQueue` and `dreamTimer`.
+- **Phase 2 — wake timer + sleep correction**: `src/dreamTimer.js` arms ONE wake-up
+  at the queued due time / next valley (injectable timers, `unref`ed). On fire it
+  re-reads the CLOCK and the WINDOW: a late wake after an OS sleep is reported
+  (`lateMs`, `catchUp`) and runs; a wake that lands in a peak re-arms for the next
+  valley instead of spending. Boot arms from the persisted queue, so a queue left by
+  a previous run catches up with delay 0. Disposal cancels the timer.
+  `dreamTimer` status (arms/wakes/lateWakes/reschedules/runs) is exposed on `/stats`.
+
+### Added — Federation / cross-space dedupe wiring (same 1.5.6)
+
+- **Federation on write**: after a successful write the engine reports the record's
+  BUSINESS tags (never `status:*` / `month:*` / `active_task`) to the Orchestrator's
+  global `FederationMap` with the space id; a tag seen in two spaces becomes ONE
+  global node listing both. A missing/broken service can never fail the write.
+- **Dedupe on monthly memos**: `generateMonthlyMemos()` claims `sha256(content)` in
+  the Orchestrator's `ContentRegistry` as `monthly:<spaceId>`; a sibling space with
+  the identical monthly workload skips its copy and reports
+  `monthly.skipped`/`skippedEntries` (owner traceable). Same-space reruns are
+  idempotent.
+- Services arrive through the existing `orchestrator` adapter extras; spaces carry
+  their own `spaceId` (`path.basename(childDir)`), the default space is `default`.
+- **Read-time merge on recall**: monthly memos now persist `meta.source_event_ids`,
+  and `projectEpisode` exposes `sourceEventIds`. `Memory.mergeRecallHits()` feeds the
+  recalled hits through `ContentRegistry.mergeForRead()`: a memo wins over the events
+  it owns, duplicate `contentHash` collapses monthly-first, and the payload reports
+  `merge: {space,monthly,droppedOwnedByMonthly,droppedDuplicateContent,total}`. Only
+  when the Orchestrator dedupe service is present; the pure core payload shape is
+  unchanged.
+- **Cross-space recall aggregation**: `Memory.recallAcrossSpaces()` queries every open
+  space under its own lock, tags each hit with `spaceId`, and folds the union through
+  the same `mergeForRead()` (raw hits are requested with `mergeRecall:false` so the
+  aggregation sees owned events before the memo hides them). It is **opt-in**:
+  `features.crossSpaceRecall` defaults to **false**, is fail-fast (true without
+  multiSpace is a contradiction), HTTP-editable and rendered in the settings page.
+  Only when `crossSpaceRecall:true` does `runtime.recall()` use this path; otherwise
+  the single-space payload is unchanged (`mode` is never `cross-space`).
+  `mode:'cross-space'`, `spaces`, `merge` and per-hit `spaceId` are reported.
+
+### Tests
+
+- New `test/v156.rawscan.test.js` (5 cases): newest-first + absolute line number
+  (5000-line shard), turn-budget truncation without reading the head, engine result
+  ceiling, `readLinesReverse` peak buffer ≤ chunk + one line over a 20k-line file,
+  and `restoreByHash` over the streaming path.
+- New `test/v156.hardening.test.js` (5 cases): recall payload truncation and
+  under-budget pass-through, `maxInjectTokens` fail-fast, `close()` resource release
+  and idempotency, lag monitor yield after a 120ms block, maintenance `eventLoop`.
+- New `test/v156.tagging.test.js` (7 cases): extraction matrix, untagged write gets
+  an anchor and becomes recallable, raw purity (four fields), manual tags win +
+  dedupe, miss warning + panel counter, `autoTag:false`, config fail-fast.
+- New `test/v156.pinned.test.js` (3 cases): pinned without tags refused and no
+  write, one-year decay still `decay=1` + index/tag flags + pinned-first ranking,
+  pinned tag stays in the active set after a 400-day maintenance.
+- New `test/v156.hints.test.js` (4 cases): selector matrix (match/unrelated/internal/
+  empty), hint rendering, prompt tail contains only matching tags after the block
+  marker with a stable prefix, `session/event` user turn tracking.
+- New `test/v156.features.test.js` (5 cases): flag fail-fast + implied transfer-off,
+  strict single-space engine + capabilities/tools absent, transfer-only-off,
+  defaults unchanged, `Memory.open(string)` + lazy `warmup()`.
+- New `test/v156.host.test.js` (6 cases): price normalisation; session start runs one
+  compensating Dream; unknown price + LLM skipped; peak skipped; not-due / disabled /
+  in-flight refused; MockHostEnvironment integration through `apply()` + `hostStatus`
+  surfaced on `/stats`; `dream.compensateAfterHours` fail-fast.
+- New `test/v156.dreamui.test.js` (3 cases): safe Dream subset exposed / credentials
+  absent from the payload; tunables editable over HTTP while `dream.llm.*` is not;
+  settings page renders the section and offers no credential field.
+- New `test/v156.l2merge.test.js` (4 cases): pinned/ordinary strict separation with
+  global-tag metadata preserved as meta (never a tag); a lone ordinary record is not
+  dragged into the pinned group; `maxSummaryChars` cap + `enabled:false`; config
+  fail-fast. Older fixtures disable `l2Merge` so their exact index-count assertions
+  stay deterministic.
+- New `test/v156.l3tag.test.js` (4 cases): strict upsert refusal; delete-consolidation
+  derives `error:typeerror` / `origin:unlabelled-episode` instead of dead knowledge;
+  trend promotion derives tags before writing L3; historical untagged summaries are
+  readable but `degraded`.
+- New `test/v156.preset.test.js` (6 cases): marker records the working mode; a new
+  conversation restores it through `agentPresets.select`; older markers are
+  backfilled from the live agent; resume / same-session / marker-without-preset never
+  override; a failed select does not fail creation; `agent-preset/selected` keeps the
+  tracked mode current.
+- New `test/v156.singleSpace.test.js` (3 cases): the core works for `default` and
+  refuses named read/write/create/ensure/transfer; without the Orchestrator the plugin
+  advertises `spaces:false`, registers eight tools and never advertises a dead tool in
+  the prompt; injecting the adapter restores ten tools and `spaces:true`.
+- Updated: manifest 1.5.5 → 1.5.6; settings page gains `context.maxInjectTokens`,
+  the pre-ingest tagging section, Dream tunables and the L2-merge section; editable
+  contract gains `tagging`, `features`, `dream` and `l2Merge`; panel contract gains
+  `global.pinned`, `autoTag` and `l2Merge`; `plugin.test` prompt contract now asserts
+  relevance hints instead of the removed global map.
+- New `test/v156.firstBatch.test.js` (5 cases): reserved status tags never reach the
+  graph/tag tree; `[Active Task]` from the handoff summary and from a `task:` event;
+  fallback hints reuse the previous turn's tags; session dedup blocks the second
+  injection and resets on a new session.
+- New `test/v156.spaceDelete.test.js` (5 cases): engine deletion with confirm/default/
+  missing rules; strict single-space refusal; **`capabilities.spacesDelete` versioned
+  handshake** (an old host hides the button, so a delete request can never be
+  misread as CREATE); `POST /spaces {action:'delete'}` removes the store and returns
+  the refreshed list; unknown actions answer 400 instead of falling through to
+  CREATE; the UI source carries the capability guard, the button, the human confirm
+  and the default-space guard.
+- **Graph interaction layer** (`test/v156.graph.test.js`, 4 cases): Ctrl/Cmd+drag
+  pans the canvas (plain drag still moves a node), Ctrl/Cmd+wheel zooms around the
+  cursor via a non-passive native listener (plain wheel keeps page scroll),
+  double-click on blank space resets the view, and the frozen initial layout runs
+  through `separateOverlaps()` so nodes never start piled on top of each other.
+  The header/footer advertise the interaction.
+- New `test/v156.lowValley.test.js` (4 cases): Beijing peak/valley boundaries and
+  next-low computation; `dream.onlyLowValley` fail-fast + editable; a peak-hour idle
+  Dream is deferred durably and runs at the valley; the Host bridge probe follows the
+  window while `DSH_DREAM_PRICE` remains an override.
+- New `test/v156.federation.test.js` (2 cases): business tags federate into one
+  global node across spaces while internal tags are skipped; the first space claims a
+  cross-space monthly memo and the sibling reports `skipped` with the owner.
+- New `test/v156.lowValley2.test.js` (4 cases): peak wake re-arms (never runs); a
+  sleep-delayed wake reports `lateMs`/`catchUp`; a past-due queue in the valley arms
+  delay 0; runtime integration: peak deferral -> timer fire -> queue cleared and
+  `dreamTimer.runs === 1`.
+- New `test/v156.readMerge.test.js` (2 cases): a recalled monthly memo drops the
+  events it owns and reports merge stats; without the dedupe service the recall
+  payload is unchanged.
+- New `test/v156.crossSpaceRecall.test.js` (2 cases): a recall returns hits from every
+  open space with provenance; a monthly memo hides its owned event even when recorder
+  in another space, while the other space still contributes.
+- New `test/v156.crossSpaceRecallFlag.test.js` (3 cases): default false + fail-fast
+  (`true` without multiSpace is a contradiction, non-boolean rejected); flag true
+  aggregates open spaces; flag false keeps the single-space payload.
+- **Durable Orchestrator state**: `<root>/state/orchestrator.json` now persists the
+  global federation map and the monthly-memo claims (atomic tmp+rename on every
+  mutation); it is loaded before the services become observable, and a corrupt file
+  is treated as empty instead of failing activation — a restart no longer forgets
+  cross-space dedupe.
+- Full suite: **389 tests / 389 pass / 0 fail**, 62 test files. Orchestrator:
+  **31/31** (`service` + `spaces` deletion + `persistence` round-trip/corrupt state).
+  **Installed locally**: desktop profile gets a `link:` dependency + an ordered patch
+  insert BEFORE the hippocampus entries, so the service exists at activation. Two
+  Cordis constraints were fixed on the way: `apply()` must return **undefined**
+  (the return value is treated as an effect → `TypeError: Invalid effect`), and the
+  service is registered directly with `ctx.provide` (itself an effect). The market
+  catalog still does **not** list it: that needs an npm publish / catalog submission.
+- Added `docs/RELEASE-1.5.6.md`: release notes + the exact push/tag/npm/market
+  commands that require the operator's credentials (none executed here).
+
+## [1.5.5] — 2026-11-03
+
+**Offline Dream distillation: an optional LLM pass that can never take Dream down.**
+Same-tag L2 records are distilled into one durable, provenance-carrying record.
+The LLM leg uses **Node's built-in `fetch` only** (charter v2.0 #1: still zero
+dependencies); endpoint / model / key are injected through config or
+`DSH_DREAM_LLM_*` env and are never hard-coded, logged, or returned by HTTP.
+Every failure — no config, network down, timeout, non-JSON — silently degrades to
+the deterministic local merge and records `MEM_E_DREAM_LLM_FALLBACK`. **303 tests
+green** (was 295).
+
+### Added — Dream LLM distillation (`src/dream.js`, `Memory.executeDream`)
+
+- **Structured output**: the model must answer JSON `{"summary","confidence"}`;
+  `summary` is capped at `dream.maxSummaryChars` (default 200). Fenced code,
+  non-JSON, missing fields and over-long summaries are all treated as LLM failure.
+- **Zero-dependency transport**: Node's global `fetch` against an
+  OpenAI-compatible `/chat/completions`; `Authorization: Bearer` only when a key is
+  configured. No SDK, no `node-fetch`, no new `package.json` dependency (test-locked).
+- **Absolute timeout**: `AbortController` + `Promise.race` under
+  `dream.llmTimeoutMs` (default 15s); the timer is always cleared in `finally`.
+- **Local fallback**: earliest/latest time + deduplicated core text, capped to
+  `maxSummaryChars`. Degradation warns `MEM_E_DREAM_LLM_FALLBACK` and is visible in
+  `status().panel.dream.lastFallback`.
+- **Provenance**: the distilled record always carries
+  `meta.source_event_ids` (deduped, sorted) and `meta.distilled_by` (`llm|local`);
+  a re-run never merges the same source twice (`state/dream.json` bookkeeping).
+- **Circuit breaker**: `failureThreshold` (default 3) consecutive failures open the
+  breaker for `cooldownMinutes` (default 60); afterwards a half-open state allows
+  exactly one probe — success closes it, failure re-opens. Exposed as
+  `panel.dream.circuit`.
+- **Single-flight + serial**: a concurrent `executeDream()` is refused
+  (`dream-in-flight`); within one run groups are processed strictly serially, so a
+  slow provider can never exhaust connections or accumulate queued work.
+- **Offline only**: `executeDream()` is called exclusively from the `dream` branch
+  of the maintenance gate, after `maintain()` converged; the online
+  `recall`/`remember` paths never touch the network.
+
+### Config
+
+- New `dream` group (fail-fast validated): `useLlm`, `minGroupSize` (2–50),
+  `maxGroupsPerRun` (1–50), `maxSummaryChars` (40–2000), `maxSourceChars`
+  (80–4000), `maxEventsPerGroup` (2–50), `llmTimeoutMs` (500–120000),
+  `failureThreshold` (1–20), `cooldownMinutes` (1–1440), and
+  `llm.{baseUrl,model,apiKey}`. The `llm` block is deliberately **not** part of the
+  UI/HTTP config projection, so a credential can never leak through the panel.
+
+### Tests
+
+- New `test/v155.dream.test.js` (8 cases): no-config local fallback with full
+  provenance; LLM success (URL/header/body/JSON parse); non-JSON degradation;
+  fetch timeout degradation; single-flight refusal; circuit open → no fetch →
+  half-open single probe → close; `dream` config fail-fast matrix; `package.json`
+  dependency red line.
+- Updated: status-panel contract gains `dream`; manifest 1.5.4 → 1.5.5.
+- Full suite: **303 tests / 303 pass / 0 fail**, 41 test files.
+
 ## [1.5.4] — 2026-11-02
 
 **Hotfix: the automatic handoff state machine can no longer wedge a session, and

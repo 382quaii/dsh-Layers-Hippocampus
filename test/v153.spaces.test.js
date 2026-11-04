@@ -23,8 +23,8 @@ import { createRuntime } from '../index.js';
 import { resolveConfig, toMemoryOptions } from '../src/config.js';
 import { ErrorCodes } from '../src/errors.js';
 import { MEMORY_API, createMemoryRoutes, registerMemoryRoutes } from '../src/webRoutes.js';
-import { validateNewSpaceId } from '../src/spaces/spaceRouter.js';
-import { FakeClock, T0, makeMemory, tempDir } from './helpers.js';
+import { validateNewSpaceId } from '../../dsh-orchestrator/src/spaceRouter.js';
+import { createOrchestratorStub, FakeClock, T0, makeMemory, tempDir } from './helpers.js';
 
 const CLIENT_PATH = new URL('../ui/client.js', import.meta.url);
 const FRIENDLY_404 = '创建失败：底层引擎未响应，请检查版本或联系架构师';
@@ -62,7 +62,7 @@ async function call(routes, routePath, request) {
 async function withRuntime(body) {
   const dir = tempDir('v153');
   const config = resolveConfig({ dataDir: dir, autoMaintainOnBoot: false });
-  const runtime = createRuntime({ config, options: toMemoryOptions(config), clock: new FakeClock(T0) });
+  const runtime = createRuntime({ config, options: toMemoryOptions(config), clock: new FakeClock(T0), orchestrator: createOrchestratorStub() });
   try {
     runtime.start();
     await runtime.ready;
@@ -290,7 +290,7 @@ test('the capability handshake turns an old host into a version hint, not a 404'
     'function spaceCreateAvailable',
     'function describeSpaceError',
     'capabilities.spaces',
-    '创建失败：底层引擎未响应，请检查版本或联系架构师',
+    '底层引擎未响应，请检查版本或联系架构师',
     '空间名称需以小写字母/数字开头',
   ]) {
     assert.ok(source.includes(marker), `client must contain ${marker}`);

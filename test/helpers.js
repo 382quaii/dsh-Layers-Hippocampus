@@ -10,6 +10,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { DAY_MS, FakeClock } from '../src/clock.js';
 import { Memory } from '../src/memory.js';
+// v1.5.6 physical split: the multi-space engine lives in the sibling package; the
+// suite injects it through the same adapter seam the Host service uses.
+import { SpaceRouter as MultiSpaceRouter } from '../../dsh-orchestrator/src/spaceRouter.js';
+import { transferBetweenSpaces } from '../../dsh-orchestrator/src/transfer.js';
 
 export { DAY_MS, FakeClock };
 
@@ -20,12 +24,77 @@ export function tempDir(prefix = 'dsh-memory-test') {
   return fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
 }
 
+export function createOrchestratorStub({ dedupe = null, federation = null } = {}) {
+  return {
+    createSpaceAdapter: ({ owner, dataDir, openChild }) => new MultiSpaceRouter({ owner, dataDir, openChild }),
+    transfer: transferBetweenSpaces,
+    ...(dedupe ? { dedupe } : {}),
+    ...(federation ? { federation } : {}),
+  };
+}
+
+/**
+ * Options that inject the Orchestrator's multi-space engine into a raw
+ * `Memory.open(...)` call (tests that bypass the plugin runtime).
+ */
+export function multiSpaceOptions({ config = {}, dedupe = null, federation = null } = {}) {
+  const buildSpaces = (owner) =>
+    new MultiSpaceRouter({
+      owner,
+      dataDir: owner.dataDir,
+      openChild: async (childDir) =>
+        Memory.open({
+          dataDir: childDir,
+          clock: owner.clock,
+          policy: owner._policyInput ?? SMALL_POLICY,
+          config,
+          spaceId: String(childDir).split(/[\\/]/).pop(),
+          spacesFactory: buildSpaces,
+          transfer: transferBetweenSpaces,
+          ...(dedupe ? { dedupe } : {}),
+          ...(federation ? { federation } : {}),
+        }),
+    });
+  return { spacesFactory: buildSpaces, transfer: transferBetweenSpaces };
+}
+
 /** Policy that admits tags after a single event, so small fixtures have a resident set. */
 export const SMALL_POLICY = Object.freeze({ activeSet: { minEvents: 1, minMass: 0.01 } });
 
-export async function makeMemory({ dir = tempDir(), start = T0, policy = SMALL_POLICY, config = {} } = {}) {
+export async function makeMemory({ dir = tempDir(), start = T0, policy = SMALL_POLICY, config = {}, multiSpace = true, dedupe = null, federation = null } = {}) {
   const clock = new FakeClock(start);
-  const memory = await Memory.open({ dataDir: dir, clock, policy, config });
+  // v1.5.6: L2 multi-merge is exercised by its own suite. Fixtures disable it by
+  // default so a test that floods ONE tag keeps exact index counts; a test that
+  // wants the merge passes `config.l2Merge` explicitly.
+  const resolvedConfig = { ...config, l2Merge: { enabled: false, ...(config.l2Merge ?? {}) } };
+  // v1.5.6 physical split: multi-space lives in dsh-orchestrator; the engine tests
+  // inject its router/transfer through the same adapter seam the Host uses.
+  const buildSpaces = (owner) =>
+    new MultiSpaceRouter({
+      owner,
+      dataDir: owner.dataDir,
+      openChild: async (childDir) =>
+        Memory.open({
+          dataDir: childDir,
+          clock: owner.clock,
+          policy: owner._policyInput ?? policy,
+          config: resolvedConfig,
+          spaceId: String(childDir).split(/[\\/]/).pop(),
+          spacesFactory: buildSpaces,
+          transfer: transferBetweenSpaces,
+          ...(dedupe ? { dedupe } : {}),
+          ...(federation ? { federation } : {}),
+        }),
+    });
+  const memory = await Memory.open({
+    dataDir: dir,
+    clock,
+    policy,
+    config: resolvedConfig,
+    ...(dedupe ? { dedupe } : {}),
+    ...(federation ? { federation } : {}),
+    ...(multiSpace ? { spacesFactory: buildSpaces, transfer: transferBetweenSpaces } : {}),
+  });
   return {
     memory,
     clock,
@@ -79,12 +148,15 @@ export function indexFile(dir, name) {
  * Minimal fake of the Host services this plugin touches: tools registry, prompt
  * registry, effect lifecycle, logger. No real cordis, no real harness.
  */
-export function fakeCtx() {
+export function fakeCtx({ orchestrator = true } = {}) {
   const tools = new Map();
   const sections = [];
   const contexts = [];
   const cleanups = [];
   const services = new Map();
+  // v1.5.6: the space adapter is an optional Host service (dsh-orchestrator).
+  // Engine/plugin tests get it by default; single-space tests set it false.
+  if (orchestrator) services.set('orchestrator', createOrchestratorStub());
   const ctx = {
     logger: { info() {}, warn() {}, error() {}, debug() {} },
     tools: {

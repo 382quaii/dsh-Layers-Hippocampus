@@ -22,6 +22,7 @@ import {
   writeJsonAtomic,
 } from '../util.js';
 import { normaliseTagToken } from '../policy.js';
+import { extractTags } from '../tagging.js';
 import { controlIdFor } from '../identity.js';
 
 export const SUMMARY_TYPES = Object.freeze({ UPSERT: 'semantic_upsert', RETIRE: 'semantic_retire' });
@@ -72,16 +73,22 @@ export class SemanticStore {
     }
     if (this._seq < lines) this._seq = lines;
     return [...byId.values()]
-      .map((record) => ({
-        summaryId: record.summary_id,
-        title: record.title,
-        text: record.text,
-        confidence: record.confidence,
-        tags: record.tags ?? [],
-        sourceEvents: record.source_events ?? [],
-        firstSeenAt: record.first_seen_at ?? record.log_time,
-        updatedAt: record.log_time,
-      }))
+      .map((record) => {
+        const tags = record.tags ?? [];
+        return {
+          summaryId: record.summary_id,
+          title: record.title,
+          text: record.text,
+          confidence: record.confidence,
+          tags,
+          sourceEvents: record.source_events ?? [],
+          firstSeenAt: record.first_seen_at ?? record.log_time,
+          updatedAt: record.log_time,
+          // v1.5.6: historical summaries written before the tag invariant existed are
+          // READABLE but marked degraded instead of being silently rewritten.
+          degraded: tags.length === 0,
+        };
+      })
       .sort((a, b) => b.updatedAt - a.updatedAt || a.summaryId.localeCompare(b.summaryId));
   }
 
@@ -98,6 +105,16 @@ export class SemanticStore {
   upsert({ clock, title, text, confidence, tags = [], sourceEvents = [] }) {
     if (!title || !text) throw new MemoryError(ErrorCodes.INVALID_INPUT, 'summary needs title and text');
     const mergedTags = [...new Set(tags.map(normaliseTagToken).filter(Boolean))].sort();
+    // v1.5.6 invariant: an L3 summary without an anchor is dead knowledge — tag-driven
+    // retrieval can never reach it. Refuse at the explicit API; the offline callers
+    // derive a deterministic fallback tag instead (see ensureForEvent).
+    if (mergedTags.length === 0) {
+      throw new MemoryError(ErrorCodes.SEMANTIC_TAG_REQUIRED, 'semantic summary requires at least one tag', {
+        title,
+        sourceEvents: [...sourceEvents].sort(),
+        hint: '提供 tags，或让写作路径从内容提取（extractTags）；离线路径会写 origin:unlabelled-* 兜底锚点',
+      });
+    }
     const summaryId = summaryIdFor({ title, sourceEvents });
     const existing = this.list().find((summary) => summary.summaryId === summaryId);
     const record = {
@@ -139,8 +156,14 @@ export class SemanticStore {
    * A caller may inject a better distiller later (same signature).
    */
   ensureForEvent({ nextId, clock, event, reason = 'delete-consolidation' }) {
-    const tags = (event.tags ?? []).map((t) => (typeof t === 'string' ? t : t.tag));
-    const title = tags.length > 0 ? `Pattern: ${tags.slice(0, 3).join(' + ')}` : 'Pattern: unlabelled episode';
+    // v1.5.6: the offline path must never fail the delete pipeline, but it must also
+    // never write dead knowledge. Fallback chain: event tags -> content heuristics ->
+    // an explicit provenance anchor.
+    const tags = (event.tags ?? []).map((t) => (typeof t === 'string' ? t : t.tag)).filter(Boolean);
+    const derived = tags.length > 0 ? [] : extractTags(event.content, { maxTags: 2 });
+    const finalTags = tags.length > 0 ? tags : derived.length > 0 ? derived : ['origin:unlabelled-episode'];
+    const anchor = finalTags.slice(0, 3).join(' + ');
+    const title = tags.length > 0 ? `Pattern: ${anchor}` : `Pattern: ${anchor} (derived)`;
     const text = `Distilled from a high-salience episode (${reason}). ${event.content.slice(0, 600)}`;
     const confidence = Math.max(
       0.3,
@@ -152,7 +175,7 @@ export class SemanticStore {
       title,
       text,
       confidence,
-      tags,
+      tags: finalTags,
       sourceEvents: [event.event_id],
     });
   }
@@ -184,6 +207,7 @@ export class SemanticStore {
       sourceEvents: record.source_events,
       firstSeenAt: record.first_seen_at,
       updatedAt: record.log_time,
+      degraded: (record.tags ?? []).length === 0,
     };
   }
 }

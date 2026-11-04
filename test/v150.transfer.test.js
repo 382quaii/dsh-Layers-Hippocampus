@@ -32,7 +32,7 @@ import {
   scanPrivacy,
   sanitiseTransferMeta,
   transferBetweenSpaces,
-} from '../src/spaces/transfer.js';
+} from '../../dsh-orchestrator/src/transfer.js';
 import { SMALL_POLICY, T0, logRecords, makeMemory } from './helpers.js';
 
 const HOUR = 3_600_000;

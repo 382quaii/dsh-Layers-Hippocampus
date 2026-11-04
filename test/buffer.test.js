@@ -70,7 +70,9 @@ test('a suspended rebuild never exposes a partial index to readers', async () =>
 test('rebuild source is the log minus tombstones, not the old index', async () => {
   const dir = tempDir('rebuild-set');
   const clock = new FakeClock(T0);
-  const memory = await Memory.open({ dataDir: dir, clock });
+  // v1.5.6: disable L2 multi-merge — this fixture asserts the exact episode count
+  // of the log-minus-tombstones rebuild; a derived merged record would add one.
+  const memory = await Memory.open({ dataDir: dir, clock, config: { l2Merge: { enabled: false } } });
   try {
     const ids = [];
     for (let i = 0; i < 6; i += 1) {

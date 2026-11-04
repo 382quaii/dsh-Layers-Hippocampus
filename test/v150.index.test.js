@@ -204,7 +204,9 @@ test('recall refuses an oversized explicit tag, then honours insistence with 3 r
 });
 
 test('deep_raw requires a window for a super tag but keeps plain validation', async () => {
-  const { memory, cleanup } = await makeMemory();
+  // v1.5.6: disable L2 multi-merge here — the fixture's 501 same-tag episodes are
+  // the point of the test, and a merged record would add one more index event.
+  const { memory, cleanup } = await makeMemory({ config: { l2Merge: { enabled: false } } });
   try {
     const items = Array.from({ length: 501 }, (_, index) => ({
       content: `super event ${index}`,

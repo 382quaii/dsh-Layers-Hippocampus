@@ -107,6 +107,18 @@ export function projectEpisode({ episode, aliases, reinforcement = null }) {
     logTime: episode.log_time,
     day: dayKey(anchorTime),
     salience: clamp01(Number(episode.salience ?? 0.5)),
+    // v1.5.6: a pinned record never decays (charter: lessons must survive time).
+    pinned: episode.meta?.pinned === true,
+    // Federated big-tag metadata (Orchestrator) is META only: it is exposed for the
+    // L2 merge / federation layer but is never a tag, so it cannot enter this
+    // sub-space's inverted index.
+    globalTags: Array.isArray(episode.meta?.global_tags)
+      ? [...new Set(episode.meta.global_tags.filter((tag) => typeof tag === 'string' && tag))].sort()
+      : [],
+    // v1.5.6: monthly-memo provenance, used by the read-time cross-space merge.
+    sourceEventIds: Array.isArray(episode.meta?.source_event_ids)
+      ? [...new Set(episode.meta.source_event_ids.filter((id) => typeof id === 'string' && id))].sort()
+      : [],
     content: episode.content,
     tags: [...strengthByTag.entries()]
       .map(([tag, strength]) => ({ tag, strength: round(strength, 4) }))
@@ -184,6 +196,8 @@ export function buildIndex({
     // many event pointers were left out of the index (the log keeps them all).
     postingsTruncated: Object.values(tags).filter((entry) => entry.postingsTruncated).length,
     postingsDropped: Object.values(tags).reduce((sum, entry) => sum + entry.postingsDropped, 0),
+    // v1.5.6: how many records are pinned (never decay, never archived).
+    pinnedEvents: events.filter((event) => event.pinned === true).length,
   };
 
   return {
@@ -233,13 +247,18 @@ export function deriveTagTable(events, { policy, now, maxPostingsPerTag = 500 })
 
   for (const event of events) {
     const anchor = event.anchorTime ?? event.eventTime;
-    const decay = decayFactor({
-      eventTime: anchor,
-      lastReinforcedAt: event.lastReinforcedAt,
-      now,
-      halfLifeDays: halfLife,
-      floor: policy.decay.floor,
-    });
+    const pinnedEvent = event.pinned === true;
+    // v1.5.6: pinned records are exempt from time decay (they anchor lessons that
+    // must remain retrievable regardless of age).
+    const decay = pinnedEvent
+      ? 1
+      : decayFactor({
+          eventTime: anchor,
+          lastReinforcedAt: event.lastReinforcedAt,
+          now,
+          halfLifeDays: halfLife,
+          floor: policy.decay.floor,
+        });
     for (const { tag, strength } of event.tags) {
       const entry = table[tag] ?? {
         tag,
@@ -250,13 +269,16 @@ export function deriveTagTable(events, { policy, now, maxPostingsPerTag = 500 })
         lastReinforcedAt: null,
         reinforcementCount: 0,
         archived: false,
+        pinned: false,
       };
       entry.postings.push({
         eventId: event.eventId,
         strength,
         eventTime: anchor,
         salience: event.salience,
+        pinned: pinnedEvent,
       });
+      if (pinnedEvent) entry.pinned = true;
       entry.eventCount += 1;
       entry.mass += event.salience * decay;
       entry.lastSeen = Math.max(entry.lastSeen, anchor);
@@ -275,8 +297,9 @@ export function deriveTagTable(events, { policy, now, maxPostingsPerTag = 500 })
     const lastActivity = Math.max(entry.lastSeen, entry.lastReinforcedAt ?? 0);
     const cold = now - lastActivity > policy.tags.archiveAfterDays * 86_400_000;
     // Low-frequency archival: cold AND thin. A cold but heavy tag stays: it still
-    // carries a pattern worth retrieving.
-    entry.archived = cold && entry.eventCount < policy.tags.archiveMinEvents;
+    // carries a pattern worth retrieving. v1.5.6: a tag holding a pinned record is
+    // never archived — pinned lessons must stay addressable.
+    entry.archived = entry.pinned ? false : cold && entry.eventCount < policy.tags.archiveMinEvents;
   }
 
   return Object.fromEntries(Object.entries(table).sort(([a], [b]) => a.localeCompare(b)));
@@ -299,7 +322,14 @@ function capPostings(entry, cap) {
   }
   const retained = entry.postings
     .slice()
-    .sort((a, b) => b.salience - a.salience || b.eventTime - a.eventTime || a.eventId.localeCompare(b.eventId))
+    // v1.5.6: pinned postings are never the ones dropped by the physical cap.
+    .sort(
+      (a, b) =>
+        Number(b.pinned === true) - Number(a.pinned === true) ||
+        b.salience - a.salience ||
+        b.eventTime - a.eventTime ||
+        a.eventId.localeCompare(b.eventId),
+    )
     .slice(0, cap);
   // Retention rank is not retrieval order: survivors go back to newest-first so the
   // cap is invisible to every existing consumer except for the dropped ids.
@@ -362,6 +392,8 @@ export function deriveActiveSet(tags, { policy, now, previous = null }) {
       evictionKey: round(priority * decayScore, 6),
       // "Eligible" is a threshold on the continuous score plus a volume floor.
       eligible: entry.eventCount >= config.minEvents && entry.mass >= config.minMass,
+      // v1.5.6: a tag carrying a pinned record is admitted regardless of score.
+      pinned: entry.pinned === true,
       eventCount: entry.eventCount,
       mass: entry.mass,
       lastSeen: entry.lastSeen,
@@ -369,7 +401,10 @@ export function deriveActiveSet(tags, { policy, now, previous = null }) {
     });
   }
 
-  const eligible = scored.filter((s) => s.eligible);
+  // v1.5.6: pinned tags bypass the cap entirely (they are the anchors the whole
+  // pinned mechanism exists to protect); ordinary tags compete for the remainder.
+  const pinnedTags = scored.filter((s) => s.pinned);
+  const eligible = scored.filter((s) => !s.pinned && s.eligible);
   // Eviction order documented in policy: priority * decay ascending; ties break on
   // the longest-unreinforced (`lastReinforcedAt ?? lastSeen` oldest first), then tag.
   eligible.sort((a, b) => {
@@ -380,8 +415,10 @@ export function deriveActiveSet(tags, { policy, now, previous = null }) {
     return a.tag.localeCompare(b.tag);
   });
 
-  const kept = eligible.slice(0, config.cap);
-  const evicted = eligible.slice(config.cap);
+  const pinnedKeep = pinnedTags.slice(0, config.cap);
+  const remaining = Math.max(0, config.cap - pinnedKeep.length);
+  const kept = [...pinnedKeep, ...eligible.slice(0, remaining)];
+  const evicted = eligible.slice(remaining);
 
   const entries = kept.map((entry) => ({
     tag: entry.tag,
@@ -413,7 +450,7 @@ export function deriveActiveSet(tags, { policy, now, previous = null }) {
     })),
     archived,
     belowThreshold: scored
-      .filter((s) => !s.eligible)
+      .filter((s) => !s.pinned && !s.eligible)
       .map((s) => ({ tag: s.tag, priority: s.priority, eventCount: s.eventCount, mass: s.mass })),
     budgetUsed: entries.reduce((sum, e) => sum + e.budget, 0),
     churn: {

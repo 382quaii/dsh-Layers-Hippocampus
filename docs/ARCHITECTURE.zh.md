@@ -191,12 +191,59 @@ state/tag-tree.json              L1.5 标签层级树 + 幽灵宽限 + 待修剪
 - **briefing 脏标记**：写只置脏，下一次 `briefing()`/面板轮询才重算一次。
 - **实测**：顺序 `remember` ×1000 **119/s → 9104/s**（8.4s → 110ms），10⁵ 事件的回归测试仍全绿。
 
-## 原始回合取证：`deep_raw` 扫描顺序（1.4.3）
+## 入库即打标（Pre-Ingest Tagging，1.5.6）
 
-- **最新优先**：分片内从尾部倒序扫描（先 newest shard、再 newest line），时间窗仍是硬约束。旧实现从文件头正序扫描，5000 回合预算永远花在最旧的数据上——10k 分片里最新的记录根本查不到，这是黑匣子语义的反转。单分片大小本身由 `raw.maxBytesPerDay` 约束（默认 8MB），整片读入是有界的。
-- **预算来自 config**：`raw.maxScanTurns`（默认 5000，范围 500–50 000，UI 可调），不再使用隐藏常量；`raw.maxScanMb` 仍限制累计字节。命中超出任一预算 → `truncated: true` + `notes` 说明，绝不静默假装"没有"。
+模型是不可靠的打标器：长对话里它可能只调一次 `remember`、之后再不写 tags，于是大量 episode 没有锚点。引擎在**写入闸门**（raw 已记录原文之后、episode 计算哈希之前）补上确定性锚点：
+
+- **模型优先**：手传 `tags` 存在时启发式**完全不运行**（不覆盖、不追加）。
+- **确定性规则**（`src/tagging.js`，无 LLM/无依赖/顺序稳定）：具名错误类型 → `error:typeerror`；Node errno → `error:econnrefused`；围栏代码语言 → `lang:python`；HTTP 状态 → `http:500`；文件路径 basename → `file:index.js`；显式任务语句（`任务：…` / `TODO: …`）→ `task:…`。
+- **纯净边界**：raw 仍是四字段 `{turn_id, timestamp, role, content}`（测试锁定），标签只进 episode/索引；合并用 `Set` 去重，数量受 `tagging.maxTags`（1–5，默认 2）限制。
+- **溯源**：推断出的 tags 同时写入 `meta.auto_tagged=true` 与 `meta.auto_tags`，与模型断言区分；`meta` 参与 `content_hash`，所以同一内容的幂等性不变。
+- **失败只是警告**：一条都提取不到时记 `MEM_E_AUTO_TAG_MISS`（经 `Memory.setWarnHook` 进 Host 日志）并累加 `panel.autoTag.misses`，写入照常成功、tags 为空。
+- 开关 `tagging.autoTag`（默认 true）、`tagging.maxTags` 均 fail-fast、HTTP 可编辑、设置页可调。
+
+## 原始回合取证：`deep_raw` 按行游标扫描（1.4.3 最新优先 → 1.5.6 流式）
+
+- **最新优先**：分片内从尾部倒序扫描（先 newest shard、再 newest line），时间窗仍是硬约束。旧实现从文件头正序扫描，5000 回合预算永远花在最旧的数据上——10k 分片里最新的记录根本查不到，这是黑匣子语义的反转。
+- **按行游标（1.5.6）**：`readLinesReverse()` 以 64 KiB 块从文件尾部倒读，一次只产出**一行**；峰值内存 = 一个 chunk + 一条未完成的行（`scanned.peakBufferBytes` 可观测、测试锁定），与文件大小无关。**不再整读分片**：`readFileSync + split` 已从 scan、`restoreByHash`、`_loadTombstones` 全部移除；`_hashesFor` 也改为流式（因此内部 `RawStore.capture()` 是 async）。
+- **绝对行号 `hit.line`**：倒读不知道行号，所以只在**该分片确实产生命中**时，额外做一次 O(chunk) 的流式行数统计，`line = total - fromTail`；未命中的分片不付这次统计成本。行号仍是正整数、以文件头为 1 的语义（v1.4 契约不变）。
+- **预算来自 config**：`raw.maxScanTurns`（默认 5000，范围 500–50 000，UI 可调），不再使用隐藏常量；`raw.maxScanMb` 仍限制累计字节；引擎另设 `MAX_SCAN_RESULTS = 500` 的结果硬上限（`budget.maxHits` 回报）。命中超出任一预算 → `truncated: true` + `notes` 说明，绝不静默假装"没有"。
 - **⚠ 尾扫偏置（明确的已知代价）**：单分片超过 `maxScanTurns` 时，一次调用只覆盖该分片**最新的 N 条**；更早的历史需要 ① 调大 `raw.maxScanTurns`（上限 50 000），或 ② 按时间窗分页（逐步前移 `end_time`，多次查询不同窗口）。这是"查新优先"的直接代价，返回体用 `truncated: true` + notes 明确告知未扫完；不存在静默的空结果。
 - 回归护栏：四字段 schema、tombstone 跳过、read-side 脱敏、token 预算、`hash_` 精确恢复全部不变。
+
+## 固定经验（Pinned，1.5.6）
+
+“踩过的坑”不能随时间衰减，否则一年后模型会重犯同一个错误。`remember({ pinned: true })` 把一条记录标记为**固定经验**：
+
+- **写入契约**：必须由调用方显式提供至少一个 tag；缺失直接抛 `MEM_E_PINNED_TAG_REQUIRED`，一条都不写（无法被标签触发的经验是死记忆）。`meta.pinned=true` 参与 `content_hash`，是记录的一部分。
+- **不衰减**：`projectEpisode` 暴露 `event.pinned`；`deriveTagTable` 对 pinned 事件取 `decay = 1`、其标签永不 `archived`、且在 `maxPostingsPerTag` 截断时优先保留；`deriveActiveSet` 无条件纳入 pinned 标签（不占普通标签竞争名额）。
+- **置顶召回**：检索给 pinned 命中 `decay = 1`、豁免 `minScore`，并把所有 pinned 命中排在普通命中之前（note `pinned-first:N`）。
+- **可观测**：`panel.global.pinned` 统计固定经验数量。
+- **边界**：`forget`/`restore` 仍然有效——pinned 只对抗时间与淘汰，不对抗用户的显式删除。
+
+## 能力开关与微内核边界（1.5.6）
+
+`features` 组是「本体只保留原子能力」的第一阶段：默认全开（行为不变），关掉后能力**显式消失**而不是静默降级。
+
+- **`features.multiSpace`**（默认 true）：关闭后 `assertSpaceFeature()` 把本体的路由读/写收敛为单空间——任何 `targetSpaceId !== 'default'` 在 I/O 之前抛 `MEM_E_FEATURE_DISABLED`；`createSpace` / `ensureSpace` / `warmup` 同样拒绝；`GET /spaces` 只回 `['default']` 且 `capabilities.spaces=false`，客户端据此隐藏创建/切换入口。
+- **`features.crossSpaceTransfer`**（默认随 multiSpace）：关闭后 `space_transfer` / `transfer_to_global` 工具既不注册、也不在提示词里宣传；`transferEvents()` 先抛 `MEM_E_FEATURE_DISABLED`（在 consent 之前，不泄露任何目标校验信息）。
+- **配置约束**：关 multiSpace 隐含关 transfer；显式给出 `multiSpace:false + crossSpaceTransfer:true` 属于配置矛盾，激活时 fail-fast。
+- **单空间 API**：`Memory.open('/abs/dir')` 是新的单空间入口（Orchestrator 负责多空间遍历）；`Memory.warmup({targetSpaceId?, dataDir?})` 是只读懒加载（折叠索引、不跑维护、不写盘），未知/相对 dataDir 立即报错。
+- **物理切割已完成（1.5.6）**：`src/spaces/spaceRouter.js` / `transfer.js` **已移出本包**，现位于 `dsh-orchestrator/src/`；本体只编译 `src/spaces/singleSpace.js`（`default` 是 owner handle，命名空间一律 `MEM_E_FEATURE_DISABLED` + “install dsh-orchestrator”提示）。
+- **注入缝**：Host 可选的 `orchestrator` 服务提供 `createSpaceAdapter({owner, dataDir, openChild})` 与 `transfer`；`Memory.open({spaces|spacesFactory, transfer})` 是同一缝的嵌入形式。没有服务时插件只注册 8 个单空间工具、`capabilities.spaces=false`、`/spaces` 只回 `default`；配置要求 multiSpace 却没有 Orchestrator 时**大声告警**并跑严格单空间核心。
+- **仍待完成**：`dsh-orchestrator` 的正式安装/接线（安装后多空间能力自动恢复），以及联邦/跨空间去重的本体调用点。
+
+## 宿主生命周期：补偿 Dream（1.5.6 / P1-7）
+
+插件只订阅 Host 的**进程内 Emit 事件**，不轮询、不建自己的时钟：
+
+- `agent/created`（payload `{agent, source}`）与 `session/created`（session）是"会话开始"信号 → `src/hostBridge.js` 记一次 `sessionStarts`，然后**最多**触发一次补偿 Dream。
+- `agent/disposed` 只用于清理计数；`session/event` 仍由 raw 捕获与 `[Memory Hints]` 使用，两者互不干扰。
+- **补偿规则**：`lastDreamAt` 距今 ≥ `dream.compensateAfterHours`（默认 24，范围 1–720，fail-fast）且价格窗口允许，才通过**同一个** `runtime.runMaintenance('compensate')` 闸门跑一次；运行中的 dream 让并发请求直接 `in-flight` 拒绝，绝不排队。
+- **价格是注入的，不猜**：`setPriceProbe(fn)`（`dsh-price-tip` 类插件）或 `DSH_DREAM_PRICE=low|high`；未知价格 + LLM Dream → `price-unknown` 跳过（不赌低谷）；未知 + 纯本地 Dream → 允许（本地重算便宜且补偿本来就是目的）；已知高峰 → `peak` 跳过。
+- **观测**：`runtime.hostStatus()` 与 `/stats` 顶层 `host` 暴露 `sessionStarts / compensations / skipped / lastSkipReason / dreamDue / lowValley`；`enableDream:false` 时补偿关闭。
+- **测试宿主**：`test/v156.host.test.js` 提供 `MockHostEnvironment`（一个 `{on,off,emit}` bus + 最小 ctx），验证"低谷 + 会话开始 → `executeDream` 被唤醒""高峰不跑""不重复跑"。
+- **仍未完成**：`dsh-price-tip` / `dsh-peak-runner` / `dsh-notify-plugin` 的真实接线与"高峰期排队"策略；目前高峰是跳过而非排队。
 
 ## L2.5 趋势隔离层（晋升 / 淘汰）
 
@@ -239,6 +286,7 @@ state/tag-tree.json              L1.5 标签层级树 + 幽灵宽限 + 待修剪
 - **原生保真 / 分层折叠**：`ContextEngine.nativeState()` 有效占用 = `max(块表 token, 会话 token)`；`< nativeTokenLimit` 为 `native` 模式（Qwen：逐字保留，**绝不折叠**），`>=` 为 `layered`（允许 L1.5 折叠）。旧 `maxTokens` 分页阈值与淘汰算法完全未动，`enforce()` 只是**新增** `native-force` 分支。
 - **自动交接（转生）**：有效占用达到 `autoRolloverThreshold × nativeTokenLimit` 时，`Memory.checkHandoff()` 把窗口末尾（或最新索引事件）提炼为**一条** L1.5 摘要（`status:handoff`，含 `status:folded` 标记），写 `state/handoff.json`（含 tokenSource/sessionId/ratio/summaryEventId），`runtime.promptState()` 在**易变尾部**追加 `[交接标记]`。幂等：marker 已 active 不再重复提炼；新会话（`observeSessionTokens` 检测到新 id）消费 marker（`active:false, consumedBy`）。会话 token 由 `session/event` 逐轮估算，**独立于 raw 门控**，raw 关闭也能交接。
 - **关闭交接**：不写 marker；`enforce()` 在 95% 时强制驱逐到 `min(target×maxTokens, target×nativeTokenLimit)`，返回 `reason:"native-force"`。
+- **工作模式随交接保持（1.5.6）**：marker 额外记录 `agentPreset`（Host 的 `agentPresets` 预设，也就是 UI 的“工作模式”）。新会话的 `agent/created` 是 **serial** 事件，桥接层在 `source === 'startup'` 且 marker 属于**另一个** session 时，`await agentPresets.select(agent, preset)` 在首轮之前把模式切回去；`resume`、marker 原 session、无 preset 的 marker 一律不覆盖，`select` 失败只记 `runtime.lastPresetInherit`，**绝不阻断 agent 创建**。当前模式通过 `agent-preset/selected` 与工具边界/提示词装配时的 `agents.currentInitiator()` + `agentPresets.composedPreset()` 持续跟踪，并会把**旧 marker**（本特性之前写的）补写 `agentPreset`；`/stats` 暴露 `agentPreset` 与 `presetInherit`。
 - **状态面**：`panel.session`（mode/tokens/nativeTokenLimit/threshold/remainingTokens/rolloverEnabled/handoffActive…）与 `panel.spaces`（current/ids/open）是 UI 状态栏与空间面板的数据源。
 
 ## 跨空间安全迁移（1.5.0）与显式用户授权闸门（1.5.1）
@@ -280,6 +328,7 @@ state/tag-tree.json              L1.5 标签层级树 + 幽灵宽限 + 待修剪
 - `pinned` 块永不淘汰；若全是 pinned 则返回 `pinnedFloorReached: true`，报告而不强删。
 - 淘汰只作用于提示窗口：日志与索引不变（测试断言 `recordCount` 不变）。`memory_recall` 注入召回块 + 语义摘要，返回 `context:{tokens,maxTokens,evicted:[...]}`；系统提示 `memory:window`（order 225）只渲染存活块，淘汰即真消失。
 - 纪律写进 `memory:policy` 提示节：晋升、裁决、分页都由引擎在维护时钟上执行，模型不得自行裁剪上下文或晋升模式。
+- **单次召回响应上限（1.5.6）**：`context.maxInjectTokens`（默认 4000，范围 256–100 000）限制**一次 recall 返回的 JSON**，独立于窗口预算。`Memory.applyPayloadBudget()` 按排序保留 hits（第一项总是保留，避免空召回），再按预算保留 semantic/tempSemantic；被丢弃时返回 `truncated:true`、`payload:{maxTokens,estimatedTokens,dropped}` 与 `payload-budget` note。估算口径与插件其余部分一致：`ceil(chars/4)`。
 
 ## 数据迁移（`migrateFrom` → `dataDir`）
 
@@ -365,13 +414,49 @@ pending ──start()──▶ in_progress ──(打开日志/迁移/引导索�
 
 - **dream 触发条件**：`enableDream` 且 `now - lastActiveAt ≥ dreamIdleMinutes`；`touch()` 在每次 remember/reinforce/forget 与 recall 命中时刷新活动时间，所以忙碌的会话不会 dream。
 - **错过窗口不补跑**：`tick` 每分钟跑一次，cron 只匹配当前时刻；重启后错过的窗口不追溯。`skipped` 计数用于观测"闸门撞车"频率。
+- **事件循环延迟监控（1.5.6）**：`maintain()` 入口 `createLagMonitor()`（`perf_hooks.monitorEventLoopDelay`），在每个维护阶段之后与 `IndexManager.rebuild` 的 read/build/catch-up/swap 之间调用 `yieldIfLagging()`：观测到 `max ≥ 100ms` 就 `await` 50ms 让出事件循环，并累加 `yields`。报告里的 `eventLoop: {maxMs, p99Ms, meanMs, yields, thresholdMs}` 进入 `status().maintenance`。**诚实边界**：同步的 `buildIndex` 无法被 JS 抢占，所以让渡粒度是"阶段/异步循环之间"，而不是每 500 条事件中途；监控数据用于发现过大的阶段。
+
+## L2 多合一蒸馏（merged_into，1.5.6）
+
+同一标签下重复的 L2 经验会越积越多。`src/l2Merge.js` 在 `maintain()` 末尾（月度纪要之后、图谱之前）离线合并：
+
+- **严格分组**：pinned 只与 pinned 合并、普通只与普通合并；pinned 合并结果保留 `pinned:true` 并继承标签。
+- **文本**：最早/最晚日期 + 去重后的核心文本（单条 ≤200 字符），整体受 `l2Merge.maxSummaryChars` 限制；截断用 ASCII `...`（NFKC 身份规范化不会变长）。
+- **全局限定**：`meta.global_tags` 只复制进合并记录的 `meta`，绝不写成 tag——子空间倒排索引不会被联邦标签污染；`projectEpisode` 以 `event.globalTags` 暴露给合并层。
+- **append-only 标记**：源记录在 `state/l2-merge.json` 的 `mergedSourceIds` 中标记为已合并，日志不改写、原始记录仍可追溯；再次维护幂等（不会重复合并）。
+- **配置**：`l2Merge.enabled / minGroupSize(2–20) / maxGroupsPerRun(1–50) / maxSummaryChars(100–2000)`，fail-fast、HTTP 可编辑、设置页可调；`panel.l2Merge` 可观测。
+- **测试夹具**：旧套件默认关闭 `l2Merge`（`helpers.makeMemory`），避免污染它们的精确索引计数断言；专门用例显式开启。
+
+## L3 语义标签不变量（1.5.6）
+
+没有标签的 L3 是「死知识」：标签驱动的检索永远够不到它。因此：
+
+- **显式 API 强制**：`SemanticStore.upsert()` 在最终标签集为空时抛 `MEM_E_SEMANTIC_TAG_REQUIRED`（带 `title`/`sourceEvents` 详情），不允许静默写入。
+- **离线路径降级而不是打断**：删除巩固（`ensureForEvent`）与趋势晋升（`tempSemantic.adjudicate`）先尝试 `extractTags(content)` 从内容形态提取锚点，仍为空则写显式的来源锚点（`origin:unlabelled-episode` / `origin:unlabelled-trend`）。两阶段删除的覆盖闸门与 `maintain()` 因此不会被历史无标签事件打断。
+- **历史数据只读降级**：不变量引入前写入的 L3 摘要仍可读，但在 `list()` / `semanticSummaries()` 里带 `degraded: true`；引擎不静默改写既有语义日志。
+
+## 离线 Dream：LLM 语义提炼与降级（1.5.5）
+
+`executeDream()` 是**唯一**允许发起网络调用的入口，且只被维护闸门的 `dream` 分支调用（`maintain()` 收敛之后）；在线 `recall`/`remember` 路径没有任何网络依赖。
+
+- **零依赖**：只用 Node 内置 `fetch`，POST 到 OpenAI 兼容的 `/chat/completions`；不引入任何 SDK（`package.json.dependencies` 为空，测试锁定）。
+- **凭证注入**：`config.dream.llm.{baseUrl,model,apiKey}` 或 `DSH_DREAM_LLM_BASE_URL / MODEL / API_KEY`；key 不进日志、不进 HTTP/UI 配置投影。
+- **结构化输出**：模型必须返回 `{"summary","confidence"}`；`summary` ≤ `dream.maxSummaryChars`（默认 200），超限/缺字段/非 JSON 一律判失败。
+- **绝对降级**：未配置 / 网络错误 / 超时（`dream.llmTimeoutMs`，默认 15s，`AbortController` + `Promise.race`）/ 非 2xx / 非 JSON → 本地启发式合并（最早最晚时间 + 去重核心文本），并记录 `MEM_E_DREAM_LLM_FALLBACK`。
+- **溯源**：新记录必带 `meta.source_event_ids`（去重排序）与 `meta.distilled_by`（`llm|local`），可追溯/恢复原始记录。
+- **熔断**：连续 `failureThreshold`（默认 3）次失败 → 开启 `cooldownMinutes`（默认 60）；冷却后半开只放 1 次试探，成功闭合、失败重开。状态在 `panel.dream.circuit`。
+- **单飞串行**：并发调用返回 `skipped: dream-in-flight`，不排队；单次运行内按组严格串行，不会耗尽连接池。
+- **状态**：`state/dream.json` 记录已合并 source id（幂等）、每组结果、熔断状态与 `lastFallback`；它是可重建缓存，删掉最多重复合并一次，日志仍是唯一真相源。
+- **配置 UI 化（1.5.6）**：安全子集（`useLlm/minGroupSize/maxGroupsPerRun/maxSummaryChars/maxSourceChars/maxEventsPerGroup/llmTimeoutMs/failureThreshold/cooldownMinutes/compensateAfterHours`）同时暴露到 `/stats`、`/config` 与设置页；`dream.llm.{baseUrl,model,apiKey}` **永不下发浏览器、不可 HTTP 编辑**，只从 profile 或 `DSH_DREAM_LLM_*` 注入（测试断言 `/stats` 载荷不含凭据）。
 
 ## 提示注入按需（不预加载）
 
 - `memory` 段（order 2450）只讲工具契约与写入纪律，不拼接历史。
 - `memory-state` 段（order 220）每次装配时读 `runtime.promptState()`，由 `composePrompt()` 按**缓存稳定顺序**拼装：
-  `[稳定规则] → [Memory Map]（活跃标签+计数，慢变） → [Memory Blocks]（存活块，唯一的每轮易变尾巴）`。
-  前缀（规则+地图）在配置/标签集合不变时逐字节稳定，只有尾巴随召回块变化；旧的"一行 briefing 直接返回"已废弃（那行含 `events=`，每次写入都会击穿前缀缓存）。回归测试在 `test/plugin.test.js`：同一次会话内召回前后，前缀必须完全相等。
+  `[稳定规则] → [Memory Blocks]（存活块） → [Memory Hints]（相关性线索，易变尾巴）`。
+  前缀只有稳定规则；召回块与线索都在 `[Memory Blocks]` 标记之后，所以**每轮变化的提示不会击穿前缀缓存**。旧的全局 `[Memory Map]`（最活跃标签+计数）已在 1.5.6 移除。
+- **相关性优先（1.5.6）**：`src/utils/memoryHints.js` 只用与「当前用户输入」词法重叠的标签（最多 `HINT_LIMIT=5`）：整标签命中权重 3；否则按 `[:/._-]` 拆段，拉丁段要求 token 精确相等、CJK 段允许子串。`status:* / month:* / context:* / active_task` 永不注入；无匹配时整段缺席（不填充无关标签）。前缀缓存与召回注入的回归测试仍在 `test/plugin.test.js`：同一次会话内召回前后，前缀必须完全相等。
+- **输入来源**：`PromptContext.text` 只拿到 `AssembleContext {scope,signal}`，没有消息文本；因此插件在 `session/event` 上跟踪最后一条 `user/message`（`runtime.lastUserText`），非用户事件不覆盖。
 - `memory:reflection` 段默认不注册内容：只有连续工具调用达到 `REFLECTION_THRESHOLD`（12）次，才在 `text()` 里返回反思提示；`enableReflection:false` 时整段不注册。
 
 ## UI：Client 插件 + Slot 注册
@@ -467,6 +552,11 @@ window.__ModuleLoader__.load({
 | `MEM_E_SPACE_INVALID` | 新建空间名非法/保留/已存在/路径冲突（1.5.3），写盘前拦截 | 换一个合法且未占用的空间名（小写字母/数字开头，a-z 0-9 . _ -，≤64） |
 | `MEM_E_INVALID_TOOL_NAME` | `tools.disabled` 含未知工具名（如 `remeber`）、核心工具（remember/recall/admin）或重复项（1.5.3） | 只写无 `toolPrefix` 的后缀名；核心工具不可关闭 |
 | `MEM_E_HANDOFF_FAILED` | 自动交接摘要生成失败/超时/写 marker 失败（1.5.4）；引擎已降级放行新会话 | 用设置页逃生舱或 `memory_admin action=reset_session` 清状态；不阻塞新会话 |
+| `MEM_E_AUTO_TAG_MISS` | 未手传 tags 的写入，引擎侧启发式提取不到任何锚点（1.5.6）；**警告，不是失败**：写入照常、tags 为空 | 无需处理；`panel.autoTag.misses` 可观测无锚点 episode 的数量 |
+| `MEM_E_PINNED_TAG_REQUIRED` | `remember({pinned:true})` 没有提供任何 tag（1.5.6），在写盘前拒绝 | 补至少一个可触发的标签（如 `lesson:release`） |
+| `MEM_E_FEATURE_DISABLED` | 该能力被 `features.*` 关闭（1.5.6）：多空间读写/创建/预热、跨空间迁移、迁移工具 | 打开对应开关（`features.multiSpace` / `features.crossSpaceTransfer`）或改用 `default` 空间 |
+| `MEM_E_SEMANTIC_TAG_REQUIRED` | 显式 L3 写入没有任何可用标签（1.5.6），语义摘要会变成标签检索够不到的“死知识” | 提供 tags；离线路径（删除巩固/趋势晋升）会自动从内容提取或写 `origin:unlabelled-*` 兜底锚点 |
+| `MEM_E_DREAM_LLM_FALLBACK` | Dream 的 LLM 调用无法产出可用结构化结果（未配置 / 网络 / 超时 / 非 JSON）（1.5.5）；引擎已本地降级，Dream 不失败 | 检查 `dream.llm` 配置；引擎无需人工干预，`panel.dream.lastFallback` 可查原因 |
 | `MEM_E_WRITER_BUSY` | 写者互斥争用 | 重试 |
 | `MEM_E_CLOCK_INVALID` / `MEM_E_IO` | 时钟回退 / 磁盘错误 | 检查环境 |
 
@@ -481,7 +571,7 @@ window.__ModuleLoader__.load({
 
 运行器带**看门狗**：默认 **60s**（`MEM_TEST_TIMEOUT_MS` 可调）仍未退出，就打印**卡住时正在导入/执行的文件、最后完成的测试名与完成数、活动资源、尚未触发的定时器**，然后 `process.exit(1)`。它不会用 `process.exit(0)` 掩盖超时——挂起即失败。`MEM_TEST_TRACE=1` 可看文件级进度，`MEM_TEST_ONLY=<子串>` 只跑一组。
 
-295 个用例（40 个文件）覆盖：
+389 个用例（62 个文件）覆盖：
 
 - 索引与标签：重建 digest 一致、行号漂移防护（eventId 不变、行号变）、同义合并、活跃集 cap 挤出、规则变更不改清单、空活跃集降级、top-k 有界有序去重。
 - 衰减与删除：30 天半衰期、reinforce 移动锚点（不存字段）、仅文本粗筛、标签过滤、维护代切换且旧代可读、boot 检查、压缩不丢记录、并发维护串行化、四阶段删除、archive 可回滚 vs purge 不可、strict 巩固暂停与恢复、任务重放幂等、错误 id 零变更。
@@ -496,7 +586,7 @@ window.__ModuleLoader__.load({
 - L1.5 标签树（`test/tagTree.test.js` 11 + `test/tagTreeMaintenance.test.js` 8）：纯函数（层级解析、实时衰减重算、release 队列、carry-forward、孤儿丢弃、配置半衰期）；集成（原子发布/来源代/顺序稳定、leaf→ghost→mid 死亡级联、复活、25 死叶分批 10/10/5/0、损坏缓存自愈、删缓存只丢幽灵、`tagTreeView` 只发幽灵元数据）。
 - 反幻觉召回（`test/ghostRecall.test.js`，3 个用例 + `test/retrieval.test.js` 单元）：宽限 mid 命中正文被物理移除、按 mid 聚合计数、点名宽限 mid 无命中时 `count:0` 提示、维护复活后正文恢复、`panel.tagTree.ghostCount` 跟随。
 - 写入路径与 `deep_raw`（`test/v143.test.js`，9 个用例）：`stage` 不写日志、`commitMany` 一次写、`bulkIngest` 分块/幂等/失败隔离、briefing 脏刷新、日志 `close()` checkpoint、崩溃可见字节、**200ms 窗口内被 kill 后重启检测 stale 并重建尾索引**、`raw.maxScanTurns` 默认值/范围/HTTP 可编辑、最新优先扫描与预算截断。
-- 全链路接线（`test/plugin.test.js` 新增 2 个用例）：`memory-state` 由 `composePrompt` 输出 `规则 → [Memory Map] → [Memory Blocks]`，召回注入后**前缀逐字节不变**、尾巴出现召回块；`memory_admin maintain` 真正落盘 `state/tag-tree.json`，`memory_forget`+maintain 后工具层 `memory_recall` 只返回 `ghostHints`（正文不泄漏、含 `deep_raw` 提示），`memory_admin status` 的 `panel.tagTree.ghostCount` 与缓存一致。
+- 全链路接线（`test/plugin.test.js` 新增 2 个用例）：`memory-state` 由 `composePrompt` 输出 `规则 → [Memory Blocks] → [Memory Hints]`（1.5.6 起用相关性线索替代全局 Map），召回注入后**前缀逐字节不变**、尾巴出现召回块；`memory_admin maintain` 真正落盘 `state/tag-tree.json`，`memory_forget`+maintain 后工具层 `memory_recall` 只返回 `ghostHints`（正文不泄漏、含 `deep_raw` 提示），`memory_admin status` 的 `panel.tagTree.ghostCount` 与缓存一致。
 - 面板：`status().panel` 形状快照（键全集，防漏字段）+ 值快照；写入后 `events/activeTags` 跟随；`cumulativeSavedTokens` 跨 reopen 保持（`state/context.json`）；`queuedDeletes` 取自删除流水线而非独立计数器；`indexGeneration` 每次 rebuild 恰好 +1。
 - v1.5.0 六组新用例：`v150.index.test.js`（截断保序/真实计数/降级→坚持 3 条/超级标签时间窗）；`v150.space.test.js`（跨空间并发 vs 同空间 FIFO/目录隔离/非法 id/native 边界/95% 强驱逐/旧阈值回归）；`v150.transfer.test.js`（copy 保留、move 两阶段、隐私拦截、raw_turn 剥离、新 id、部分失败不改源）；`v150.ui.test.js`（bundle 契约、状态栏/过滤/软跟随纯函数、无防抖、Footer 文案、transfer 路由）；`v150.lifecycle.test.js`（Qwen 原生折叠门、阈值交接+标记注入+新会话消费、空间隔离、第九工具）；`v150.config.test.js`（两个新组默认值/范围/HTTP 可编辑）。
 - v1.5.1 安全补丁（`test/v151.consent.test.js`，9 个用例）：默认开闸 + 布尔 fail-fast；闸门先于校验/IO（非法目标也先回 CONSENT、不挂待删、源不变）；工具无 `user_approved` 被拦、带 `user_approved:true` 成功；`memory_transfer_to_global` 同契约并落到 `global`；显式关闭配置后才放行；`Memory.transferEvents` 引擎层同契约；`memory:policy` 红线文案标记；HTTP 路由不再伪造授权（缺 `user_approved` 与工具同拦）；面板使用 SpaceSelector + 勾选 `移动到…` 流程，手动 id 文本框已删除。
@@ -505,6 +595,27 @@ window.__ModuleLoader__.load({
 - v1.5.3 工具裁剪（`test/v155.tools.test.js`，7 个用例）：`tools.disabled` 默认空数组、后缀词表闭集；`remeber`/带前缀名/核心工具/重复项全部 `MEM_E_INVALID_TOOL_NAME`；HTTP 可编辑并走同一校验器；默认 10 个工具零回归；`disabled:["capture","bulk_ingest"]` 时注册表与 `memory` 提示段同时剔除这两个工具；非法名称在 `apply()` 阶段阻断激活且零工具注册。
 - v1.5.4 交接状态机加固（`test/v156.handoff.test.js`，9 个用例）：递归摘要同时按 tag 与 `交接摘要` 前缀过滤且输出硬上限 1200 字符；蒸馏抛错/挂起（timeout 可注入）时 `checkHandoff` 不 reject、写 `failed` 降级 marker；新会话必然重置 token 基线、消费旧 marker、释放 in-flight；`status:handoff` 在 recall 中 2% 权重且不进普通列表；`resetSessionState`/admin 工具/HTTP 逃生舱；`repairHandoffSummaries` dry-run 与 pending_delete 归档。
 - v1.5.3 发布卫生（`test/v154.release.test.js`，3 个用例）：`minInjectConfidence` 端到端移除（配置 fail-fast、不在 HTTP 白名单、retrieval 无导出、recall 无 confidence/low-confidence 注解、UI 无该键与旧文案）；多空间固定开销（N=10：建空间/写入耗时、每空间字节数 max/min≤1.35、总字节随 N 线性、单空间固定开销<256KB、逐空间冷启动中位耗时<500ms、根启动不 eager 打开子空间 `spaces.open=[]`）；基准协议 `scripts/bench-protocol.mjs` 独立临时库 + 同进程预热 + 5 次取中位数，报告必须带离散度。
+- v1.5.5 Dream LLM（`test/v155.dream.test.js`，8 个用例）：无 LLM 配置时本地降级且 `source_event_ids` 完整；LLM 成功时 URL/Bearer/`response_format`/JSON 解析与 `distilled_by:"llm"`；非 JSON 与 fetch 超时降级并记 `MEM_E_DREAM_LLM_FALLBACK`；并发 `executeDream` 返回 `dream-in-flight`；连续失败熔断后不再发请求、冷却后半开只试探一次并闭合；`dream` 配置 fail-fast 矩阵；`package.json` 零依赖红线。
+- v1.5.6 raw 按行游标（`test/v156.rawscan.test.js`，5 个用例）：5000 行分片最新命中且 `hit.line=5000`；`raw.maxScanTurns=500` 时最旧行不可见且 `truncated:true`；`limit:5000` 仍被 `MAX_SCAN_RESULTS=500` 截断；`readLinesReverse` 在 2 万行文件上峰值缓冲 ≤ chunk+一行；流式 `restoreByHash` 命中原文。
+- v1.5.6 硬化（`test/v156.hardening.test.js`，5 个用例）：`context.maxInjectTokens=300` 时 6 条长命中被截断且 `payload.dropped≥1`/note 可见，预算内不截断；`maxInjectTokens` 默认 4000 与 256–100 000 fail-fast；`close()` 同步落盘 pending raw、清 flush timer、释放 index 视图且幂等；lag monitor 在 120ms 阻塞后 yield 一次并回报 `maxMs/p99Ms/yields`；`maintain()` 报告带 `eventLoop`。
+- v1.5.6 入库打标（`test/v156.tagging.test.js`，7 个用例）：提取矩阵（错误类型/errno/代码块/HTTP/路径/任务语句）；未打标写入得到 `error:typeerror` 且可按该标签召回；raw 仍为四字段；手传 tags 优先且去重；miss 记 `MEM_E_AUTO_TAG_MISS` + `panel.autoTag.misses`；`autoTag:false` 恢复旧行为；`tagging.*` fail-fast。
+- v1.5.6 固定经验（`test/v156.pinned.test.js`，3 个用例）：pinned 无 tags 被拒且零写入；模拟一年后 `decay===1`、索引事件与标签 `pinned` 标记、召回置顶；400 天后 pinned 标签仍在活跃集且可召回。
+- v1.5.6 相关性线索（`test/v156.hints.test.js`，4 个用例）：匹配/不相关/内部标签/空输入矩阵；线索渲染；提示尾部只含匹配标签且位于 `[Memory Blocks]` 之后、前缀稳定；`session/event` 用户回合跟踪。
+- v1.5.6 能力开关（`test/v156.features.test.js`，5 个用例）：`features.*` fail-fast 与「关多空间隐含关迁移」；单空间模式下读写/创建/预热/迁移全部 `MEM_E_FEATURE_DISABLED`、空间工具不注册、能力握手 `spaces=false`；只关迁移；默认零回归；`Memory.open(string)` 与只读 `warmup()`。
+- v1.5.6 宿主生命周期（`test/v156.host.test.js`，6 个用例）：价格归一化；会话开始触发一次补偿 Dream；未知价格 + LLM 跳过；高峰跳过；未到期/禁用/在途拒绝；`MockHostEnvironment` 走 `apply()` 全链路并验证 `/stats.host`；`dream.compensateAfterHours` fail-fast。
+- v1.5.6 Dream 配置 UI（`test/v156.dreamui.test.js`，3 个用例）：安全子集暴露且凭据不出现在 `/stats`；Dream 可调项 HTTP 可编辑而 `dream.llm.*` 不可；设置页渲染该分区且不提供凭据输入。
+- v1.5.6 L2 多合一蒸馏（`test/v156.l2merge.test.js`，4 个用例）：pinned/普通严格分组且 `global_tags` 只进 meta；单独普通记录不被拖入 pinned 组；`maxSummaryChars` 截断与 `enabled:false`；配置 fail-fast。旧夹具默认关闭该功能以保持精确计数断言。
+- v1.5.6 L3 标签不变量（`test/v156.l3tag.test.js`，4 个用例）：显式 upsert 拒绝空标签；删除巩固从 `TypeError` 内容派生 `error:typeerror`、纯文本落 `origin:unlabelled-episode`；趋势晋升先派生锚点再写 L3；历史空标签摘要可读且 `degraded`。
+- v1.5.6 工作模式跨交接（`test/v156.preset.test.js`，6 个用例）：marker 记录 preset；新会话在首轮前恢复；旧 marker 从当前 agent 补写；resume/同会话/无 preset 不覆盖；`select` 失败不阻断创建；`agent-preset/selected` 跟踪当前模式。
+- v1.5.6 物理切割（`test/v156.singleSpace.test.js`，3 个用例）：核心只用 `default`、命名空间读写/创建/预热/迁移全部 `MEM_E_FEATURE_DISABLED`；无 Orchestrator 时插件只注册 8 个工具、`capabilities.spaces=false`、提示词不宣传死工具；注入适配器后恢复 10 个工具与 `spaces:true`。
+- v1.5.6 第一批冲刺（`test/v156.firstBatch.test.js`，5 个用例）：`status:*`/`folded-summary` 不进图谱与标签树；`[Active Task]` 来自 handoff 摘要与 `task:` 事件且每会话一次；短输入回退上一轮标签；同会话二次注水被 `injectedIds`/`tags` 拦截、新会话重置。Orchestrator `test/service.test.js`（3 个用例）断言 `ctx.provide('orchestrator', …)` 与卸载清理。
+- v1.5.6 空间删除（`test/v156.spaceDelete.test.js`，5 个用例）：命名空间需 `confirm:true` 才删除、`default` 永远拒绝、缺失空间 `MEM_E_NOT_FOUND`；严格单空间核心 `MEM_E_FEATURE_DISABLED`；HTTP `action:'delete'` 返回刷新后的列表，未知 action 为 400（绝不落到 CREATE）；`capabilities.spacesDelete` 版本化握手让旧宿主隐藏按钮；UI 仅对命名空间显示按钮并二次确认。Orchestrator `test/spaces.test.js` 额外断言先关句柄再删目录。
+- v1.5.6 图谱交互（`test/v156.graph.test.js`，4 个用例）：Ctrl/Cmd+拖拽平移画布（普通拖拽仍移动节点）；Ctrl/Cmd+滚轮按光标缩放（native `passive:false`，普通滚轮不拦截）；双击空白重置视图；冻结布局先过 `separateOverlaps()` 防初始堆叠；头尾提示文案随 bundle 发布。
+- v1.5.6 本地低谷调度（`test/v156.lowValley.test.js`，4 个用例）：北京时区工作日 09–12/14–18 为峰，午休/夜间/周末为谷；峰时 idle LLM Dream 写入 `state/dream-queue.json` 延后、谷时自动补跑；HostBridge 默认价格探针随窗口（`DSH_DREAM_PRICE` 仍可覆盖）；`dream.onlyLowValley` fail-fast + 可编辑。
+- v1.5.6 联邦/跨空间去重（`test/v156.federation.test.js`，2 个用例）：业务标签写入后注册进全局 `FederationMap`（跳过内部标签；同标签跨空间=一个节点）；月记按 `sha256(content)` 认领，兄弟空间相同月记跳过并报 owner。
+- v1.5.6 低谷调度 Phase 2（`test/v156.lowValley2.test.js`，4 个用例）：峰时唤醒重新 arm 不执行；睡过头唤醒报 `lateMs`/`catchUp`；谷时过期队列 delay 0 catch-up；runtime 集成峰时延后→定时器触发→队列清空、`dreamTimer.runs=1`。
+- v1.5.6 读时 merge（`test/v156.readMerge.test.js`，2 个用例）：月记 `meta.source_event_ids` 进索引投影，recall 走 `mergeForRead()` 丢弃其 owned 事件并回报 `merge` 统计；无 dedupe 服务时 payload 形状不变。
+- v1.5.6 跨空间 recall 聚合（`test/v156.crossSpaceRecall.test.js`，2 个用例）：逐空间加锁取原始命中（`mergeRecall:false`）、带 `spaceId` 合并；月记在 default、事件在 work 时仍能隐藏 owned 事件；`test/v156.crossSpaceRecallFlag.test.js`（3 个用例）锁定 `features.crossSpaceRecall` 默认 false、fail-fast、开关行为。
 
 
 ## SLO / 容量

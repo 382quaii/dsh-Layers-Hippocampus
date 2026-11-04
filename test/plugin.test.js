@@ -11,13 +11,16 @@ import { existsSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { apply, getRuntime, inject, resolveConfig } from '../index.js';
-import { tempDir } from './helpers.js';
+import { createOrchestratorStub, tempDir } from './helpers.js';
 
 function fakeCtx() {
   const tools = new Map();
   const sections = new Map();
   const contexts = new Map();
   const disposers = [];
+  // v1.5.6 physical split: the plugin keeps its multi-space surface only when the
+  // Host exposes the Orchestrator service; this fake registers it explicitly.
+  const services = new Map([['orchestrator', createOrchestratorStub()]]);
   return {
     logger: { info() {}, warn() {}, error() {} },
     tools: {
@@ -46,8 +49,8 @@ function fakeCtx() {
       disposers.push(disposer);
       return disposer;
     },
-    get() {
-      return null;
+    get(name) {
+      return services.get(name) ?? null;
     },
     // The real cordis `inject` waits for a service; here webServer is simply
     // absent, so the child callback runs and registration reports "unavailable".
@@ -251,12 +254,15 @@ test('the memory-state prompt is composed live: stable rules + map + volatile bl
     });
     await ctx.call('memory_admin', { action: 'maintain' });
 
+    // v1.5.6: the prompt tail offers only tags that overlap the current user input.
+    getRuntime(ctx).lastUserText = 'pnpm build and release the habit';
     const stateDefinition = ctx.contexts.get('memory-state');
     const before = stateDefinition.text();
-    assert.ok(before.includes('[Memory Map]'), 'the map section is rendered');
+    assert.ok(before.includes('[Memory Hints]'), 'the relevance-first hint section is rendered');
+    assert.match(before, /habit:release/, 'the tag overlapping the current input is hinted');
     assert.ok(before.includes('[Memory Blocks]'), 'the volatile tail marker is rendered');
-    assert.ok(before.indexOf('[Memory Map]') < before.indexOf('[Memory Blocks]'), 'map before blocks');
-    assert.match(before, /habit:release\(\d+\)/, 'the map carries tag + count, never bodies');
+    assert.ok(before.indexOf('[Memory Blocks]') < before.indexOf('[Memory Hints]'), 'hints live in the volatile tail');
+    assert.ok(!before.includes('[Memory Map]'), 'the global most-active-tag map is no longer injected');
 
     // A recall injects a live block: the tail changes, the cacheable prefix does not.
     const mapEnd = before.indexOf('[Memory Blocks]');

@@ -33,6 +33,7 @@ import {
   snippet,
   writeFileAtomic,
 } from '../util.js';
+import { extractTags } from '../tagging.js';
 
 export const TEMP_RECORD_VERSION = 1;
 
@@ -285,13 +286,19 @@ export class TempSemanticStore {
       const aggregationConfirmed = entry.hitCount >= 2;
 
       if (reinforcedInWindow && aggregationConfirmed) {
+        // v1.5.6: promotion must never write untagged L3 (dead knowledge). Entry tags
+        // first, then content heuristics, then an explicit provenance anchor — the
+        // semantic upsert is strict and would otherwise throw inside maintenance.
+        const entryTags = Array.isArray(entry.tags) ? entry.tags : [];
+        const derived = entryTags.length > 0 ? [] : extractTags(entry.content, { maxTags: 2 });
+        const promotedTags = entryTags.length > 0 ? entryTags : derived.length > 0 ? derived : ['origin:unlabelled-trend'];
         const summary = this.semanticStore.upsert({
           nextId: this.ids,
           clock: this.clock,
           title: `Trend: ${snippet(entry.content, 40)}`,
           text: entry.content,
           confidence: clamp01(0.5 + 0.1 * entry.hitCount),
-          tags: entry.tags,
+          tags: promotedTags,
           sourceEvents: entry.sourceEvents,
         });
         await this.appendRecord({

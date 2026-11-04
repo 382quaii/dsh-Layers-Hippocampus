@@ -132,9 +132,11 @@ export class IndexManager {
 
   /**
    * Full rebuild. Publishes to disk, then flips the pointer.
-   * @param {{reason?: string}} [opts]
+   * @param {{reason?: string, onPhase?: (phase: {phase: string, [key: string]: unknown}) => Promise<unknown>}} [opts]
+   *   `onPhase` is the maintenance lag hook (v1.5.6): awaited between phases so a
+   *   long rebuild can cooperate with the event loop.
    */
-  async rebuild({ reason = 'rebuild' } = {}) {
+  async rebuild({ reason = 'rebuild', onPhase = null } = {}) {
     return this._enqueue(async () => {
       const policy = this.getPolicy();
       const tombstones = this.getTombstones();
@@ -143,6 +145,7 @@ export class IndexManager {
       const opened = await this.logStore.snapshot();
       let records = opened.records;
       let watermark = records.length;
+      await onPhase?.({ phase: 'read', records: records.length });
       let built = buildIndex({
         records,
         policy,
@@ -152,6 +155,7 @@ export class IndexManager {
         previous: this._active,
         maxPostingsPerTag: this._maxPostingsPerTag(),
       });
+      await onPhase?.({ phase: 'build', records: records.length, events: built.stats.events });
 
       // ---- phase 2: CATCH-UP (replay what landed while we were building) ---
       for (let pass = 0; pass < MAX_CATCHUP_PASSES; pass += 1) {
@@ -168,6 +172,7 @@ export class IndexManager {
           previous: this._active,
           maxPostingsPerTag: this._maxPostingsPerTag(),
         });
+        await onPhase?.({ phase: 'catch-up', pass, records: records.length });
       }
 
       // ---- phase 3: SWAP (standby fully built; pointer flips here) ----------
@@ -182,6 +187,7 @@ export class IndexManager {
       this.store.prune({ keep: 2 });
       await this._afterSwap(built);
       built.reason = reason;
+      await onPhase?.({ phase: 'swap', generation: built.generation });
       return {
         generation: built.generation,
         previousGeneration: built.previousGeneration,
@@ -206,6 +212,18 @@ export class IndexManager {
       this._dirty = true;
       return this._active;
     });
+  }
+
+  /**
+   * v1.5.6: release the in-memory views when the owning Memory closes. A closed
+   * instance is never read again; this only guarantees it holds no index
+   * references that could keep a large graph alive for the GC.
+   */
+  release() {
+    this._active = null;
+    this._standby = null;
+    this._records = [];
+    this._dirty = false;
   }
 
   /** Adopt a view that was built elsewhere (used by maintenance with its own clock). */

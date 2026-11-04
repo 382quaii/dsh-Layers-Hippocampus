@@ -220,12 +220,18 @@ test('validatePatch rejects non-objects and accepts only the editable set', () =
     'dataDir',
     'decay',
     'delete',
+    // v1.5.6 Dream tunables (safe subset; llm credentials are not editable).
+    'dream',
     'dreamIdleMinutes',
     'enableDream',
     'enableReflection',
+    // v1.5.6 capability flags nest under their own group.
+    'features',
     'graphMaxEdges',
     'identity',
     'index',
+    // v1.5.6 L2 multi-merge tunables.
+    'l2Merge',
     'maintenanceCron',
     'maxRecallTopK',
     'promptSection',
@@ -234,6 +240,8 @@ test('validatePatch rejects non-objects and accepts only the editable set', () =
     'review',
     'storageBudgetMb',
     'tagTree',
+    // v1.5.6 pre-ingest tagging: autoTag/maxTags nest under their own group.
+    'tagging',
     'temp',
     // v1.5.3 tool schema pruning: tools.disabled nests under its own group.
     'tools',

@@ -33,6 +33,9 @@ import { IndexStore } from './index/indexStore.js';
 import { IndexManager } from './index/indexManager.js';
 import { GraphCache, GRAPH_HARD_CAP, GRAPH_TOP_NEIGHBORS } from './graph.js';
 import { RawStore } from './rawStore.js';
+import { DreamEngine } from './dream.js';
+import { L2MergeEngine } from './l2Merge.js';
+import { extractTags } from './tagging.js';
 import { ReviewSchedule } from './schedule.js';
 import { PendingDeletes } from './pendingDelete.js';
 import { foldRecords } from './index/buildIndex.js';
@@ -48,8 +51,65 @@ import {
 import { SemanticStore } from './semantic/semanticStore.js';
 import { TempSemanticStore } from './semantic/tempSemantic.js';
 import { ContextEngine } from './context/contextEngine.js';
-import { DEFAULT_SPACE_ID, SpaceRouter, normaliseSpaceId, validateNewSpaceId } from './spaces/spaceRouter.js';
+import { DEFAULT_SPACE_ID, SpaceRouter, normaliseSpaceId, validateNewSpaceId } from './spaces/singleSpace.js';
 import { nextRun, parseCron } from './cron.js';
+
+// ---------------------------------------------------------------------------
+// Multi-space input validation. These rules used to live in the router; they stay
+// in the core as pure VALIDATION (no routing), applied only when the Orchestrator
+// adapter is injected. The single-space core's own `normaliseSpaceId` refuses named
+// spaces with MEM_E_FEATURE_DISABLED instead.
+// ---------------------------------------------------------------------------
+const ROUTED_SPACE_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const ROUTED_WINDOWS_DEVICE = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+
+function normaliseRoutedSpaceId(value) {
+  if (value === undefined || value === null || value === '') return DEFAULT_SPACE_ID;
+  if (typeof value !== 'string') {
+    throw new MemoryError(ErrorCodes.INVALID_INPUT, 'space id must be a string', { got: typeof value });
+  }
+  if (value === DEFAULT_SPACE_ID) return DEFAULT_SPACE_ID;
+  if (!ROUTED_SPACE_ID.test(value) || value === '..' || value.includes('/') || value.includes('\\')) {
+    throw new MemoryError(ErrorCodes.INVALID_INPUT, `invalid space id: ${JSON.stringify(value)}`, {
+      pattern: ROUTED_SPACE_ID.source,
+    });
+  }
+  return value;
+}
+
+function validateRoutedNewSpaceId(value) {
+  if (typeof value !== 'string') {
+    throw new MemoryError(ErrorCodes.SPACE_INVALID, 'space id must be a string', { got: typeof value });
+  }
+  const id = value.trim();
+  if (!id) throw new MemoryError(ErrorCodes.SPACE_INVALID, 'space id must not be empty');
+  if (id === DEFAULT_SPACE_ID) {
+    throw new MemoryError(ErrorCodes.SPACE_INVALID, 'the default space always exists and cannot be created', {
+      spaceId: id,
+      reason: 'conflict',
+    });
+  }
+  if (!ROUTED_SPACE_ID.test(id)) {
+    throw new MemoryError(ErrorCodes.SPACE_INVALID, `invalid space id: ${JSON.stringify(id)}`, {
+      spaceId: id,
+      pattern: ROUTED_SPACE_ID.source,
+      hint: 'lowercase letter/digit start; only a-z 0-9 . _ -; max 64 chars',
+    });
+  }
+  if (id.endsWith('.')) {
+    throw new MemoryError(ErrorCodes.SPACE_INVALID, 'space id must not end with a dot (Windows alias)', {
+      spaceId: id,
+      reason: 'reserved',
+    });
+  }
+  if (ROUTED_WINDOWS_DEVICE.test(id.split('.')[0])) {
+    throw new MemoryError(ErrorCodes.SPACE_INVALID, `space id is a reserved device name: ${JSON.stringify(id)}`, {
+      spaceId: id,
+      reason: 'reserved',
+    });
+  }
+  return id;
+}
 import { ensureDir, dayKey, genNumber, sha256, readJson, writeJsonAtomic, snippet } from './util.js';
 
 /** Recursive byte size of a directory tree (symlinks count as their target size). */
@@ -281,18 +341,35 @@ export class Memory {
    * @param {object} [options.policy] partial policy overrides
    * @param {object} [options.config] { maxSegmentRecords, context }
    */
-  constructor({ dataDir, clock = new SystemClock(), policy = {}, config = {} }) {
+  constructor({ dataDir, clock = new SystemClock(), policy = {}, config = {}, spaces = null, spacesFactory = null, transfer = null, federation = null, dedupe = null, spaceId = DEFAULT_SPACE_ID }) {
     if (!dataDir) throw new MemoryError(ErrorCodes.INVALID_CONFIG, 'dataDir is required');
     assertClock(clock);
     this.dataDir = path.resolve(dataDir);
     this.clock = clock;
     this.config = config;
+    // v1.5.6 pre-ingest tagging: counters for the panel, and a warning hook the
+    // plugin adapter wires to the Host logger (a miss must never break a write).
+    this._autoTag = { applied: 0, misses: 0, lastMissAt: null };
+    this._warnHook = null;
     // Kept so child spaces can be opened with the SAME policy input (the resolved
     // policy is a projection; re-resolving the projection would silently double-apply
     // aliases/defaults).
     this._policyInput = policy;
     this.policy = resolvePolicy(policy);
     this.policyHash = hashPolicy(this.policy);
+
+    // v1.5.6 physical split: the core compiles ONLY the owner's own space. The
+    // multi-space router now lives in dsh-orchestrator and is injected as `spaces`
+    // (or built by `spacesFactory`); without it, a named space fails fast with
+    // MEM_E_FEATURE_DISABLED. `transfer` is the same story for the transfer engine.
+    this.transfer = typeof transfer === 'function' ? transfer : null;
+    // v1.5.6: optional Orchestrator services. Federation records which spaces
+    // reported a tag (metadata only); dedupe arbitrates cross-space monthly memos.
+    this.federation = federation ?? null;
+    this.dedupe = dedupe ?? null;
+    this.spaceId = spaceId || DEFAULT_SPACE_ID;
+    const builtSpaces = spaces ?? (typeof spacesFactory === 'function' ? spacesFactory(this) : null);
+    this.spaces = builtSpaces ?? new SpaceRouter({ owner: this, dataDir: this.dataDir });
 
     this.paths = Object.fromEntries(
       Object.entries(SUBDIRS).map(([key, name]) => [key, path.join(this.dataDir, name)]),
@@ -329,6 +406,20 @@ export class Memory {
     this.tagTree = new TagTreeCache({ dataDir: this.dataDir, clock: this.clock, getConfig: () => this.config });
     // Forensic raw turns: never indexed, never loaded at boot, only deep_raw/prune.
     this.raw = new RawStore({ dataDir: this.dataDir, clock: this.clock, getConfig: () => this.config });
+    // v1.5.5: offline Dream distillation (LLM with a local fallback). The engine is
+    // inert until executeDream() is called by the maintenance gate: no LLM call can
+    // ever originate from the online recall/remember path.
+    this.dream = new DreamEngine({
+      memory: this,
+      clock: this.clock,
+      getConfig: () => this.config?.dream ?? {},
+    });
+    // v1.5.6: offline L2 multi-merge (duplicate same-tag episodes -> one record).
+    this.l2Merge = new L2MergeEngine({
+      memory: this,
+      clock: this.clock,
+      getConfig: () => this.config?.l2Merge ?? {},
+    });
     // Engine-owned review schedule and pending-delete queue.
     this.reviews = new ReviewSchedule({
       file: path.join(this.paths.state, 'reviews.json'),
@@ -391,26 +482,11 @@ export class Memory {
     this._closed = false;
     this._writeChain = Promise.resolve();
     /**
-     * v1.5.0 physical-layer space routing. The default space IS this instance (no
-     * extra store, so every existing single-space behaviour is byte-identical);
-     * named spaces are child store directories under <dataDir>/spaces/<id>.
+     * Child handles are only produced by a multi-space adapter (Orchestrator); the
+     * default single-space core never adds one. Kept so lifecycle/config fan-out
+     * stays unchanged.
      */
     this._childMemories = new Set();
-    this.spaces = new SpaceRouter({
-      owner: this,
-      dataDir: this.dataDir,
-      openChild: async (childDir) => {
-        const child = new Memory({
-          dataDir: childDir,
-          clock: this.clock,
-          policy: this._policyInput,
-          config: this.config,
-        });
-        await child.init();
-        this._childMemories.add(child);
-        return child;
-      },
-    });
     /**
      * Session-context accounting for the rollover/handoff decision. Keyed by session
      * id (bounded); the VALUE is the absolute estimated session size fed by the
@@ -428,9 +504,77 @@ export class Memory {
   }
 
   static async open(options) {
-    const memory = new Memory(options);
+    // v1.5.6 microkernel API: `Memory.open('/abs/dir')` is the single-space form
+    // (the Orchestrator owns the multi-space walk). The options-object form stays
+    // supported for tests and existing embedders.
+    const resolved = typeof options === 'string' ? { dataDir: options } : options;
+    const memory = new Memory(resolved);
     await memory.init();
     return memory;
+  }
+
+  /**
+   * v1.5.6 microkernel boundary: a non-default space requires `features.multiSpace`.
+   * This is the ONE gate every routed write/read passes through, so a profile that
+   * turns multi-space off becomes a strict single-space core instead of silently
+   * scattering directories.
+   */
+  assertSpaceFeature(targetSpaceId) {
+    // v1.5.6 physical split: the single-space core throws FEATURE_DISABLED for named
+    // ids itself; with the injected Orchestrator adapter, ids are validated but
+    // routed normally.
+    const multi = this.spaces?.status?.().multiSpace === true;
+    const spaceId = multi ? normaliseRoutedSpaceId(targetSpaceId) : normaliseSpaceId(targetSpaceId);
+    if (spaceId !== DEFAULT_SPACE_ID && (this.config?.features?.multiSpace === false || !multi)) {
+      throw new MemoryError(ErrorCodes.FEATURE_DISABLED, 'multi-space routing is disabled (features.multiSpace=false)', {
+        feature: 'features.multiSpace',
+        targetSpaceId: spaceId,
+      });
+    }
+    return spaceId;
+  }
+
+  /**
+   * v1.5.6 lazy warm-up for the UI / Orchestrator: fold the index for one space
+   * (default `this`, or a named space / an absolute dataDir) without opening every
+   * space at boot. Read-only: no maintenance, no writes.
+   *
+   * @param {{targetSpaceId?: string, dataDir?: string}} [options]
+   */
+  async warmup({ targetSpaceId, dataDir } = {}) {
+    this.assertOpen();
+    let target = this;
+    let spaceId = DEFAULT_SPACE_ID;
+    if (dataDir !== undefined) {
+      if (typeof dataDir !== 'string' || !path.isAbsolute(dataDir)) {
+        throw invalidInput('warmup.dataDir must be an absolute path', { dataDir: dataDir ?? null });
+      }
+      const resolvedDir = path.resolve(dataDir);
+      if (resolvedDir !== this.dataDir) {
+        if (this.config?.features?.multiSpace === false) {
+          throw new MemoryError(ErrorCodes.FEATURE_DISABLED, 'multi-space routing is disabled (features.multiSpace=false)', {
+            feature: 'features.multiSpace',
+            dataDir: resolvedDir,
+          });
+        }
+        spaceId = this.spaces.status().ids.find((id) => this.spaces.spaceDir(id) === resolvedDir) ?? null;
+        if (!spaceId) {
+          throw invalidInput('warmup.dataDir does not belong to a known space', { dataDir: resolvedDir });
+        }
+        target = await this.spaces.memoryFor(spaceId);
+      }
+    } else if (targetSpaceId !== undefined) {
+      spaceId = this.assertSpaceFeature(targetSpaceId);
+      target = await this.spaces.memoryFor(spaceId);
+    }
+    const view = target.indexManager.snapshot();
+    return {
+      spaceId,
+      dataDir: target.dataDir,
+      phase: 'ready',
+      indexGeneration: target.indexManager.generation ?? null,
+      events: view?.stats?.events ?? 0,
+    };
   }
 
   async init() {
@@ -486,6 +630,64 @@ export class Memory {
    * the same occurrence index. The ledger is a rebuildable cache, so a crash before
    * its checkpoint costs a rebuild from the log, never data.
    */
+  /**
+   * Resolve the tags for one write (v1.5.6).
+   *
+   * The model's tags always win. Only an UNTAGGED write reaches the deterministic
+   * heuristic; a successful extraction is recorded on `meta.auto_tagged` so an
+   * operator can tell inferred anchors from asserted ones. A miss is a warning
+   * (`MEM_E_AUTO_TAG_MISS`) counted for `panel.autoTag`, never a blocked write.
+   */
+  _resolveTags(content, provided) {
+    const manual = [
+      ...new Set((Array.isArray(provided) ? provided : []).map((tag) => normaliseTagToken(tag)).filter(Boolean)),
+    ];
+    if (manual.length > 0) return { tags: manual, auto: false };
+    if (this.config?.tagging?.autoTag === false) return { tags: [], auto: false };
+    const inferred = extractTags(content, { maxTags: this.config?.tagging?.maxTags ?? 2 });
+    if (inferred.length === 0) {
+      this._autoTag.misses += 1;
+      this._autoTag.lastMissAt = this.clock.now();
+      this._warn(ErrorCodes.AUTO_TAG_MISS, 'pre-ingest tagging found no usable anchor', {
+        chars: typeof content === 'string' ? content.length : 0,
+      });
+      return { tags: [], auto: false };
+    }
+    this._autoTag.applied += 1;
+    return { tags: inferred, auto: true };
+  }
+
+  /** Wire the Host logger in (optional; a throwing hook must never break a write). */
+  setWarnHook(hook) {
+    this._warnHook = typeof hook === 'function' ? hook : null;
+  }
+
+  /**
+   * v1.5.6: the Host adapter injects a reader for the CURRENT agent preset
+   * ("工作模式"). The handoff marker records it so a NEW conversation can re-apply
+   * the same mode instead of silently falling back to the default preset.
+   */
+  setHandoffPresetProvider(provider) {
+    this._handoffPresetProvider = typeof provider === 'function' ? provider : null;
+  }
+
+  _handoffPreset() {
+    try {
+      const preset = this._handoffPresetProvider?.();
+      return typeof preset === 'string' && preset.length > 0 ? preset : null;
+    } catch {
+      return null;
+    }
+  }
+
+  _warn(code, message, details = undefined) {
+    try {
+      this._warnHook?.(code, message, details);
+    } catch {
+      /* logging is observable, never load-bearing */
+    }
+  }
+
   async stage({
     content,
     eventTime,
@@ -497,17 +699,37 @@ export class Memory {
     idempotencyKey = null,
     dedupe = true,
     isTransientTrend = false,
+    pinned = false,
     mediaUrl = null,
     mediaType = null,
   } = {}) {
     this.assertOpen();
     ensureNoEmbeddedBase64(content);
     const media = validateMedia(mediaUrl, mediaType);
+    const requestedTags = [
+      ...new Set((Array.isArray(tags) ? tags : []).map((tag) => normaliseTagToken(tag)).filter(Boolean)),
+    ];
+    // v1.5.6: pinning promises this memory stays retrievable forever; it is only
+    // meaningful if something can trigger it. Refuse the write outright.
+    if (pinned === true && requestedTags.length === 0) {
+      throw new MemoryError(
+        ErrorCodes.PINNED_TAG_REQUIRED,
+        'pinned memory requires at least one caller-provided tag (an uncallable lesson is dead memory)',
+        { key: 'tags', pinned: true },
+      );
+    }
+    const tagInfo = pinned === true ? { tags: requestedTags, auto: false } : this._resolveTags(content, tags);
+    let payloadMeta = tagInfo.auto
+      ? { ...(meta && typeof meta === 'object' ? meta : {}), auto_tagged: true, auto_tags: tagInfo.tags }
+      : meta;
+    if (pinned === true) {
+      payloadMeta = { ...(payloadMeta && typeof payloadMeta === 'object' ? payloadMeta : {}), pinned: true };
+    }
     const payload = {
       content,
-      tags,
+      tags: tagInfo.tags,
       salience,
-      meta,
+      meta: payloadMeta,
       entity,
       event_time: eventTime ?? happenedAt,
       ...(media ? { media } : {}),
@@ -565,6 +787,8 @@ export class Memory {
       logTime: record.log_time,
       salience: record.salience,
       tags: record.tags.map((tag) => tag.tag),
+      // v1.5.6: pinned records never decay and are pinned to the front of recall.
+      pinned: record.meta?.pinned === true,
       day: dayKey(record.time_source === 'content' ? record.log_time : record.event_time),
       indexGeneration: this.indexManager.generation,
       indexed: true,
@@ -631,7 +855,7 @@ export class Memory {
   async remember(input = {}) {
     this.assertOpen();
     const { targetSpaceId, ...rest } = input ?? {};
-    const spaceId = normaliseSpaceId(targetSpaceId);
+    const spaceId = this.assertSpaceFeature(targetSpaceId);
     // Default space: this instance, already inside its own router lock -> use the
     // space-local write path. A child space owns its OWN router/lock; delegate to
     // its public remember() so a transfer writes into the same child lock as a
@@ -647,7 +871,28 @@ export class Memory {
     const plan = await this.stage(input);
     if (plan.status !== 'ready') return this.describePlan(plan);
     const [result] = await this.commitMany([plan]);
+    this._federate((plan.record?.tags ?? []).map((tag) => tag.tag ?? tag));
     return result;
+  }
+
+  /**
+   * v1.5.6: report this space's business tags to the Orchestrator's global map.
+   * Internal bookkeeping tags (status:/month:/active_task) are not federated, and a
+   * missing/broken service must never break a write.
+   */
+  _federate(tags = []) {
+    if (!this.federation || typeof this.federation.register !== 'function') return;
+    const business = (Array.isArray(tags) ? tags : [])
+      .filter((tag) => typeof tag === 'string' && tag && !/^(?:status:|month:)/.test(tag) && tag !== 'active_task');
+    if (business.length === 0) return;
+    try {
+      this.federation.register(this.spaceId, business);
+    } catch (error) {
+      this._warn?.(ErrorCodes.FEDERATION_FAILED ?? 'MEM_E_FEDERATION_FAILED', 'federation register failed', {
+        spaceId: this.spaceId,
+        error: error?.message ?? String(error),
+      });
+    }
   }
 
   /**
@@ -916,7 +1161,7 @@ export class Memory {
   async recall(query = {}) {
     this.assertOpen();
     const { targetSpaceId, ...rest } = query ?? {};
-    const spaceId = normaliseSpaceId(targetSpaceId);
+    const spaceId = this.assertSpaceFeature(targetSpaceId);
     // Same lock discipline as remember(): a child space uses its own public read
     // path (its own lock), so routed reads and transfer-driven writes never
     // interleave on one directory.
@@ -924,7 +1169,7 @@ export class Memory {
   }
 
   /** The space-local read path. */
-  async _recallLocal({ text = '', tags = [], topK } = {}) {
+  async _recallLocal({ text = '', tags = [], topK } = {}, { mergeRecall = true } = {}) {
     this.assertOpen();
     const now = this.clock.now();
     const view = this.indexManager.snapshot();
@@ -975,9 +1220,14 @@ export class Memory {
       now,
       queryTags: result.query?.tags ?? [],
     });
-    return {
+    // v1.5.6 read-time merge: when a monthly memo and the events it owns are both
+    // recalled, the memo wins and duplicates collapse. Only when the Orchestrator
+    // dedupe service is present; the pure core keeps its previous payload shape.
+    const merged = mergeRecall ? this.mergeRecallHits(ghostPass.hits) : { hits: ghostPass.hits, stats: null };
+    const payload = {
       ...result,
-      hits: ghostPass.hits,
+      hits: merged.hits,
+      ...(merged.stats ? { merge: merged.stats } : {}),
       ghostHints: ghostPass.ghostHints,
       oversizedTagHints: result.oversizedTagHints ?? [],
       stale: this._boot ? this._boot.status !== 'ok' : false,
@@ -989,8 +1239,152 @@ export class Memory {
         ...(result.notes ?? []),
         ...ghostPass.notes,
         ...(associations.length > 0 ? [`graph-associations:${associations.length}`] : []),
+        ...(merged.stats ? [`read-merge:${merged.stats.total}`] : []),
         ...(this._boot && this._boot.status !== 'ok' ? [`boot-check:${this._boot.status}`] : []),
       ],
+    };
+    return this.applyPayloadBudget(payload);
+  }
+
+  /**
+   * v1.5.6: cross-space recall — query every open space and merge the hit sets.
+   *
+   * This is the read half of federation: a parent monthly memo and the events it
+   * owns can live in different spaces, so a single-space recall can never dedupe
+   * them. Each space is queried under ITS OWN lock; the merged payload carries the
+   * hit's `spaceId` and (when dedupe is available) the same `merge` stats as the
+   * single-space path.
+   */
+  async recallAcrossSpaces({ text = '', tags = [], topK } = {}) {
+    this.assertOpen();
+    const spaceIds = this.spaces.status().ids;
+    const perSpace = [];
+    for (const spaceId of spaceIds) {
+      const bundle = await this.spaces.run(spaceId, async (target) => ({
+        result: await target._recallLocal({ text, tags, topK }, { mergeRecall: false }),
+        view: target.indexManager?.snapshot?.() ?? null,
+      }));
+      const raw = bundle.view?.events;
+      const events = raw instanceof Map ? [...raw.values()] : Array.isArray(raw) ? raw : [];
+      const byId = new Map(events.map((event) => [event.eventId, event]));
+      for (const hit of bundle.result.hits ?? []) {
+        const event = byId.get(hit.eventId) ?? {};
+        perSpace.push({
+          ...hit,
+          spaceId,
+          eventTime: event.eventTime ?? hit.eventTime ?? 0,
+          contentHash: event.contentHash ?? hit.contentHash ?? null,
+          sourceEventIds: event.sourceEventIds ?? [],
+          tags: (event.tags ?? hit.tags ?? []).map((tag) => tag?.tag ?? tag),
+        });
+      }
+    }
+    let hits = perSpace;
+    let merge = null;
+    if (this.dedupe && typeof this.dedupe.mergeForRead === 'function' && perSpace.length > 1) {
+      const monthlyRecords = perSpace.filter((record) => (record.tags ?? []).includes(MONTHLY_TAG));
+      const spaceRecords = perSpace.filter((record) => !(record.tags ?? []).includes(MONTHLY_TAG));
+      if (monthlyRecords.length > 0) {
+        const merged = this.dedupe.mergeForRead({ spaceRecords, monthlyRecords });
+        const byId = new Map(perSpace.map((record) => [record.eventId, record]));
+        hits = merged.records.map((record) => byId.get(record.eventId)).filter(Boolean);
+        merge = merged.stats;
+      }
+    }
+    const limit = Number.isFinite(Number(topK)) && Number(topK) > 0 ? Math.min(Math.trunc(Number(topK)), 100) : hits.length;
+    return {
+      mode: 'cross-space',
+      crossSpace: true,
+      spaces: spaceIds,
+      hits: hits.slice(0, limit),
+      ...(merge ? { merge } : {}),
+      total: hits.length,
+    };
+  }
+
+  /**
+   * v1.5.6: fold recalled hits through the Orchestrator's read-time merge.
+   *
+   * A monthly memo owns the events listed in its `source_event_ids`; when both the
+   * memo and one of its source events are recalled, the event is dropped. Identical
+   * `contentHash` hits collapse too (monthly first). Without the service, or with
+   * fewer than two hits, the payload is returned untouched.
+   */
+  mergeRecallHits(hits) {
+    if (!this.dedupe || typeof this.dedupe.mergeForRead !== 'function' || !Array.isArray(hits) || hits.length < 2) {
+      return { hits: Array.isArray(hits) ? hits : [], stats: null };
+    }
+    const view = this.indexManager?.snapshot?.();
+    const raw = view?.events;
+    const events = raw instanceof Map ? [...raw.values()] : Array.isArray(raw) ? raw : [];
+    const byId = new Map(events.map((event) => [event.eventId, event]));
+    const records = hits.map((hit) => {
+      const event = byId.get(hit.eventId) ?? {};
+      const tags = (event.tags ?? hit.tags ?? []).map((tag) => tag?.tag ?? tag);
+      return {
+        ...hit,
+        eventId: hit.eventId,
+        eventTime: event.eventTime ?? hit.eventTime ?? 0,
+        contentHash: event.contentHash ?? hit.contentHash ?? null,
+        sourceEventIds: event.sourceEventIds ?? [],
+        monthly: tags.includes(MONTHLY_TAG),
+      };
+    });
+    const monthlyRecords = records.filter((record) => record.monthly);
+    if (monthlyRecords.length === 0) return { hits, stats: null };
+    const spaceRecords = records.filter((record) => !record.monthly);
+    const merged = this.dedupe.mergeForRead({ spaceRecords, monthlyRecords });
+    const byHitId = new Map(hits.map((hit) => [hit.eventId, hit]));
+    const mergedHits = merged.records.map((record) => byHitId.get(record.eventId)).filter(Boolean);
+    return { hits: mergedHits, stats: merged.stats };
+  }
+
+  /**
+   * v1.5.6 — one recall's response budget.
+   *
+   * A broad query must not hand the caller an unbounded JSON payload: the window
+   * engine only sees what the response actually contains, so the response itself
+   * needs a ceiling. Hits are kept in rank order; semantic/temp summaries only if
+   * the body budget still has room. The first item is always kept (an empty recall
+   * would be worse than a small overrun) and the overrun is reported, never hidden:
+   * `truncated`, `payload.estimatedTokens` and a `payload-budget` note.
+   */
+  applyPayloadBudget(result = {}) {
+    const maxTokens = Math.max(1, Math.trunc(Number(this.config?.context?.maxInjectTokens ?? 4000)));
+    const budgetChars = maxTokens * 4;
+    let usedChars = 0;
+    let dropped = 0;
+    const keep = (item) => {
+      const chars = JSON.stringify(item ?? null).length;
+      if (usedChars > 0 && usedChars + chars > budgetChars) return false;
+      usedChars += chars;
+      return true;
+    };
+    const hits = [];
+    for (const hit of result.hits ?? []) {
+      if (keep(hit)) hits.push(hit);
+      else dropped += 1;
+    }
+    const semantic = [];
+    for (const item of result.semantic ?? []) {
+      if (keep(item)) semantic.push(item);
+      else dropped += 1;
+    }
+    const tempSemantic = [];
+    for (const item of result.tempSemantic ?? []) {
+      if (keep(item)) tempSemantic.push(item);
+      else dropped += 1;
+    }
+    const payload = { maxTokens, estimatedTokens: Math.ceil(usedChars / 4), dropped };
+    if (dropped === 0) return { ...result, payload };
+    return {
+      ...result,
+      hits,
+      semantic,
+      tempSemantic,
+      truncated: true,
+      payload,
+      notes: [...(result.notes ?? []), `payload-budget:dropped ${dropped} item(s) (maxInjectTokens=${maxTokens})`],
     };
   }
 
@@ -1260,6 +1654,69 @@ export class Memory {
   }
 
   /**
+   * v1.5.6: backfill the working mode into an ACTIVE handoff marker. The marker may
+   * predate this feature (or the mode may be learned after the rollover fired);
+   * patching is idempotent and only touches state/, never durable memories.
+   */
+  patchHandoffPreset(preset) {
+    if (typeof preset !== 'string' || preset.length === 0) return null;
+    const current = readJson(this.handoffPath(), null);
+    if (!current || current.active !== true) return null;
+    if (current.agentPreset === preset) return current;
+    const next = { ...current, agentPreset: preset, agentPresetUpdatedAt: this.clock.now() };
+    ensureDir(this.paths.state);
+    writeJsonAtomic(this.handoffPath(), next);
+    this._markBriefingDirty();
+    return next;
+  }
+
+  /**
+   * v1.5.6 local Dream scheduler queue (`state/dream-queue.json`).
+   *
+   * A peak-hour deferral is durable, so a restart during the peak window does not
+   * lose the pending Dream: the next low-valley tick (or boot) can run it.
+   */
+  dreamQueue() {
+    const record = readJson(path.join(this.paths.state, 'dream-queue.json'), null);
+    if (!record || typeof record !== 'object') return { pending: false };
+    return { pending: record.pending === true, ...record };
+  }
+
+  setDreamQueue(record = {}) {
+    ensureDir(this.paths.state);
+    writeJsonAtomic(path.join(this.paths.state, 'dream-queue.json'), { ...record, updatedAt: this.clock.now() });
+    return this.dreamQueue();
+  }
+
+  clearDreamQueue(reason = 'completed') {
+    return this.setDreamQueue({ pending: false, reason, clearedAt: this.clock.now() });
+  }
+
+  /**
+   * v1.5.6: the `[Active Task]` source for prompt assembly.
+   *
+   * Note: `activeTask()` is the checkpoint reader (existing public API); this is a
+   * different projection, hence the distinct name.
+   */
+  promptActiveTask() {
+    this.assertOpen();
+    const view = this.indexManager?.snapshot?.();
+    const rawEvents = view?.events;
+    const events = rawEvents instanceof Map ? [...rawEvents.values()] : Array.isArray(rawEvents) ? rawEvents : [];
+    const handoff = this.handoffState();
+    if (handoff.active && typeof handoff.summaryEventId === 'string') {
+      const summary = events.find((event) => event.eventId === handoff.summaryEventId);
+      if (summary?.content) return { eventId: summary.eventId, source: 'handoff', text: String(summary.content) };
+    }
+    const tagOf = (entry) => (typeof entry === 'string' ? entry : entry?.tag);
+    const withTask = events.filter((event) => (event.tags ?? []).some((tag) => String(tagOf(tag) ?? '').startsWith('task:')));
+    if (withTask.length === 0) return null;
+    withTask.sort((a, b) => (b.eventTime ?? 0) - (a.eventTime ?? 0) || String(b.eventId).localeCompare(String(a.eventId)));
+    const newest = withTask[0];
+    return { eventId: newest.eventId, source: 'task', text: String(newest.content ?? '') };
+  }
+
+  /**
    * Evaluate the rollover state and, when due, perform the handoff exactly once.
    *
    * v1.5.4 anti-deadlock contract: this method NEVER rejects and NEVER leaves the
@@ -1328,6 +1785,9 @@ export class Memory {
       summaryEventId: distilled?.eventId ?? null,
       summaryStatus: distilled?.status ?? null,
       summaryError: failure,
+      // v1.5.6: carry the working mode (Host agent preset) across the handoff so the
+      // next conversation starts in the SAME mode instead of the profile default.
+      agentPreset: this._handoffPreset(),
       note: failure
         ? '交接摘要生成失败，状态机已优雅降级：新会话可立即开始（记录见 summaryError）。本插件不能保证一个会话永生不死，只能保证人格不死。'
         : '人格交接点：末尾摘要已存为 L1.5，新会话从该摘要继续。本插件不能保证一个会话永生不死，只能保证人格不死。',
@@ -1477,6 +1937,13 @@ export class Memory {
    */
   async transferEvents({ eventIds, targetSpaceId, transferMode = 'copy', sourceSpaceId, userApproved = false } = {}) {
     this.assertOpen();
+    // v1.5.6 feature gate: an explicitly disabled capability answers with a stable
+    // code before the consent dance (nothing is read, nothing is written).
+    if (this.config?.features?.crossSpaceTransfer === false || this.config?.features?.multiSpace === false) {
+      throw new MemoryError(ErrorCodes.FEATURE_DISABLED, 'cross-space transfer is disabled (features.crossSpaceTransfer=false)', {
+        feature: 'features.crossSpaceTransfer',
+      });
+    }
     const consentRequired = this.config?.context?.requireExplicitConsentForTransfer !== false;
     if (consentRequired && userApproved !== true) {
       throw new MemoryError(
@@ -1489,18 +1956,26 @@ export class Memory {
         },
       );
     }
-    const sourceId = normaliseSpaceId(sourceSpaceId);
-    const targetId = normaliseSpaceId(targetSpaceId);
+    const sourceId = this.assertSpaceFeature(sourceSpaceId);
+    const targetId = this.assertSpaceFeature(targetSpaceId);
     if (sourceId === targetId) {
       throw invalidInput('source space and target space must differ', { sourceSpaceId: sourceId, targetSpaceId: targetId });
     }
+    // v1.5.6 physical split: the transfer engine now lives in dsh-orchestrator and
+    // arrives through the injected `transfer` function. Without it the core keeps the
+    // tool/route surface for compatibility but answers with an explicit capability
+    // error instead of importing multi-space code.
+    if (!this.transfer) {
+      throw new MemoryError(
+        ErrorCodes.FEATURE_DISABLED,
+        'cross-space transfer is not part of the hippocampus core; install dsh-orchestrator to enable it',
+        { capability: 'crossSpaceTransfer', sourceSpaceId: sourceId, targetSpaceId: targetId },
+      );
+    }
     const source = await this.spaces.memoryFor(sourceId);
     const target = await this.spaces.memoryFor(targetId);
-    // Loaded lazily: the transfer engine is optional surface, so a broken/absent
-    // module must not stop the whole facade from opening.
-    const { transferBetweenSpaces } = await import('./spaces/transfer.js');
     const graceHours = Math.max(1, Number(this.policy?.delete?.graceHours ?? 24));
-    return transferBetweenSpaces({
+    return this.transfer({
       source,
       target,
       eventIds,
@@ -1520,7 +1995,7 @@ export class Memory {
    */
   async recentMemories({ limit = 20, targetSpaceId } = {}) {
     this.assertOpen();
-    const spaceId = normaliseSpaceId(targetSpaceId);
+    const spaceId = this.assertSpaceFeature(targetSpaceId);
     const bounded = Math.max(1, Math.min(Math.round(Number(limit) || 20), 200));
     return this.spaces.run(spaceId, (target) => target._recentMemoriesLocal(bounded, spaceId));
   }
@@ -1554,6 +2029,13 @@ export class Memory {
       report.monthly = await this.generateMonthlyMemos();
     } catch (error) {
       report.monthlyError = error instanceof Error ? error.message : String(error);
+    }
+    // v1.5.6: L2 multi-merge runs offline, after the read model converged. A failure
+    // must never fail maintenance (duplicates are cosmetic, the log is the truth).
+    try {
+      report.l2Merge = await this.l2Merge.run({ now: this.clock.now() });
+    } catch (error) {
+      report.l2MergeError = error instanceof Error ? error.message : String(error);
     }
     // The graph is part of maintenance, never of the read path: the index is
     // already "log minus tombstones", so this is a projection of a projection.
@@ -1632,6 +2114,25 @@ export class Memory {
     return report;
   }
 
+  /**
+   * Offline Dream: group same-tag L2 records and distill them into one durable
+   * record. The LLM leg is optional and strictly offline — this is the ONLY call
+   * site that may reach the network. On any failure the engine degrades to the
+   * deterministic local merge and records `MEM_E_DREAM_LLM_FALLBACK`; the returned
+   * record always carries `meta.source_event_ids`.
+   *
+   * @param {{now?: number, fetchImpl?: Function, logger?: object}} [options]
+   */
+  async executeDream(options = {}) {
+    this.assertOpen();
+    return this.dream.run(options);
+  }
+
+  /** Circuit + last-run snapshot for the panel / admin surface. */
+  dreamStatus() {
+    return this.dream.status();
+  }
+
   /** Panel summary of the cached graph (no nodes, no edges). */
   graphStatus() {
     this.assertOpen();
@@ -1665,7 +2166,7 @@ export class Memory {
    */
   async graphForSpace({ targetSpaceId, limit } = {}) {
     this.assertOpen();
-    const spaceId = normaliseSpaceId(targetSpaceId);
+    const spaceId = this.assertSpaceFeature(targetSpaceId);
     if (spaceId === DEFAULT_SPACE_ID) {
       return { spaceId, graph: this.graphView(limit), tagTree: this.tagTreeView() };
     }
@@ -1679,7 +2180,7 @@ export class Memory {
   /** Ensure a named space exists (creates its store lazily) and list all spaces. */
   async ensureSpace(spaceId) {
     this.assertOpen();
-    const id = normaliseSpaceId(spaceId);
+    const id = this.assertSpaceFeature(spaceId);
     await this.spaces.memoryFor(id);
     return { spaceId: id, spaces: this.spaces.status() };
   }
@@ -1696,7 +2197,15 @@ export class Memory {
    */
   async createSpace(spaceId) {
     this.assertOpen();
-    const id = validateNewSpaceId(spaceId);
+    const multi = this.spaces?.status?.().multiSpace === true;
+    if (this.config?.features?.multiSpace === false || !multi) {
+      // Single-space core: creation is not a capability it has at all.
+      if (!multi) return validateNewSpaceId(spaceId);
+      throw new MemoryError(ErrorCodes.FEATURE_DISABLED, 'multi-space routing is disabled (features.multiSpace=false)', {
+        feature: 'features.multiSpace',
+      });
+    }
+    const id = validateRoutedNewSpaceId(spaceId);
     const dir = this.spaces.spaceDir(id);
     let existing = null;
     try {
@@ -1725,6 +2234,39 @@ export class Memory {
       });
     }
     return { spaceId: id, created: true, spaces: this.spaces.status() };
+  }
+
+  /**
+   * v1.5.6: DELETE a named space (the UI's missing affordance).
+   *
+   * Destructive: `confirm:true` is mandatory, `default` is never deletable, and the
+   * operation is refused entirely in the strict single-space core. The actual close
+   * + directory removal lives in the injected router (dsh-orchestrator), which owns
+   * the child handles; this facade only validates the capability boundary.
+   */
+  async deleteSpace(spaceId, { confirm = false } = {}) {
+    this.assertOpen();
+    const multi = this.spaces?.status?.().multiSpace === true;
+    if (this.config?.features?.multiSpace === false || !multi) {
+      throw new MemoryError(
+        ErrorCodes.FEATURE_DISABLED,
+        'space deletion requires dsh-orchestrator (the core has only the default space)',
+        { spaceId: typeof spaceId === 'string' ? spaceId : null, capability: 'multiSpace' },
+      );
+    }
+    const id = this.assertSpaceFeature(spaceId);
+    if (id === DEFAULT_SPACE_ID) {
+      throw new MemoryError(ErrorCodes.SPACE_INVALID, 'the default space cannot be deleted', {
+        spaceId: id,
+        reason: 'reserved',
+      });
+    }
+    if (typeof this.spaces.deleteSpace !== 'function') {
+      throw new MemoryError(ErrorCodes.FEATURE_DISABLED, 'the injected space adapter does not support deletion', {
+        capability: 'multiSpace',
+      });
+    }
+    return this.spaces.deleteSpace(id, { confirm: confirm === true });
   }
 
   // ---- L2.5 trend quarantine ---------------------------------------------
@@ -1819,6 +2361,7 @@ export class Memory {
     const state = readJson(this.monthlyStatePath(), null);
     const done = new Set(Array.isArray(state?.months) ? state.months : []);
     const generated = [];
+    const skipped = [];
     for (const [month, list] of [...byMonth].sort(([a], [b]) => a.localeCompare(b))) {
       if (done.has(month)) continue;
       const [year, monthIndex] = month.split('-').map(Number);
@@ -1834,12 +2377,37 @@ export class Memory {
         .map((event) => snippet(event.content, 60));
       const days = new Set(list.map((event) => event.day)).size;
       const content = `月度记忆 ${month}：${list.length} 条事件 / ${days} 天；主要标签：${topTags.join('、') || '无'}；要点：${highlights.join('；') || '无'}`;
+      // v1.5.6 cross-space dedupe: the FIRST space to claim this memo's content hash
+      // owns it; a sibling space with the identical workload skips its own copy.
+      if (this.dedupe && typeof this.dedupe.claim === 'function') {
+        const owner = `monthly:${this.spaceId}`;
+        try {
+          const claim = this.dedupe.claim({
+            contentHash: sha256(content),
+            owner,
+            spaceId: this.spaceId,
+            sourceEventIds: list.map((event) => event.eventId),
+          });
+          if (!claim.claimed && claim.owner !== owner) {
+            done.add(month);
+            skipped.push({ month, owner: claim.owner, events: list.length });
+            continue;
+          }
+        } catch (error) {
+          this._warn?.(ErrorCodes.DEDUPE_FAILED ?? 'MEM_E_DEDUPE_FAILED', 'dedupe claim failed', {
+            month,
+            error: error?.message ?? String(error),
+          });
+        }
+      }
       const result = await this.remember({
         content,
         tags: [MONTHLY_TAG, `month:${month}`],
         salience: 0.95,
         eventTime: nextMonth - 1,
         entity: `month:${month}`,
+        // Provenance for the read-time cross-space merge: the memo owns these events.
+        meta: { source_event_ids: list.map((event) => event.eventId).sort() },
       });
       done.add(month);
       generated.push({ month, eventId: result.eventId, status: result.status, events: list.length });
@@ -1848,7 +2416,7 @@ export class Memory {
       ensureDir(this.paths.state);
       writeJsonAtomic(this.monthlyStatePath(), { schema: 1, months: [...done].sort(), updatedAt: now });
     }
-    return { generated: generated.length, months: generated.map((entry) => entry.month), entries: generated };
+    return { generated: generated.length, months: generated.map((entry) => entry.month), entries: generated, skipped: skipped.length, skippedEntries: skipped };
   }
 
   async extractTrend({ content, sourceEvents = [], tags = [], occurredAt, ttlDays } = {}) {
@@ -1877,7 +2445,7 @@ export class Memory {
    */
   async status({ targetSpaceId, spaceIds = null } = {}) {
     this.assertOpen();
-    const spaceId = normaliseSpaceId(targetSpaceId);
+    const spaceId = this.assertSpaceFeature(targetSpaceId);
     if (spaceId === DEFAULT_SPACE_ID) return this._statusLocal(DEFAULT_SPACE_ID, spaceIds);
     return this.spaces.run(spaceId, (target) => target._statusLocal(spaceId, spaceIds));
   }
@@ -1938,6 +2506,8 @@ export class Memory {
           activeTags: index.stats?.activeTags ?? 0,
           semanticSummaries: semantic.summaries ?? 0,
           tempQuarantined: temp.temp ?? 0,
+          // v1.5.6: pinned records (never decay / never archived).
+          pinned: index.stats?.pinnedEvents ?? 0,
         },
         tokens: {
           contextTokens: context.tokens ?? 0,
@@ -1971,6 +2541,13 @@ export class Memory {
         raw: { ...this.raw.stats(), mode: this.config?.raw?.mode ?? 'salience' },
         reviews: this.reviews.status({ now }),
         pendingDeletes: this.pendingDeletes.status(now),
+        // v1.5.5: offline Dream circuit + last fallback, visible so a broken LLM is
+        // never a silent degradation.
+        dream: this.dreamStatus(),
+        // v1.5.6: pre-ingest tagging health (applied anchors / anchorless misses).
+        autoTag: { ...this._autoTag },
+        // v1.5.6: L2 multi-merge bookkeeping (merged sources / groups).
+        l2Merge: this.l2Merge.status(),
         // v1.5.0: the status bar and the space panel read exactly these fields.
         // `mode` is the Qwen native/layered decision (native below nativeTokenLimit);
         // `remainingTokens` is what the UI renders as "剩余 X Tokens 触发交接".
@@ -2165,6 +2742,13 @@ export class Memory {
       }
     }
     this._childMemories.clear();
+    // v1.5.6 resource release: the raw store owns a flush timer and a write queue.
+    // Close it BEFORE the log so the last turns are persisted synchronously.
+    try {
+      this.raw.close();
+    } catch {
+      /* best effort */
+    }
     try {
       this.logStore.close();
     } catch {
@@ -2174,6 +2758,15 @@ export class Memory {
       this.ledger.persist();
     } catch {
       /* the log remains the truth source */
+    }
+    // Drop the caches a closed instance no longer needs: the scheduler reference and
+    // the index views. Nothing may read this instance after close (assertOpen).
+    this._scheduler = null;
+    this._oversizedHintTags?.clear?.();
+    try {
+      this.indexManager.release?.();
+    } catch {
+      /* best effort */
     }
   }
 }

@@ -149,21 +149,36 @@
       }
 
       /**
-       * The ONE user-facing error mapper for space creation. Every branch returns
+       * v1.5.6: DELETE is a versioned sub-capability. An old host advertises
+       * spaces:true but has no delete route, so the button must stay hidden — sending
+       * the request to an old host is what produced the misleading "空间已存在".
+       */
+      function spaceDeleteAvailable(payload) {
+        const caps = payload && payload.capabilities;
+        return Boolean(caps && typeof caps === 'object' && caps.spaces === true && caps.spacesDelete === true);
+      }
+
+      /**
+       * The ONE user-facing error mapper for space operations. Every branch returns
        * a complete sentence; codes are diagnostics, never the visible message.
        */
-      function describeSpaceError(error, httpStatus) {
+      function describeSpaceError(error, httpStatus, operation = 'create') {
+        const prefix = operation === 'delete' ? '删除失败：' : '创建失败：';
         const code = (error && error.code) || '';
         const message = (error && error.message) || '';
         if (code === 'MEM_E_SPACE_INVALID') {
           const details = (error && error.details) || {};
-          if (details.reason === 'conflict') return `创建失败：空间「${details.spaceId ?? ''}」已存在，请换一个名称`;
-          if (details.reason === 'reserved') return '创建失败：该名称是系统保留名，请换一个';
+          if (details.reason === 'conflict') return `${prefix}空间「${details.spaceId ?? ''}」已存在，请换一个名称`;
+          if (details.reason === 'reserved') {
+            return operation === 'delete' ? `${prefix}该空间不可删除或名称属于系统保留` : `${prefix}该名称是系统保留名，请换一个`;
+          }
           // No raw English validator text either: the server message is diagnostics.
-          return '创建失败：空间名称无效——需以小写字母/数字开头，只能含 a-z 0-9 . _ -（最长 64）';
+          return `${prefix}空间名称无效——需以小写字母/数字开头，只能含 a-z 0-9 . _ -（最长 64）`;
         }
-        if (code === 'MEM_E_NOT_READY') return '创建失败：记忆引擎尚未就绪，请稍后重试';
-        if (code === 'MEM_E_REQUIRE_USER_CONSENT') return '创建失败：该操作需要用户明确授权';
+        if (code === 'MEM_E_NOT_FOUND') return `${prefix}空间不存在或已被删除`;
+        if (code === 'MEM_E_FEATURE_DISABLED') return `${prefix}当前宿主未启用多空间（需安装 dsh-orchestrator）`;
+        if (code === 'MEM_E_NOT_READY') return `${prefix}记忆引擎尚未就绪，请稍后重试`;
+        if (code === 'MEM_E_REQUIRE_USER_CONSENT') return `${prefix}该操作需要用户明确授权`;
         // Route missing / version mismatch / transport failure: friendly fallback,
         // never the raw `MEM_E_SPACES: HTTP 404`.
         if (
@@ -173,9 +188,9 @@
           /HTTP\s*404/i.test(message) ||
           /not found/i.test(message)
         ) {
-          return '创建失败：底层引擎未响应，请检查版本或联系架构师';
+          return `${prefix}底层引擎未响应，请检查版本或联系架构师`;
         }
-        return `创建失败：${message || '未知错误'}，请稍后重试或联系架构师`;
+        return `${prefix}${message || '未知错误'}，请稍后重试或联系架构师`;
       }
 
       /** Subscribe to the global space selector; returns the selected id. */
@@ -983,6 +998,40 @@
       }
 
       /**
+       * v1.5.6: initial overlap separation. The force pass can leave a pair (or a
+       * tight cluster) closer than a readable node, especially with equal weights.
+       * One deterministic post-pass pushes every pair below `minDistance` apart
+       * without re-running the simulation, so the first painted frame is already
+       * readable instead of a pile of labels.
+       */
+      function separateOverlaps(positions, { minDistance = 56, passes = 14 } = {}) {
+        for (let pass = 0; pass < passes; pass += 1) {
+          let moved = false;
+          for (let i = 0; i < positions.length; i += 1) {
+            for (let j = i + 1; j < positions.length; j += 1) {
+              const a = positions[i];
+              const b = positions[j];
+              const dx = a.x - b.x;
+              const dy = a.y - b.y;
+              const distance = Math.sqrt(dx * dx + dy * dy);
+              if (distance >= minDistance) continue;
+              const push = (minDistance - distance) / 2 + 0.5;
+              const angle = distance > 0.001 ? Math.atan2(dy, dx) : ((i * 37 + j * 17) % 628) / 100;
+              const ux = Math.cos(angle);
+              const uy = Math.sin(angle);
+              a.x += ux * push;
+              a.y += uy * push;
+              b.x -= ux * push;
+              b.y -= uy * push;
+              moved = true;
+            }
+          }
+          if (!moved) break;
+        }
+        return positions;
+      }
+
+      /**
        * Force graph with drag.
        *
        * The layout is computed once and frozen into `layoutRef`; dragging then
@@ -1113,7 +1162,7 @@
         const layoutKey =
           allNodes.length + ':' + allEdges.length + ':' + (graph ? graph.generatedAt : 0) + ':' + ghostNodes.map((node) => node.id).join(',');
         if (!layoutRef.current || layoutRef.current.key !== layoutKey) {
-          layoutRef.current = { key: layoutKey, positions: computeLayout(allNodes, allEdges, width, height) };
+          layoutRef.current = { key: layoutKey, positions: separateOverlaps(computeLayout(allNodes, allEdges, width, height)) };
         }
         const positions = layoutRef.current.positions;
         const byId = new Map(positions.map((position) => [position.id, position]));
@@ -1126,6 +1175,21 @@
         const dragRef = React.useRef(null);
         const rafRef = React.useRef(0);
         const aliveRef = React.useRef(true);
+        // v1.5.6: viewport transform (Ctrl+drag pan / Ctrl+wheel zoom). Kept in a ref
+        // and applied to a <g> imperatively, so panning never re-renders the graph.
+        const groupRef = React.useRef(null);
+        const viewRef = React.useRef({ x: 0, y: 0, k: 1 });
+        const panRef = React.useRef(null);
+        const applyView = () => {
+          const g = groupRef.current;
+          if (!g) return;
+          const v = viewRef.current;
+          g.setAttribute('transform', `translate(${v.x}, ${v.y}) scale(${v.k})`);
+        };
+        const resetView = () => {
+          viewRef.current = { x: 0, y: 0, k: 1 };
+          applyView();
+        };
 
         React.useEffect(() => {
           aliveRef.current = true;
@@ -1133,6 +1197,7 @@
           // releasing outside the SVG must still end the drag (and must never
           // leave a node pinned forever).
           const onWindowUp = (evt) => {
+            if (panRef.current) panRef.current = null;
             const drag = dragRef.current;
             if (!drag || drag.pointerId !== evt.pointerId) return;
             dragRef.current = null;
@@ -1152,6 +1217,20 @@
               window.removeEventListener('pointercancel', onWindowUp);
             }
           };
+        }, []);
+
+        // v1.5.6: native wheel listener (passive:false) so Ctrl+wheel can zoom the
+        // graph without the page scrolling. Plain wheel keeps the page behaviour.
+        React.useEffect(() => {
+          const svg = svgRef.current;
+          if (!svg || typeof svg.addEventListener !== 'function') return undefined;
+          const onWheel = (evt) => {
+            if (!(evt.ctrlKey || evt.metaKey)) return;
+            evt.preventDefault();
+            zoomAt(evt);
+          };
+          svg.addEventListener('wheel', onWheel, { passive: false });
+          return () => svg.removeEventListener('wheel', onWheel);
         }, []);
 
         // Progressive reveal paints frozen coordinates only; it never re-runs
@@ -1191,14 +1270,82 @@
           }
         };
 
-        /** Client point -> viewBox point, so a drag tracks the cursor exactly. */
-        const toSvg = (evt) => {
+        /** Client point -> viewBox point (before pan/zoom), so a drag tracks the cursor exactly. */
+        const toView = (evt) => {
           const svg = svgRef.current;
           if (!svg) return { x: 0, y: 0 };
           const rect = svg.getBoundingClientRect();
           const scaleX = rect.width ? width / rect.width : 1;
           const scaleY = rect.height ? height / rect.height : 1;
           return { x: (evt.clientX - rect.left) * scaleX, y: (evt.clientY - rect.top) * scaleY };
+        };
+
+        /** Client point -> graph coordinates (viewBox point through the pan/zoom transform). */
+        const toSvg = (evt) => {
+          const raw = toView(evt);
+          const view = viewRef.current;
+          return { x: (raw.x - view.x) / view.k, y: (raw.y - view.y) / view.k };
+        };
+
+        // ---- v1.5.6 Ctrl interactions: pan by drag, zoom by wheel -----------------
+        const startPan = (evt) => {
+          if (evt.button !== undefined && evt.button !== 0) return;
+          const view = viewRef.current;
+          panRef.current = {
+            pointerId: evt.pointerId,
+            startX: evt.clientX,
+            startY: evt.clientY,
+            originX: view.x,
+            originY: view.y,
+          };
+          try {
+            svgRef.current?.setPointerCapture(evt.pointerId);
+          } catch {
+            /* pointer capture is best-effort */
+          }
+          evt.preventDefault?.();
+        };
+
+        const panMove = (evt) => {
+          const pan = panRef.current;
+          if (!pan || pan.pointerId !== evt.pointerId) return false;
+          const svg = svgRef.current;
+          if (!svg) return true;
+          const rect = svg.getBoundingClientRect();
+          const scaleX = rect.width ? width / rect.width : 1;
+          const scaleY = rect.height ? height / rect.height : 1;
+          viewRef.current = {
+            ...viewRef.current,
+            x: pan.originX + (evt.clientX - pan.startX) * scaleX,
+            y: pan.originY + (evt.clientY - pan.startY) * scaleY,
+          };
+          applyView();
+          return true;
+        };
+
+        const endPan = (evt) => {
+          if (!panRef.current || panRef.current.pointerId !== evt.pointerId) return false;
+          panRef.current = null;
+          try {
+            svgRef.current?.releasePointerCapture(evt.pointerId);
+          } catch {
+            /* already released */
+          }
+          return true;
+        };
+
+        /** Zoom around the cursor so the tag under the pointer stays put. */
+        const zoomAt = (evt) => {
+          const svg = svgRef.current;
+          if (!svg) return;
+          const view = viewRef.current;
+          const raw = toView(evt);
+          const gx = (raw.x - view.x) / view.k;
+          const gy = (raw.y - view.y) / view.k;
+          const factor = Math.exp(-Number(evt.deltaY || 0) * 0.0015);
+          const k = Math.max(0.4, Math.min(3, view.k * factor));
+          viewRef.current = { x: raw.x - gx * k, y: raw.y - gy * k, k };
+          applyView();
         };
 
         /** Local relaxation: the dragged node and its neighbours only, alpha-decayed. */
@@ -1264,6 +1411,12 @@
 
         const onPointerDown = (node, index, evt) => {
           if (evt.button !== undefined && evt.button !== 0) return;
+          // Ctrl/Cmd turns a node grab into canvas panning (prevents accidental moves).
+          if (evt.ctrlKey || evt.metaKey) {
+            startPan(evt);
+            evt.stopPropagation?.();
+            return;
+          }
           const position = positions[index];
           if (!position) return;
           const point = toSvg(evt);
@@ -1292,6 +1445,8 @@
         };
 
         const onPointerMove = (evt) => {
+          // v1.5.6: Ctrl+drag pans the canvas; plain drag moves a node.
+          if (panMove(evt)) return;
           const drag = dragRef.current;
           if (!drag || drag.pointerId !== evt.pointerId) return;
           if (!drag.moved) {
@@ -1310,6 +1465,7 @@
         };
 
         const endDrag = (evt) => {
+          if (endPan(evt)) return;
           const drag = dragRef.current;
           if (!drag || drag.pointerId !== evt.pointerId) return;
           dragRef.current = null;
@@ -1342,6 +1498,11 @@
             h(
               'div',
               { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+              h(
+                'div',
+                { style: { ...labelStyle, marginBottom: 0 }, title: '按住 Ctrl（Mac 为 Cmd）拖拽画布平移；Ctrl + 滚轮缩放；双击空白处重置视图' },
+                'Ctrl 拖拽平移 · Ctrl 滚轮缩放',
+              ),
               h('div', { style: { ...labelStyle, marginBottom: 0 } }, `${fmtNumber(graph.nodeCount)} 节点 · ${fmtNumber(graph.edgeCount)} 边${graph.truncated ? '（已截断）' : ''}`),
               ghostNodes.length > 0
                 ? h(
@@ -1371,10 +1532,17 @@
               width: '100%',
               viewBox: `0 0 ${width} ${height}`,
               style: { display: 'block', touchAction: 'none' },
+              onPointerDown: (evt) => {
+                if ((evt.ctrlKey || evt.metaKey) && evt.target === evt.currentTarget) startPan(evt);
+              },
               onPointerMove,
               onPointerUp: endDrag,
               onPointerCancel: endDrag,
+              onDoubleClick: (evt) => {
+                if (evt.target === evt.currentTarget) resetView();
+              },
             },
+            h('g', { ref: groupRef, transform: 'translate(0, 0) scale(1)' },
             // Edges first, and only when BOTH endpoints are painted: no dangling lines.
             allEdges.map((edge, i) => {
               const a = byId.get(edge.source);
@@ -1452,8 +1620,9 @@
                   ),
               );
             }),
+            ),
           ),
-          h('div', { style: { ...labelStyle, marginTop: 6, marginBottom: 0 } }, '拖拽节点可移动；单击查看标签；核心节点常显。幽灵节点＝宽限期内的层级记忆，仅在"历史全貌"可见（半透明、虚线、挂在父 root 下）。'),
+          h('div', { style: { ...labelStyle, marginTop: 6, marginBottom: 0 } }, 'Ctrl+拖拽平移 · Ctrl+滚轮缩放 · 双击空白重置视图；拖拽节点可移动；单击查看标签；核心节点常显。幽灵节点＝宽限期内的层级记忆，仅在"历史全貌"可见（半透明、虚线、挂在父 root 下）。'),
         );
       }
 
@@ -1529,7 +1698,14 @@
         const [busy, setBusy] = React.useState(false);
         // Capability handshake: an old host that does not serve /spaces is detected
         // BEFORE a request is made, so the 404 incident cannot repeat.
-        const availability = spaceCreateAvailable(props.payload || { capabilities: props.capabilities });
+        const handshake = props.payload || { capabilities: props.capabilities };
+        const caps = (handshake && handshake.capabilities) || null;
+        // v1.5.6: silently disappear when multi-space is not a live capability
+        // (no dsh-orchestrator, or an old host). No empty selector, no disabled
+        // button, no warning noise in the panel.
+        if (!caps || caps.spaces !== true) return null;
+        const availability = spaceCreateAvailable(handshake);
+        const deleteAvailable = spaceDeleteAvailable(handshake);
 
         const create = async () => {
           // Defence #1: never call a route the host did not advertise.
@@ -1568,6 +1744,46 @@
           }
         };
 
+        /**
+         * v1.5.6: DELETE the CURRENT named space. Destructive, so the human confirms
+         * first; `default` has no delete button at all. After success the selector
+         * returns to `default` and the caller refreshes the list.
+         */
+        const remove = async () => {
+          const target = props.value;
+          // Never call a delete route the host did not advertise: on a pre-delete
+          // host this request used to be misread as CREATE ("空间已存在").
+          if (!deleteAvailable) return;
+          if (!target || target === DEFAULT_SPACE_ID) return;
+          if (!availability.available) {
+            setStatus({ tone: 'error', text: availability.reason });
+            return;
+          }
+          const ok = typeof window !== 'undefined' && typeof window.confirm === 'function'
+            ? window.confirm(`删除空间「${spaceLabel(target)}（${target}）」？该空间内的全部记忆会被永久删除，不可恢复。`)
+            : true;
+          if (!ok) return;
+          setBusy(true);
+          try {
+            const { status: httpStatus, body } = await getJson(API.spaces, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ action: 'delete', space_id: target, confirm: true }),
+            });
+            if (body && body.ok === true) {
+              setStatus({ tone: 'ok', text: `已删除空间 ${target}` });
+              if (typeof props.onCreate === 'function') props.onCreate(body.spaces || []);
+              setActiveSpace(DEFAULT_SPACE_ID);
+            } else {
+              setStatus({ tone: 'error', text: describeSpaceError(body && body.error, httpStatus, 'delete') });
+            }
+          } catch (error) {
+            setStatus({ tone: 'error', text: describeSpaceError({ code: 'MEM_E_NETWORK', message: String((error && error.message) || error) }, 0, 'delete') });
+          } finally {
+            setBusy(false);
+          }
+        };
+
         return h(
           'div',
           { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
@@ -1582,6 +1798,19 @@
             },
             entries.map((id) => h('option', { key: id, value: id }, `${spaceLabel(id)}（${id}）`)),
           ),
+          availability.available && deleteAvailable && props.value !== DEFAULT_SPACE_ID
+            ? h(
+                'button',
+                {
+                  type: 'button',
+                  style: { ...smallButtonStyle, color: palette.danger },
+                  onClick: remove,
+                  disabled: busy,
+                  title: '删除当前空间（永久删除该空间内的记忆，需二次确认；默认空间不可删除）',
+                },
+                '🗑 删除空间',
+              )
+            : null,
           availability.available
             ? creating
               ? h(
@@ -1892,21 +2121,25 @@
               },
               statusBarText(session),
             ),
-            h(
-              'span',
-              {
-                style: {
-                  fontSize: 11,
-                  color: palette.muted,
-                  border: `1px dashed ${palette.border}`,
-                  borderRadius: 999,
-                  padding: '2px 9px',
-                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-                },
-                title: '当前空间（spaces.current）',
-              },
-              `${spaceLabel(currentSpace)} · ${currentSpace}`,
-            ),
+            // v1.5.6: when multi-space is not a live capability the whole space UI
+            // silently disappears — the chip would still imply a selector exists.
+            payload?.capabilities?.spaces === true
+              ? h(
+                  'span',
+                  {
+                    style: {
+                      fontSize: 11,
+                      color: palette.muted,
+                      border: `1px dashed ${palette.border}`,
+                      borderRadius: 999,
+                      padding: '2px 9px',
+                      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+                    },
+                    title: '当前空间（spaces.current）',
+                  },
+                  `${spaceLabel(currentSpace)} · ${currentSpace}`,
+                )
+              : null,
             // v1.5.4: a degraded handoff is surfaced, never a silent lock.
             session && session.handoffDegraded
               ? h(
@@ -2223,6 +2456,40 @@
           tools: {
             disabled: Array.isArray(config.tools && config.tools.disabled) ? [...config.tools.disabled] : [],
           },
+          // Pre-ingest tagging (v1.5.6): model tags win; this only fills in anchors
+          // for untagged writes.
+          tagging: {
+            autoTag: (config.tagging && config.tagging.autoTag) !== false,
+            maxTags: Number((config.tagging && config.tagging.maxTags) ?? 2),
+          },
+          // v1.5.6 capability flags: off => space tools/routes disappear.
+          features: {
+            multiSpace: (config.features && config.features.multiSpace) !== false,
+            crossSpaceTransfer: (config.features && config.features.crossSpaceTransfer) !== false,
+            crossSpaceRecall: (config.features && config.features.crossSpaceRecall) === true,
+          },
+          // v1.5.6 offline Dream tunables (safe subset; llm credentials are never
+          // sent to the browser).
+          dream: {
+            useLlm: (config.dream && config.dream.useLlm) !== false,
+            minGroupSize: Number((config.dream && config.dream.minGroupSize) ?? 3),
+            maxGroupsPerRun: Number((config.dream && config.dream.maxGroupsPerRun) ?? 5),
+            maxSummaryChars: Number((config.dream && config.dream.maxSummaryChars) ?? 200),
+            maxSourceChars: Number((config.dream && config.dream.maxSourceChars) ?? 400),
+            maxEventsPerGroup: Number((config.dream && config.dream.maxEventsPerGroup) ?? 8),
+            llmTimeoutMs: Number((config.dream && config.dream.llmTimeoutMs) ?? 15000),
+            failureThreshold: Number((config.dream && config.dream.failureThreshold) ?? 3),
+            cooldownMinutes: Number((config.dream && config.dream.cooldownMinutes) ?? 60),
+            compensateAfterHours: Number((config.dream && config.dream.compensateAfterHours) ?? 24),
+            onlyLowValley: (config.dream && config.dream.onlyLowValley) !== false,
+          },
+          // v1.5.6 L2 multi-merge tunables (offline maintain phase).
+          l2Merge: {
+            enabled: (config.l2Merge && config.l2Merge.enabled) !== false,
+            minGroupSize: Number((config.l2Merge && config.l2Merge.minGroupSize) ?? 2),
+            maxGroupsPerRun: Number((config.l2Merge && config.l2Merge.maxGroupsPerRun) ?? 5),
+            maxSummaryChars: Number((config.l2Merge && config.l2Merge.maxSummaryChars) ?? 400),
+          },
           decayHalfLifeDays: Number((config.decay && config.decay.halfLifeDays) ?? 30),
           activeSetCap: Number((config.activeSet && config.activeSet.cap) ?? 200),
           maxRecallTopK: Number(config.maxRecallTopK),
@@ -2236,6 +2503,8 @@
           reviewEnabled: (config.review && config.review.enabled) !== false,
           context: {
             maxTokens: Number(config.context.maxTokens),
+            // v1.5.6: the per-recall response ceiling (older hosts omit it).
+            maxInjectTokens: Number((config.context && config.context.maxInjectTokens) ?? 4000),
             threshold: Number(config.context.threshold),
             target: Number(config.context.target),
             injectPrompt: Boolean(config.context.injectPrompt),
@@ -2271,6 +2540,7 @@
         { key: 'maxRecallTopK', label: '检索上限', min: 1, max: 1000 },
         { key: 'retrievalTopK', label: '默认 topK', min: 1, max: 1000 },
         { key: 'context.maxTokens', label: '上下文预算', min: 256, max: 1000000 },
+        { key: 'context.maxInjectTokens', label: '单次召回注入上限', min: 256, max: 100000 },
         { key: 'context.threshold', label: '淘汰阈值', min: 0.01, max: 0.99 },
         { key: 'context.target', label: '收敛目标', min: 0, max: 0.98 },
         { key: 'temp.ttlDays', label: 'L2.5 隔离期', min: 1, max: 3650 },
@@ -2287,6 +2557,19 @@
         { key: 'context.nativeTokenLimit', label: '原生窗口', min: 512, max: 1000000 },
         { key: 'context.autoRolloverThreshold', label: '交接触发比例', min: 0.5, max: 0.99 },
         { key: 'index.maxPostingsPerTag', label: '单标签索引上限', min: 1, max: 100000 },
+        { key: 'tagging.maxTags', label: '自动打标数量', min: 1, max: 5 },
+        { key: 'dream.minGroupSize', label: 'Dream 成组最少条数', min: 2, max: 50 },
+        { key: 'dream.maxGroupsPerRun', label: 'Dream 单次组数', min: 1, max: 50 },
+        { key: 'dream.maxSummaryChars', label: 'Dream 摘要字数', min: 40, max: 2000 },
+        { key: 'dream.maxSourceChars', label: 'Dream 来源字数', min: 80, max: 4000 },
+        { key: 'dream.maxEventsPerGroup', label: 'Dream 每组条数', min: 2, max: 50 },
+        { key: 'dream.llmTimeoutMs', label: 'Dream LLM 超时', min: 500, max: 120000 },
+        { key: 'dream.failureThreshold', label: 'Dream 熔断阈值', min: 1, max: 20 },
+        { key: 'dream.cooldownMinutes', label: 'Dream 冷却分钟', min: 1, max: 1440 },
+        { key: 'dream.compensateAfterHours', label: 'Dream 补偿阈值', min: 1, max: 720 },
+        { key: 'l2Merge.minGroupSize', label: 'L2 合并成组条数', min: 2, max: 20 },
+        { key: 'l2Merge.maxGroupsPerRun', label: 'L2 合并单次组数', min: 1, max: 50 },
+        { key: 'l2Merge.maxSummaryChars', label: 'L2 合并字数上限', min: 100, max: 2000 },
       ];
 
       /**
@@ -2452,6 +2735,10 @@
                 ...(prev.tools || {}),
                 disabled: Array.isArray(prev.tools && prev.tools.disabled) ? [...prev.tools.disabled] : [],
               },
+              tagging: { ...(prev.tagging || {}) },
+              features: { ...(prev.features || {}) },
+              dream: { ...(prev.dream || {}) },
+              l2Merge: { ...(prev.l2Merge || {}) },
             };
             if (path.indexOf('.') >= 0) {
               const [group, leaf] = path.split('.');
@@ -2501,6 +2788,7 @@
             maxRecallTopK: Number(draft.maxRecallTopK),
             'retrieval.topK': Number(draft.retrievalTopK),
             'context.maxTokens': Number(draft.context.maxTokens),
+            'context.maxInjectTokens': Number(draft.context.maxInjectTokens),
             'context.threshold': Number(draft.context.threshold),
             'context.target': Number(draft.context.target),
             'context.injectPrompt': Boolean(draft.context.injectPrompt),
@@ -2511,6 +2799,26 @@
             'context.requireExplicitConsentForTransfer': Boolean(draft.context.requireExplicitConsentForTransfer),
             'index.maxPostingsPerTag': Number(draft.index.maxPostingsPerTag),
             'tools.disabled': Array.isArray(draft.tools.disabled) ? [...draft.tools.disabled] : [],
+            'tagging.autoTag': Boolean(draft.tagging.autoTag),
+            'tagging.maxTags': Number(draft.tagging.maxTags),
+            'features.multiSpace': Boolean(draft.features.multiSpace),
+            'features.crossSpaceTransfer': Boolean(draft.features.crossSpaceTransfer),
+            'features.crossSpaceRecall': Boolean(draft.features.crossSpaceRecall),
+            'dream.useLlm': Boolean(draft.dream.useLlm),
+            'dream.minGroupSize': Number(draft.dream.minGroupSize),
+            'dream.maxGroupsPerRun': Number(draft.dream.maxGroupsPerRun),
+            'dream.maxSummaryChars': Number(draft.dream.maxSummaryChars),
+            'dream.maxSourceChars': Number(draft.dream.maxSourceChars),
+            'dream.maxEventsPerGroup': Number(draft.dream.maxEventsPerGroup),
+            'dream.llmTimeoutMs': Number(draft.dream.llmTimeoutMs),
+            'dream.failureThreshold': Number(draft.dream.failureThreshold),
+            'dream.cooldownMinutes': Number(draft.dream.cooldownMinutes),
+            'dream.compensateAfterHours': Number(draft.dream.compensateAfterHours),
+            'dream.onlyLowValley': Boolean(draft.dream.onlyLowValley),
+            'l2Merge.enabled': Boolean(draft.l2Merge.enabled),
+            'l2Merge.minGroupSize': Number(draft.l2Merge.minGroupSize),
+            'l2Merge.maxGroupsPerRun': Number(draft.l2Merge.maxGroupsPerRun),
+            'l2Merge.maxSummaryChars': Number(draft.l2Merge.maxSummaryChars),
             'temp.ttlDays': Number(draft.temp.ttlDays),
             'temp.promotionWindowDays': Number(draft.temp.promotionWindowDays),
             'raw.mode': String(draft.rawMode),
@@ -2684,6 +2992,200 @@
           ),
           h(
             Section,
+            {
+              title: '入库自动打标（Pre-Ingest Tagging）',
+              hint: '模型手传 tags 优先；未传 tags 时由引擎从内容形态提取 1–2 个锚点（错误类型 / errno / 代码块语言 / HTTP 状态 / 文件路径 / 任务语句）。raw 保持纯净，锚点直接进 L1.5 索引；提取不到只记 MEM_E_AUTO_TAG_MISS 警告，不阻断写入。',
+            },
+            h(Toggle, {
+              label: '启用引擎侧自动打标（tagging.autoTag）',
+              checked: draft.tagging.autoTag,
+              onChange: (value) => edit('tagging.autoTag', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '最多自动标签数（tagging.maxTags）',
+              hint: '1 – 5，默认 2。只影响未手传 tags 的写入。',
+              value: draft.tagging.maxTags,
+              min: 1,
+              max: 5,
+              step: 1,
+              onChange: (value) => edit('tagging.maxTags', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            {
+              title: '可选能力（微内核边界）',
+              hint: '关闭多空间后，本体退化为严格单空间核心：targetSpaceId 只能是 default，空间工具与 /spaces、/transfer 路由返回 MEM_E_FEATURE_DISABLED。跨空间迁移必须同时启用多空间。保存后立即生效；工具注册在下次宿主启动/重载时真正移除。',
+            },
+            h(Toggle, {
+              label: '启用多空间路由（features.multiSpace）',
+              checked: draft.features.multiSpace,
+              onChange: (value) => edit('features.multiSpace', value),
+              disabled,
+            }),
+            h(Toggle, {
+              label: '允许跨空间迁移（features.crossSpaceTransfer）',
+              hint: '关闭后 space_transfer / transfer_to_global 工具不再注册，迁移路由直接拒绝。',
+              checked: draft.features.crossSpaceTransfer,
+              onChange: (value) => edit('features.crossSpaceTransfer', value),
+              disabled: disabled || !draft.features.multiSpace,
+            }),
+            h(Toggle, {
+              label: '跨空间召回聚合（features.crossSpaceRecall，默认关）',
+              hint: '开启后每次 recall 会查询所有已打开空间并合并命中（月记可遮住它拥有的其他空间事件）；代价是每次召回多查 N 个空间。',
+              checked: draft.features.crossSpaceRecall,
+              onChange: (value) => edit('features.crossSpaceRecall', value),
+              disabled: disabled || !draft.features.multiSpace,
+            }),
+          ),
+          h(
+            Section,
+            {
+              title: '离线 Dream（LLM 蒸馏）',
+              hint: 'Dream 在空闲/补偿时蒸馏同标签经验；失败会本地降级并记 MEM_E_DREAM_LLM_FALLBACK。Endpoint / Model / API Key 只从 profile 配置或 DSH_DREAM_LLM_* 环境变量注入，绝不会下发到浏览器，也不能在此页填写。',
+            },
+            h(Toggle, {
+              label: '启用 LLM 提炼（dream.useLlm）',
+              hint: '关闭后只用本地启发式合并（时间范围 + 去重文本），不发任何网络请求。',
+              checked: draft.dream.useLlm,
+              onChange: (value) => edit('dream.useLlm', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '成组最少条数（dream.minGroupSize）',
+              value: draft.dream.minGroupSize,
+              min: 2,
+              max: 50,
+              step: 1,
+              onChange: (value) => edit('dream.minGroupSize', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '单次最多蒸馏组数（dream.maxGroupsPerRun）',
+              value: draft.dream.maxGroupsPerRun,
+              min: 1,
+              max: 50,
+              step: 1,
+              onChange: (value) => edit('dream.maxGroupsPerRun', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '摘要字数上限（dream.maxSummaryChars）',
+              value: draft.dream.maxSummaryChars,
+              min: 40,
+              max: 2000,
+              step: 20,
+              onChange: (value) => edit('dream.maxSummaryChars', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '单条来源字数上限（dream.maxSourceChars）',
+              value: draft.dream.maxSourceChars,
+              min: 80,
+              max: 4000,
+              step: 40,
+              onChange: (value) => edit('dream.maxSourceChars', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '每组最多来源条数（dream.maxEventsPerGroup）',
+              value: draft.dream.maxEventsPerGroup,
+              min: 2,
+              max: 50,
+              step: 1,
+              onChange: (value) => edit('dream.maxEventsPerGroup', value),
+              disabled,
+            }),
+            h(Field, {
+              label: 'LLM 超时（毫秒，dream.llmTimeoutMs）',
+              value: draft.dream.llmTimeoutMs,
+              min: 500,
+              max: 120000,
+              step: 500,
+              onChange: (value) => edit('dream.llmTimeoutMs', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '熔断阈值（dream.failureThreshold）',
+              hint: '连续失败达到该次数即熔断 LLM，冷却期内只本地降级。',
+              value: draft.dream.failureThreshold,
+              min: 1,
+              max: 20,
+              step: 1,
+              onChange: (value) => edit('dream.failureThreshold', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '熔断冷却（分钟，dream.cooldownMinutes）',
+              value: draft.dream.cooldownMinutes,
+              min: 1,
+              max: 1440,
+              step: 1,
+              onChange: (value) => edit('dream.cooldownMinutes', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '会话开始时补偿阈值（小时，dream.compensateAfterHours）',
+              hint: '超过该时长没有 Dream 且价格窗口允许时，会话开始会补跑一次。',
+              value: draft.dream.compensateAfterHours,
+              min: 1,
+              max: 720,
+              step: 1,
+              onChange: (value) => edit('dream.compensateAfterHours', value),
+              disabled,
+            }),
+            h(Toggle, {
+              label: '只在低谷窗口跑 LLM Dream（dream.onlyLowValley）',
+              hint: '北京时间工作日 09–12、14–18 为高峰；其余时段与周末才发起 LLM 调用。关闭后任何时段都可能调用。',
+              checked: draft.dream.onlyLowValley,
+              onChange: (value) => edit('dream.onlyLowValley', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            {
+              title: 'L2 多合一蒸馏',
+              hint: '维护时把同一标签下的重复经验合并成一条：pinned 只与 pinned 合并、普通只与普通合并，永不混组；全局大标签只保留为 meta.global_tags，不写入倒排索引。原始记录标记为已合并（state/l2-merge.json），仍可追溯。',
+            },
+            h(Toggle, {
+              label: '启用 L2 合并（l2Merge.enabled）',
+              checked: draft.l2Merge.enabled,
+              onChange: (value) => edit('l2Merge.enabled', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '成组最少条数（l2Merge.minGroupSize）',
+              value: draft.l2Merge.minGroupSize,
+              min: 2,
+              max: 20,
+              step: 1,
+              onChange: (value) => edit('l2Merge.minGroupSize', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '单次最多合并组数（l2Merge.maxGroupsPerRun）',
+              value: draft.l2Merge.maxGroupsPerRun,
+              min: 1,
+              max: 50,
+              step: 1,
+              onChange: (value) => edit('l2Merge.maxGroupsPerRun', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '合并文本字数上限（l2Merge.maxSummaryChars）',
+              value: draft.l2Merge.maxSummaryChars,
+              min: 100,
+              max: 2000,
+              step: 20,
+              onChange: (value) => edit('l2Merge.maxSummaryChars', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
             { title: '调度' },
             h(TextInput, {
               label: '维护 Cron（5 段）',
@@ -2735,6 +3237,16 @@
               max: 1000000,
               step: 256,
               onChange: (value) => edit('context.maxTokens', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '单次召回注入上限（token）',
+              hint: '一次 recall 返回 JSON 的硬上限（默认 4000，256 – 100000）。超限会截断并带 truncated:true，绝不静默超发。',
+              value: draft.context.maxInjectTokens,
+              min: 256,
+              max: 100000,
+              step: 256,
+              onChange: (value) => edit('context.maxInjectTokens', value),
               disabled,
             }),
             h(Field, {

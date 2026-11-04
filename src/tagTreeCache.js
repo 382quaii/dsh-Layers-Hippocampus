@@ -33,6 +33,7 @@ import {
   queueDeadLeaves,
   rebuildTree,
 } from './tagTreeRebuild.js';
+import { isSystemReservedTag } from './utils/reservedTags.js';
 
 /** Bump when the persisted shape changes; older files are ignored, not migrated. */
 export const TAG_TREE_SCHEMA = 1;
@@ -228,9 +229,13 @@ export class TagTreeCache {
       leafDecayFloor: config.leafDecayFloor,
     });
 
-    const nodes = pruned.tree.nodes;
+    const rawNodes = pruned.tree.nodes;
+    // v1.5.6: a previous persisted tree (or an old index) may still carry reserved
+    // nodes; drop them before they can be counted or shipped.
+    const nodes = new Map([...rawNodes].filter(([, node]) => !isSystemReservedTag(node.name)));
     const remainingQueue = queue.slice(pruned.consumed).filter((entry) => nodes.has(entry.id));
     const ghosts = ghostMids(pruned.tree, now)
+      .filter((ghost) => !isSystemReservedTag(ghost.name))
       .map((ghost) => ({ ...ghost, parentId: nodes.get(ghost.id)?.parentId ?? null }))
       .sort((a, b) => a.id.localeCompare(b.id));
 
@@ -276,7 +281,9 @@ export class TagTreeCache {
     if (!tree) {
       return { available: false, generatedAt: null, sourceIndexGeneration: null, stats: null, totalGhosts: 0, truncated: false, ghosts: [] };
     }
-    const ghosts = Array.isArray(tree.ghosts) ? tree.ghosts : [];
+    const ghosts = (Array.isArray(tree.ghosts) ? tree.ghosts : []).filter(
+      (ghost) => !isSystemReservedTag(ghost?.name ?? ghost?.id),
+    );
     const requested = Number(ghostLimit);
     const limit = Number.isFinite(requested) ? Math.max(0, Math.min(Math.trunc(requested), TAG_TREE_GHOST_VIEW_CAP)) : TAG_TREE_GHOST_VIEW_CAP;
     return {

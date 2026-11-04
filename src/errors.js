@@ -83,6 +83,49 @@ export const ErrorCodes = Object.freeze({
    * rejects, never leaves the state machine in-flight, never locks the user out.
    */
   HANDOFF_FAILED: 'MEM_E_HANDOFF_FAILED',
+
+  // ---- v1.5.5 Dream LLM distillation ------------------------------------
+  /**
+   * Dream's LLM call could not produce a usable structured answer: no endpoint /
+   * model configured, network failure, timeout, or a non-JSON reply. NEVER fatal:
+   * the engine records this warning, degrades to the deterministic local merge
+   * (time range + deduplicated core text) and keeps `meta.source_event_ids` on the
+   * result. The Dream run itself always completes.
+   */
+  DREAM_LLM_FALLBACK: 'MEM_E_DREAM_LLM_FALLBACK',
+
+  // ---- v1.5.6 pre-ingest tagging ----------------------------------------
+  /**
+   * The deterministic tagger found no usable anchor for an untagged write. This is
+   * a WARNING, never a failure: the episode is written with `tags: []` exactly as
+   * before, and the miss is counted in `status().panel.autoTag` so an operator can
+   * see how many anchorless episodes exist.
+   */
+  AUTO_TAG_MISS: 'MEM_E_AUTO_TAG_MISS',
+
+  // ---- v1.5.6 pinned memory ---------------------------------------------
+  /**
+   * `pinned: true` requires at least one caller-provided tag. An untriggerable
+   * lesson would be a dead memory: the engine refuses it before writing anything.
+   */
+  PINNED_TAG_REQUIRED: 'MEM_E_PINNED_TAG_REQUIRED',
+
+  // ---- v1.5.6 feature flags / microkernel boundary ----------------------
+  /**
+   * The operation belongs to an optional feature this profile turned off
+   * (`features.multiSpace` / `features.crossSpaceTransfer`). Fail-fast with a
+   * specific code instead of pretending the space does not exist.
+   */
+  FEATURE_DISABLED: 'MEM_E_FEATURE_DISABLED',
+
+  // ---- v1.5.6 L3 semantic invariant --------------------------------------
+  /**
+   * An L3 summary was written without a single usable tag, which would make it
+   * invisible to tag-driven retrieval (dead knowledge). The explicit upsert API
+   * refuses it; the offline paths (delete consolidation / trend promotion) derive a
+   * deterministic fallback tag instead of failing the maintenance pass.
+   */
+  SEMANTIC_TAG_REQUIRED: 'MEM_E_SEMANTIC_TAG_REQUIRED',
 });
 
 export class MemoryError extends Error {

@@ -103,7 +103,9 @@ test('startup: reads during a migration are served from the legacy directory', a
 
 test('dream: an idle window triggers maintenance through the shared gate', async () => {
   const dir = tempDir('dream');
-  const runtime = runtimeFor(dir, { enableDream: true, dreamIdleMinutes: 180 });
+  // This fixture targets the idle GATE, not the wall-clock window: pin the window
+  // open so the 2023-11-15 09:14 Beijing instant cannot turn it into a deferral.
+  const runtime = runtimeFor(dir, { enableDream: true, dreamIdleMinutes: 180, dream: { onlyLowValley: false } });
   const reasons = [];
   try {
     runtime.start();

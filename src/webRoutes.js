@@ -55,6 +55,8 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   'maxRecallTopK',
   'retrieval.topK',
   'context.maxTokens',
+  // v1.5.6: one recall's response cap (JSON payload handed to the caller).
+  'context.maxInjectTokens',
   'context.threshold',
   'context.target',
   'context.injectPrompt',
@@ -73,6 +75,32 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   // Tool schema pruning (v1.5.3): array of suffixes; the engine validates names
   // fail-fast (core tools are rejected), the UI renders a checkbox catalog.
   'tools.disabled',
+  // Pre-ingest tagging (v1.5.6): engine-side anchors for untagged writes.
+  'tagging.autoTag',
+  'tagging.maxTags',
+  // v1.5.6 capability flags: switching these off removes the space tools and makes
+  // the space/transfer routes answer MEM_E_FEATURE_DISABLED.
+  'features.multiSpace',
+  'features.crossSpaceTransfer',
+  'features.crossSpaceRecall',
+  // v1.5.6 L2 multi-merge tunables (offline maintain phase).
+  'l2Merge.enabled',
+  'l2Merge.minGroupSize',
+  'l2Merge.maxGroupsPerRun',
+  'l2Merge.maxSummaryChars',
+  // v1.5.6 offline Dream tunables. CREDENTIALS ARE NOT EDITABLE: `dream.llm.*`
+  // (baseUrl/model/apiKey) stays in the profile / DSH_DREAM_LLM_* env.
+  'dream.useLlm',
+  'dream.minGroupSize',
+  'dream.maxGroupsPerRun',
+  'dream.maxSummaryChars',
+  'dream.maxSourceChars',
+  'dream.maxEventsPerGroup',
+  'dream.llmTimeoutMs',
+  'dream.failureThreshold',
+  'dream.cooldownMinutes',
+  'dream.compensateAfterHours',
+  'dream.onlyLowValley',
   'temp.ttlDays',
   'temp.promotionWindowDays',
   'decay.halfLifeDays',
@@ -424,7 +452,7 @@ export function createMemoryRoutes({ runtime, persist = null, logger = null }) {
         ok: true,
         spaces: runtime.spaceList(),
         defaultSpaceId: 'default',
-        capabilities: runtime.capabilities ?? null,
+        capabilities: runtime.capabilities?.() ?? null,
       });
       return;
     }
@@ -440,6 +468,30 @@ export function createMemoryRoutes({ runtime, persist = null, logger = null }) {
       const body = await readJsonBody(req);
       const raw = body && typeof body === 'object' ? (body.patch ?? body) : {};
       const spaceId = typeof raw.space_id === 'string' ? raw.space_id : typeof raw.spaceId === 'string' ? raw.spaceId : '';
+      // Actions are an explicit enum: an unknown action must NEVER fall through to
+      // CREATE (that is exactly how a delete request on an old host answered
+      // "空间已存在"). Fail fast instead.
+      const action = typeof raw.action === 'string' && raw.action.length > 0 ? raw.action : 'create';
+      if (action !== 'create' && action !== 'delete') {
+        throw new MemoryError(ErrorCodes.INVALID_INPUT, `unknown spaces action: ${action}`, {
+          action,
+          hint: 'use "create" or "delete"',
+        });
+      }
+      // v1.5.6: the same route carries deletion (`action:'delete'`). It is
+      // destructive, so the engine itself refuses without `confirm:true` and the
+      // UI only sends it after the human confirm dialog.
+      if (action === 'delete') {
+        const result = await runtime.deleteSpace(spaceId, { confirm: raw.confirm === true });
+        sendState(res, 200, runtime, {
+          ok: true,
+          spaceId: result.spaceId,
+          deleted: true,
+          spaces: result.spaces.ids,
+          capabilities: runtime.capabilities?.() ?? null,
+        });
+        return;
+      }
       // The strict validator lives in the ENGINE (validateNewSpaceId): malformed /
       // reserved / existing ids throw MEM_E_SPACE_INVALID and land in the catch as
       // a clean 400 — nothing is written, no raw FS error is exposed.
@@ -449,7 +501,7 @@ export function createMemoryRoutes({ runtime, persist = null, logger = null }) {
         spaceId: result.spaceId,
         created: result.created === true,
         spaces: result.spaces.ids,
-        capabilities: runtime.capabilities ?? null,
+        capabilities: runtime.capabilities?.() ?? null,
       });
     } catch (error) {
       log(`spaces failed: ${error?.message ?? error}`);

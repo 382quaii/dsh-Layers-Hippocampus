@@ -9,6 +9,8 @@
  * `rebuildTree` is pure: same events + parents + now -> byte-identical tree, so a
  * restart or a log replay converges instead of drifting.
  */
+import { isSystemReservedTag } from './utils/reservedTags.js';
+
 export const DAY_MS = 86_400_000;
 /** Mid survives while its decay score is above this (wide-grace survival line). */
 export const MID_DECAY_FLOOR = 0.05;
@@ -58,6 +60,8 @@ export function rebuildTree({ events = [], parents = {}, now = 0, config = {} } 
   for (const event of events) {
     const tags = Array.isArray(event.tags) ? event.tags : [];
     for (const tag of tags) {
+      // v1.5.6: reserved bookkeeping tags are not part of the user's tag tree.
+      if (isSystemReservedTag(tag)) continue;
       const path = parseTagPath(tag);
       if (!path) {
         const flat = touch('root', String(tag), null, Infinity);

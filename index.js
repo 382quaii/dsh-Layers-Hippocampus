@@ -28,14 +28,18 @@
  */
 
 import path from 'node:path';
-import { resolveConfig, toMemoryOptions, DEFAULT_CONFIG } from './src/config.js';
+import { resolveConfig, toMemoryOptions, DEFAULT_CONFIG, multiSpaceActive } from './src/config.js';
 import { extractEntities } from './src/utils/RegexExtractor.js';
 import { migrateDataDir } from './src/migration.js';
 import { MigrationRunner } from './src/migrationRunner.js';
 import { CronScheduler } from './src/scheduler.js';
 import { asMemoryError, ErrorCodes, MemoryError } from './src/errors.js';
-import { Memory } from './src/memory.js';
-import { composePrompt, renderMemoryMap } from './src/utils/promptLayout.js';
+import { Memory, turnFromSessionEvent } from './src/memory.js';
+import { composePrompt, renderActiveTask } from './src/utils/promptLayout.js';
+import { renderMemoryHints, selectRelevantTags } from './src/utils/memoryHints.js';
+import { HostBridge } from './src/hostBridge.js';
+import { isLowValley, nextLowValleyStart, windowInfo } from './src/priceWindow.js';
+import { DreamTimer } from './src/dreamTimer.js';
 import { MEMORY_API, registerMemoryRoutes } from './src/webRoutes.js';
 
 export const name = 'memory';
@@ -54,7 +58,7 @@ export { resolveConfig, DEFAULT_CONFIG };
  * of letting a raw 404 reach the user.
  */
 export const CAPABILITIES = Object.freeze({
-  version: '1.5.4',
+  version: '1.5.6',
   spaces: true,
   memories: true,
   transferConsent: true,
@@ -182,9 +186,40 @@ function defineTool(definition) {
  * The startup state machine + the single maintenance gate. Kept in this file
  * because it owns the plugin's lifecycle contracts; the store itself is src/.
  */
-export function createRuntime({ ctx = null, config, options, clock, raw = null }) {
+export function createRuntime({ ctx = null, config, options, clock, raw = null, orchestrator = null, timers = null }) {
+  // v1.5.6 physical split: multi-space lives in dsh-orchestrator. `orchestrator` is a
+  // test/embedding override; the Host supplies the real service through `ctx.get`.
+  const orchestratorService = () => orchestrator ?? ctx?.get?.('orchestrator') ?? null;
+  const multiSpaceExtras = () => {
+    const orchestrator = orchestratorService();
+    if (typeof orchestrator?.createSpaceAdapter !== 'function') return {};
+    return {
+      spacesFactory: (owner) =>
+        orchestrator.createSpaceAdapter({
+          owner,
+          dataDir: owner.dataDir,
+          openChild: async (childDir) =>
+            Memory.open({
+              dataDir: childDir,
+              clock: owner.clock,
+              policy: options.policy,
+              config: owner.config,
+              spaceId: path.basename(childDir),
+              ...multiSpaceExtras(),
+            }),
+        }),
+      transfer: typeof orchestrator.transfer === 'function' ? orchestrator.transfer : null,
+      // v1.5.6: wire the Orchestrator's federation/dedupe services into the engine.
+      federation: orchestrator.federation ?? null,
+      dedupe: orchestrator.dedupe ?? null,
+    };
+  };
   // `let` (not const): a failed bootstrap can be retried by rebuilding the facade.
-  let memory = new Memory({ dataDir: config.dataDir, policy: options.policy, config: options.config, clock });
+  let memory = new Memory({ dataDir: config.dataDir, policy: options.policy, config: options.config, clock, ...multiSpaceExtras() });
+  // v1.5.6: engine warnings (currently MEM_E_AUTO_TAG_MISS) go to the Host log.
+  memory.setWarnHook?.((code, message, details) => {
+    ctx?.logger?.warn?.(`hippocampus: ${code} ${message}`, details);
+  });
 
   const listeners = new Set();
   const runtime = {
@@ -200,6 +235,13 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
     maintenanceInFlight: false,
     maintenanceSource: null,
     lastActiveAt: clock ? clock.now() : Date.now(),
+    /** Last completed Dream (idle or compensating); null until one runs. */
+    lastDreamAt: null,
+    /** v1.5.6: the current Host agent preset ("工作模式"), tracked for handoff. */
+    agentPreset: null,
+    agentPresetSessionId: null,
+    /** Result of the last handoff preset inheritance (observability). */
+    lastPresetInherit: null,
     toolCalls: 0,
     reflectionActive: false,
     started: false,
@@ -207,6 +249,8 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
     retrying: false,
     /** Last UI-triggered migration snapshot (state/migration.json), if any. */
     migration: null,
+    /** Last observed user turn: the relevance input for `[Memory Hints]`. */
+    lastUserText: '',
     /** Set by apply(): persists config patches through configEditor. */
     persist: null,
   };
@@ -274,8 +318,35 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
     runtime.lastActiveAt = runtime.memory.clock.now();
   };
 
+  /**
+   * v1.5.6: learn the live agent's working mode (Host preset) and backfill it into
+   * an active handoff marker. `agents.currentInitiator()` only answers inside an
+   * agent turn, so this runs opportunistically (tool boundary / prompt assembly) and
+   * never throws; the value is what the NEXT conversation will re-apply.
+   */
+  runtime.syncAgentPreset = () => {
+    try {
+      const presets = ctx?.get?.('agentPresets') ?? null;
+      const agent = ctx?.get?.('agents')?.currentInitiator?.() ?? null;
+      if (!presets || !agent) return null;
+      const composed = presets.composedPreset?.(agent.ctx);
+      if (typeof composed !== 'string' || composed.length === 0) return null;
+      runtime.agentPreset = composed;
+      runtime.agentPresetSessionId = agent.id ?? null;
+      try {
+        memory.patchHandoffPreset?.(composed);
+      } catch {
+        /* the marker patch is best-effort */
+      }
+      return composed;
+    } catch {
+      return null;
+    }
+  };
+
   /** Called by every tool: keeps the dream idle clock honest. */
   runtime.recordToolCall = ({ landed = false } = {}) => {
+    runtime.syncAgentPreset();
     runtime.touch();
     runtime.toolCalls += 1;
     if (landed) runtime.toolCalls = 0;
@@ -317,15 +388,66 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
    * longer the prompt body: a changing state line at the head would break the prefix
    * cache on every write.
    */
+  /**
+   * v1.5.6: session-scoped injection dedup. A tag / recall block / active-task
+   * event already injected in THIS session is never injected again on a later turn:
+   * repeating byte-identical content is what inflated the context cache hit rate and
+   * made the model look like it was rereading the same page.
+   */
+  runtime.injection = { sessionId: null, ids: new Set(), tags: new Set(), handoffAt: null };
+  runtime.lastHintTags = [];
+  runtime.resetInjection = (sessionId = runtime.injection.sessionId) => {
+    runtime.injection = { sessionId, ids: new Set(), tags: new Set(), handoffAt: null };
+  };
+
   runtime.promptState = () => {
+    // Opportunistic mode tracking: prompt assembly is inside the agent turn, so the
+    // current preset is readable here even when no change event ever fired.
+    runtime.syncAgentPreset();
     if (runtime.phase === 'ready') {
+      const handoff = memory.handoffState();
+      const usage = memory.sessionUsage();
+      const sessionId = usage?.sessionId ?? 'anonymous';
+      // SessionStart OR rollover resets the dedup pool: the new session may receive
+      // the same handoff summary / tags that the old one already saw.
+      if (runtime.injection.sessionId !== sessionId || (handoff.active && runtime.injection.handoffAt !== handoff.at)) {
+        runtime.resetInjection(sessionId);
+        runtime.injection.handoffAt = handoff.active ? handoff.at : null;
+      }
+
       const view = memory.indexManager.snapshot();
       const entries = view?.activeSet?.entries ?? [];
-      const map = renderMemoryMap(entries.map((entry) => ({ tag: entry.tag, count: entry.eventCount ?? 0 })));
-      const blocks = memory.context.render();
+      const activeTags = entries.map((entry) => ({ tag: entry.tag, count: entry.eventCount ?? 0 }));
+      // v1.5.6: relevance-first hints; short inputs ("继续"/"在吗") fall back to the
+      // previous turn's matched tags so the model still gets a thread to pull.
+      const selected = selectRelevantTags({
+        text: runtime.lastUserText,
+        activeTags,
+        fallbackTags: runtime.lastHintTags,
+      });
+      const freshTags = selected.filter((tag) => !runtime.injection.tags.has(tag));
+      for (const tag of freshTags) runtime.injection.tags.add(tag);
+      if (selected.length > 0) runtime.lastHintTags = selected;
+      const hints = renderMemoryHints(freshTags, { toolName: `${config.toolPrefix}_recall` });
+
+      // v1.5.6: [Active Task] is unconditional when a handoff summary or a `task:`
+      // event exists — injected once per session.
+      const activeTask = memory.promptActiveTask();
+      let activeTaskBlock = '';
+      if (activeTask?.text && !runtime.injection.ids.has(`active:${activeTask.eventId}`)) {
+        runtime.injection.ids.add(`active:${activeTask.eventId}`);
+        activeTaskBlock = renderActiveTask(activeTask);
+      }
+
+      // Recall blocks: the block id IS the event id. Render only blocks that this
+      // session has not injected yet, then remember every non-briefing block id.
+      const blocks = memory.context.render({ excludeIds: runtime.injection.ids });
+      for (const block of memory.context.blocks ?? []) {
+        if (block.kind !== 'briefing') runtime.injection.ids.add(block.id);
+      }
+
       // v1.5.0 handoff marker: appended to the volatile tail on purpose — the
       // stable prefix above must stay byte-identical for the prompt cache.
-      const handoff = memory.handoffState();
       const marker = handoff.active
         ? [
             '',
@@ -336,7 +458,7 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
             .filter(Boolean)
             .join('\n')
         : '';
-      return composePrompt({ rules: PROMPT_STATE_RULES, map, blocks }) + marker;
+      return composePrompt({ rules: PROMPT_STATE_RULES, activeTask: activeTaskBlock, blocks, hints }) + marker;
     }
     const error = runtime.phaseError ? ` — ${asMemoryError(runtime.phaseError).code}` : '';
     return `Memory state: ${runtime.phase}${error} (not ready: memory tools answer MEM_E_NOT_READY).`;
@@ -358,6 +480,18 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
     runtime.touch();
     try {
       const report = await memory.maintain({ reason: source });
+      // v1.5.5: the offline Dream leg runs AFTER the read model has converged and
+      // NEVER on the online path. It can never fail the maintenance pass: any LLM
+      // failure already degraded to the local merge inside executeDream().
+      if (source === 'dream' || source === 'compensate') {
+        try {
+          report.dream = await memory.executeDream({ now: memory.clock.now(), logger: runtime.logger });
+        } catch (error) {
+          report.dreamError = asMemoryError(error).toJSON();
+          runtime.logger?.warn?.(`hippocampus: dream distillation failed: ${asMemoryError(error).code}`);
+        }
+        runtime.lastDreamAt = memory.clock.now();
+      }
       emit({ type: 'maintenance', source, report });
       return { ran: true, source, report };
     } finally {
@@ -375,12 +509,32 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
     if (runtime.scheduler) {
       results.push(await runtime.scheduler.tick({ now }));
     }
-    if (config.enableDream && runtime.phase === 'ready' && !runtime.maintenanceInFlight) {
-      const idleMs = runtime.lastActiveAt === null ? Infinity : now - runtime.lastActiveAt;
-      if (idleMs >= config.dreamIdleMinutes * 60_000) {
-        results.push(await runtime.runMaintenance('dream'));
-      }
+    if (!config.enableDream || runtime.phase !== 'ready' || runtime.maintenanceInFlight) return results;
+
+    // v1.5.6 local scheduler: a queued (peak-deferred) Dream runs as soon as the
+    // valley opens, even if the idle threshold was only just crossed.
+    const queue = memory.dreamQueue();
+    if (queue.pending && now >= (queue.dueAt ?? 0) && isLowValley(now)) {
+      const result = await runtime.runMaintenance('dream');
+      memory.clearDreamQueue(result.ran ? 'completed' : 'retry-later');
+      runtime.dreamTimer?.cancel();
+      results.push({ ...result, fromQueue: true });
+      return results;
     }
+
+    const idleMs = runtime.lastActiveAt === null ? Infinity : now - runtime.lastActiveAt;
+    if (idleMs < config.dreamIdleMinutes * 60_000) return results;
+
+    const llmDream = config.dream?.useLlm !== false;
+    if (config.dream?.onlyLowValley !== false && llmDream && !isLowValley(now)) {
+      const dueAt = nextLowValleyStart(now);
+      memory.setDreamQueue({ pending: true, dueAt, reason: 'peak-hour', deferredAt: now });
+      runtime.dreamTimer?.schedule(now);
+      results.push({ ran: false, skipped: true, reason: 'peak-hour', dueAt, source: 'dream' });
+      emit({ type: 'dream-deferred', dueAt, window: windowInfo(now) });
+      return results;
+    }
+    results.push(await runtime.runMaintenance('dream'));
     return results;
   };
 
@@ -391,6 +545,19 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
   runtime.recall = async (query) => {
     if (runtime.phase === 'ready') {
       runtime.recordToolCall();
+      // v1.5.6: with the Orchestrator dedupe service installed, a recall spans every
+      // open space (monthly memos and the events they own may live in different
+      // spaces). A caller that explicitly targets one space stays single-space.
+      const wantsSingle = query && typeof query === 'object' && typeof query.targetSpaceId === 'string';
+      if (
+        !wantsSingle &&
+        memory.dedupe &&
+        runtime.config.features.crossSpaceRecall === true &&
+        runtime.multiSpaceAvailable?.() &&
+        memory.spaces.status().ids.length > 1
+      ) {
+        return memory.recallAcrossSpaces(query ?? {});
+      }
       return memory.recall(query);
     }
     if (runtime.legacy) {
@@ -457,6 +624,8 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
       memory.attachScheduler(runtime.scheduler);
       emit({ type: 'ready', at: runtime.readyAt });
       resolveReady(runtime);
+      // Phase 2 self-heal: a queue persisted by a previous run may be due now.
+      runtime.dreamTimer?.schedule();
       return runtime;
     } catch (error) {
       runtime.phase = 'failed';
@@ -499,6 +668,7 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
 
   runtime.stop = () => {
     runtime.stopped = true;
+    runtime.dreamTimer?.cancel();
     try {
       memory.close();
     } catch {
@@ -538,7 +708,7 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
       // though the store is offline for writes.
       // capabilities are advertised even before READY: the client must be able to
       // tell "old host" from "temporarily booting" without probing missing routes.
-      return { ok: false, ...view, capabilities: CAPABILITIES, migration: runtime.migrationStatus() };
+      return { ok: false, ...view, capabilities: runtime.capabilities(), host: runtime.hostStatus?.() ?? null, migration: runtime.migrationStatus() };
     }
     try {
       const spaceIds = memory.spaces.status().ids;
@@ -547,13 +717,21 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
         ok: true,
         ...view,
         spaceId: status.panel.spaces.current,
-        capabilities: CAPABILITIES,
+        // v1.5.6: the working mode in force, plus the last handoff inheritance result.
+        agentPreset: runtime.agentPreset,
+        presetInherit: runtime.lastPresetInherit,
+        capabilities: runtime.capabilities(),
+        host: runtime.hostStatus?.() ?? null,
+        // v1.5.6 local low-valley scheduler observability.
+        dreamWindow: runtime.dreamWindow?.() ?? null,
+        dreamQueue: memory.dreamQueue(),
+        dreamTimer: runtime.dreamTimer?.status() ?? null,
         panel: { ...status.panel, migration: runtime.migrationStatus() },
         briefing: memory.briefing(),
         config: uiConfig(runtime.config),
       };
     } catch (error) {
-      return { ok: false, ...view, spaceId, capabilities: CAPABILITIES, error: asMemoryError(error).toJSON(), migration: runtime.migrationStatus() };
+      return { ok: false, ...view, spaceId, agentPreset: runtime.agentPreset, capabilities: runtime.capabilities(), host: runtime.hostStatus?.() ?? null, error: asMemoryError(error).toJSON(), migration: runtime.migrationStatus() };
     }
   };
 
@@ -592,10 +770,39 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
   };
 
   /** Global SpaceSelector data source (root router: every physical space). */
-  runtime.spaceList = () => (runtime.phase === 'ready' ? memory.spaces.status().ids : []);
+  runtime.spaceList = () =>
+    runtime.phase === 'ready'
+      ? runtime.multiSpaceAvailable()
+        ? memory.spaces.status().ids
+        : ['default']
+      : [];
 
-  /** Capability handshake read by the client bundle (old host → new UI safety). */
-  runtime.capabilities = CAPABILITIES;
+  /**
+   * True only when a multi-space adapter (dsh-orchestrator) is present AND the
+   * profile has not turned the capability off. The core alone is single-space.
+   */
+  runtime.multiSpaceAvailable = () => {
+    const orchestrator = orchestratorService();
+    return multiSpaceActive(runtime.config, typeof orchestrator?.createSpaceAdapter === 'function');
+  };
+
+  /**
+   * Capability handshake read by the client bundle (old host → new UI safety).
+   * v1.5.6: function, not a constant — the feature flags can change live and the
+   * client must see `spaces:false` / `multiSpace:false` instead of a dead route.
+   */
+  runtime.capabilities = () => ({
+    ...CAPABILITIES,
+    spaces: runtime.multiSpaceAvailable(),
+    multiSpace: runtime.multiSpaceAvailable(),
+    crossSpaceTransfer: runtime.multiSpaceAvailable() && runtime.config.features.crossSpaceTransfer !== false,
+    // v1.5.6: opt-in cross-space recall aggregation (default false).
+    crossSpaceRecall: runtime.multiSpaceAvailable() && runtime.config.features.crossSpaceRecall === true,
+    // v1.5.6: a versioned sub-capability. An OLD host (pre-delete) reports spaces:true
+    // but no spacesDelete, so the client hides the delete button instead of sending an
+    // action the old server would misread as CREATE ("空间已存在").
+    spacesDelete: runtime.multiSpaceAvailable() && typeof memory.spaces?.deleteSpace === 'function',
+  });
 
   /** "＋ 新建空间": creates the child store lazily, then returns the updated list. */
   runtime.ensureSpace = async (spaceId) => {
@@ -613,6 +820,17 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
   runtime.createSpace = async (spaceId) => {
     if (runtime.phase !== 'ready') throw runtime.notReady('spaces');
     const result = await memory.createSpace(spaceId);
+    emit({ type: 'spaces', spaces: result.spaces });
+    return result;
+  };
+
+  /**
+   * v1.5.6: "🗑 删除空间". Destructive, so `confirm:true` is mandatory and the
+   * default space is always refused. Emits the updated list for the client.
+   */
+  runtime.deleteSpace = async (spaceId, { confirm = false } = {}) => {
+    if (runtime.phase !== 'ready') throw runtime.notReady('spaces');
+    const result = await memory.deleteSpace(spaceId, { confirm });
     emit({ type: 'spaces', spaces: result.spaces });
     return result;
   };
@@ -742,7 +960,7 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
     } catch {
       /* the old store is read-mostly */
     }
-    memory = new Memory({ dataDir: next.dataDir, policy: nextOptions.policy, config: nextOptions.config, clock });
+    memory = new Memory({ dataDir: next.dataDir, policy: nextOptions.policy, config: nextOptions.config, clock, ...multiSpaceExtras() });
     runtime.memory = memory;
     runtime.config = next;
     runtime.rawConfig = merged;
@@ -811,8 +1029,9 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
     } catch {
       /* a half-open store must not block the rebuild */
     }
-    memory = new Memory({ dataDir: config.dataDir, policy: options.policy, config: options.config, clock });
+    memory = new Memory({ dataDir: config.dataDir, policy: options.policy, config: options.config, clock, ...multiSpaceExtras() });
     runtime.memory = memory;
+    memory.setHandoffPresetProvider?.(() => runtime.agentPreset);
     emit({ type: 'retry', phase: runtime.phase });
     queueMicrotask(() => {
       runtime.bootstrap()
@@ -825,6 +1044,110 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null }
     });
     return { ok: true, phase: runtime.phase, retrying: true };
   };
+
+  /**
+   * v1.5.6: carry the working mode across a handoff. `agent/created` is SERIAL, so
+   * this hook can `agentPresets.select()` before the new session's first turn. It
+   * only fires for a brand-new conversation (`source === 'startup'`), only when the
+   * pending marker belongs to a DIFFERENT session, and it never throws (a failed
+   * inheritance must not fail agent creation).
+   */
+  runtime.inheritHandoffPreset = async ({ agent, source } = {}) => {
+    if (!agent || source !== 'startup') return { inherited: false, reason: 'not-a-new-conversation' };
+    const marker = memory.handoffState();
+    if (!marker?.active) return { inherited: false, reason: 'no-handoff' };
+    if (marker.sessionId && agent.id === marker.sessionId) return { inherited: false, reason: 'same-session' };
+    const preset = typeof marker.agentPreset === 'string' && marker.agentPreset.length > 0 ? marker.agentPreset : null;
+    if (!preset) {
+      runtime.lastPresetInherit = { inherited: false, reason: 'marker-without-preset', at: memory.clock.now() };
+      return runtime.lastPresetInherit;
+    }
+    const presets = ctx?.get?.('agentPresets') ?? null;
+    if (!presets || typeof presets.select !== 'function') {
+      runtime.lastPresetInherit = { inherited: false, reason: 'agentPresets-unavailable', preset };
+      return runtime.lastPresetInherit;
+    }
+    try {
+      const committed = await presets.select(agent, preset);
+      runtime.agentPreset = typeof committed === 'string' ? committed : preset;
+      runtime.agentPresetSessionId = agent.id ?? null;
+      runtime.lastPresetInherit = { inherited: true, preset: runtime.agentPreset, at: memory.clock.now() };
+      ctx?.logger?.info?.(`hippocampus: new conversation restored working mode "${runtime.agentPreset}" from the handoff marker`);
+      return runtime.lastPresetInherit;
+    } catch (error) {
+      runtime.lastPresetInherit = { inherited: false, reason: error?.code ?? 'select-failed', message: error?.message ?? String(error), preset };
+      ctx?.logger?.warn?.(`hippocampus: handoff preset inheritance failed: ${error?.message ?? error}`);
+      return runtime.lastPresetInherit;
+    }
+  };
+
+  /**
+   * Host lifecycle bridge (P1-7): a session start may trigger ONE compensating
+   * Dream, gated by `dream.compensateAfterHours`, the injected price window and the
+   * shared maintenance gate. `ctx.root` is the process-local event bus; the bridge
+   * only needs a plain `{on, off}` seam, so tests inject a MockHostEnvironment.
+   */
+  runtime.hostBridge = new HostBridge({
+    bus: ctx?.root ?? ctx ?? null,
+    clock: () => memory.clock.now(),
+    logger: ctx?.logger ?? null,
+    getConfig: () => runtime.config,
+    getLastDreamAt: () => runtime.lastDreamAt,
+    onDream: () => runtime.runMaintenance('compensate'),
+    onAgentPresetSelected: (sessionId, agentPreset) => {
+      runtime.agentPreset = agentPreset;
+      runtime.agentPresetSessionId = sessionId ?? null;
+    },
+    onAgentCreated: async (payload) => {
+      // Track the mode this session actually runs in (a session may be created with
+      // a preset without emitting a change event).
+      try {
+        const presets = ctx?.get?.('agentPresets');
+        const composed = presets?.composedPreset?.(payload?.agent?.ctx);
+        if (typeof composed === 'string' && composed.length > 0) {
+          runtime.agentPreset = composed;
+          runtime.agentPresetSessionId = payload?.agent?.id ?? null;
+        }
+      } catch {
+        /* preset tracking is best-effort */
+      }
+      await runtime.inheritHandoffPreset(payload);
+    },
+  });
+  runtime.hostBridge.attach();
+  runtime.hostStatus = () => runtime.hostBridge.status();
+  // v1.5.6 local scheduler: the price window is computed from the clock, so a
+  // compensating Dream obeys peak hours without any external price plugin. An
+  // explicit DSH_DREAM_PRICE override wins (hostBridge reads it when no probe).
+  if (!process.env.DSH_DREAM_PRICE) {
+    runtime.hostBridge.setPriceProbe((now) => isLowValley(now ?? memory.clock.now()));
+  }
+  runtime.dreamWindow = () => windowInfo(memory.clock.now());
+  // Phase 2: one injectable wake-up timer, armed from the durable queue. A late
+  // wake re-reads the window; a peak wake re-arms instead of spending.
+  runtime.dreamTimer = new DreamTimer({
+    clock: () => memory.clock.now(),
+    getQueue: () => memory.dreamQueue(),
+    isLow: (now) => isLowValley(now),
+    nextLow: (now) => nextLowValleyStart(now),
+    logger: ctx?.logger ?? null,
+    ...(timers && typeof timers === 'object' ? timers : {}),
+    onDue: async ({ now, lateMs, catchUp }) => {
+      if (runtime.phase !== 'ready' || runtime.maintenanceInFlight) return;
+      const result = await runtime.runMaintenance('dream');
+      memory.clearDreamQueue(result.ran ? 'completed' : 'retry-later');
+      emit({ type: 'dream-wake', now, lateMs, catchUp, ran: result.ran === true });
+    },
+  });
+  // The handoff marker records the mode in force at rollover time.
+  memory.setHandoffPresetProvider?.(() => runtime.agentPreset);
+  // Explicit, loud degradation: a profile that asks for multi-space while the
+  // Orchestrator is not installed runs strict single-space (never silent).
+  if (runtime.config.features.multiSpace !== false && !runtime.multiSpaceAvailable()) {
+    ctx?.logger?.warn?.(
+      'hippocampus: features.multiSpace requested but dsh-orchestrator is not installed; running the strict single-space core (space tools/routes disabled)',
+    );
+  }
 
   return runtime;
 }
@@ -885,6 +1208,28 @@ function uiConfig(config) {
     tagTree: config.tagTree,
     // Tool schema pruning: the settings page renders a checkbox catalog from this.
     tools: config.tools,
+    // Pre-ingest tagging (v1.5.6): toggle + maxTags.
+    tagging: config.tagging,
+    // v1.5.6 capability flags (microkernel boundary).
+    features: config.features,
+    // v1.5.6 L2 multi-merge tunables.
+    l2Merge: config.l2Merge,
+    // v1.5.6: offline Dream tunables — SAFE SUBSET ONLY. `dream.llm` is deliberately
+    // absent: the endpoint/credential live in the profile or DSH_DREAM_LLM_* env and
+    // must never round-trip through the browser.
+    dream: {
+      useLlm: config.dream.useLlm,
+      minGroupSize: config.dream.minGroupSize,
+      maxGroupsPerRun: config.dream.maxGroupsPerRun,
+      maxSummaryChars: config.dream.maxSummaryChars,
+      maxSourceChars: config.dream.maxSourceChars,
+      maxEventsPerGroup: config.dream.maxEventsPerGroup,
+      llmTimeoutMs: config.dream.llmTimeoutMs,
+      failureThreshold: config.dream.failureThreshold,
+      cooldownMinutes: config.dream.cooldownMinutes,
+      compensateAfterHours: config.dream.compensateAfterHours,
+      onlyLowValley: config.dream.onlyLowValley,
+    },
     // Convenience mirrors kept for older clients; the form uses the nested form.
     eventTimePolicy: config.identity.eventTimePolicy,
     retrievalTopK: config.retrieval.topK,
@@ -1003,15 +1348,26 @@ export async function apply(ctx, rawConfig = {}) {
       const prefix = `${config.toolPrefix}_`;
       return definition.name.startsWith(prefix) ? definition.name.slice(prefix.length) : definition.name;
     };
+    // v1.5.6 microkernel boundary: a disabled capability removes its tools from the
+    // registry AND from the prompt section, so the model is never told about a
+    // facility the profile turned off.
+    const featureDisabledSuffix = (suffix) =>
+      (suffix === 'space_transfer' || suffix === 'transfer_to_global') &&
+      !runtime.capabilities().crossSpaceTransfer;
     const register = (definition) => {
-      if (disabledToolSuffixes.has(toolSuffixOf(definition))) {
+      const suffix = toolSuffixOf(definition);
+      if (disabledToolSuffixes.has(suffix)) {
         ctx.logger?.info?.(`hippocampus: tool ${definition.name} skipped by config.tools.disabled`);
+        return;
+      }
+      if (featureDisabledSuffix(suffix)) {
+        ctx.logger?.info?.(`hippocampus: tool ${definition.name} skipped by disabled feature flags`);
         return;
       }
       disposers.push(ctx.tools.register(definition));
     };
     const toolLine = (suffix, text) =>
-      disabledToolSuffixes.has(suffix) ? null : `- ${config.toolPrefix}_${suffix}: ${text}`;
+      disabledToolSuffixes.has(suffix) || featureDisabledSuffix(suffix) ? null : `- ${config.toolPrefix}_${suffix}: ${text}`;
 
     // ---- automatic raw capture: every surface message, verbatim ------------
     // `dsh-session` publishes `session/event` as (session, event). Subscribing at
@@ -1019,6 +1375,15 @@ export async function apply(ctx, rawConfig = {}) {
     // raw store's own gating/budgets still decide what lands on disk.
     const captureListener = (session, event) => {
       if (!runtime.memory || runtime.phase !== 'ready') return;
+      // v1.5.6: remember the latest USER turn as the relevance input for
+      // `[Memory Hints]`. This is the only place the current input is available:
+      // prompt assembly receives no message text.
+      try {
+        const turn = turnFromSessionEvent(event);
+        if (turn && turn.role === 'user' && turn.text && turn.contextOnly !== true) runtime.lastUserText = turn.text;
+      } catch {
+        /* hint relevance must never affect capture */
+      }
       runtime.memory
         .captureSessionEvent(session, event)
         .then((result) => {
@@ -1080,6 +1445,12 @@ export async function apply(ctx, rawConfig = {}) {
           idempotency_key: { type: 'string', description: 'Client idempotency key; a repeat returns the existing event id' },
           dedupe: { type: 'boolean', description: 'Default true. false records a genuine second occurrence' },
           is_transient_trend: { type: 'boolean', description: 'Mark as a trend: isolated in L2.5, never promoted directly' },
+          pinned: {
+            type: 'boolean',
+            description:
+              'Pin a lesson/experience that must never decay and is ranked FIRST when its tag matches (v1.5.6). ' +
+              'Requires at least one explicit tag; a pinned write without tags is refused with MEM_E_PINNED_TAG_REQUIRED.',
+          },
           target_space_id: {
             type: 'string',
             description:
@@ -1526,7 +1897,7 @@ export async function apply(ctx, rawConfig = {}) {
           text: () =>
             [
               `Long-term memory (tool prefix: ${config.toolPrefix}):`,
-              toolLine('remember', 'store a durable fact with tags, salience and (when known) happened_at.'),
+              toolLine('remember', 'store a durable fact with tags, salience and (when known) happened_at. pinned=true (needs tags) never decays and ranks first on its tag.'),
               toolLine(
                 'recall',
                 'search memory before asking the user to repeat themselves; mode="deep_raw" scans the bounded raw-turn shards.',
@@ -1627,6 +1998,12 @@ export async function apply(ctx, rawConfig = {}) {
         }
       }
       runtime.stop();
+      // P1-7: unsubscribe the lifecycle bridge BEFORE the bus goes away.
+      try {
+        runtime.hostBridge?.detach();
+      } catch {
+        /* already detached */
+      }
     };
   });
 }
@@ -1684,6 +2061,7 @@ async function memory_remember(runtime, args, media = {}) {
     idempotencyKey: args.idempotency_key,
     dedupe: args.dedupe,
     isTransientTrend: args.is_transient_trend,
+    pinned: args.pinned === true,
     targetSpaceId: args.target_space_id,
     mediaUrl: media.mediaUrl ?? null,
     mediaType: media.mediaType ?? null,

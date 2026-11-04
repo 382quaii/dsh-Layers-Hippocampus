@@ -22,7 +22,7 @@ import test from 'node:test';
 import { resolveConfig } from '../src/config.js';
 import { Memory } from '../src/memory.js';
 import { EDITABLE_CONFIG_KEYS } from '../src/webRoutes.js';
-import { FakeClock, T0, makeMemory, tempDir } from './helpers.js';
+import { FakeClock, multiSpaceOptions, T0, makeMemory, tempDir } from './helpers.js';
 
 const CLIENT_PATH = new URL('../ui/client.js', import.meta.url);
 
@@ -99,7 +99,7 @@ test('multi-space overhead: bounded lazy boot and linear storage for N=10', { ti
   const rootDir = tempDir('v154-multispace');
   const clock = new FakeClock(T0);
   const policy = { activeSet: { minEvents: 1, minMass: 0.01 } };
-  const root = await Memory.open({ dataDir: rootDir, clock, policy });
+  const root = await Memory.open({ dataDir: rootDir, clock, policy, ...multiSpaceOptions({ config: {} }) });
   try {
     // 1) Create N empty physical spaces and write the same workload to each.
     const createStarted = performance.now();
@@ -144,7 +144,7 @@ test('multi-space overhead: bounded lazy boot and linear storage for N=10', { ti
 
     // 4) The fixed cost must be LAZY: opening the root must NOT open all children.
     const rootOpenStarted = performance.now();
-    const rootAgain = await Memory.open({ dataDir: rootDir, clock, policy });
+    const rootAgain = await Memory.open({ dataDir: rootDir, clock, policy, ...multiSpaceOptions({ config: {} }) });
     const rootOpenMs = performance.now() - rootOpenStarted;
     try {
       assert.deepEqual(rootAgain.spaces.status().open, [], 'root boot must not eagerly open child stores');

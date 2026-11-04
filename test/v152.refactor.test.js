@@ -25,12 +25,12 @@ import { createRuntime } from '../index.js';
 import { resolveConfig, toMemoryOptions } from '../src/config.js';
 import { validateMigrationPaths } from '../src/migrationRunner.js';
 import { MEMORY_API, createMemoryRoutes } from '../src/webRoutes.js';
-import { FakeClock, T0, tempDir } from './helpers.js';
+import { createOrchestratorStub, FakeClock, T0, tempDir } from './helpers.js';
 
 async function withRuntime(body, configOverrides = {}) {
   const dir = tempDir('v152');
   const config = resolveConfig({ dataDir: dir, autoMaintainOnBoot: false, ...configOverrides });
-  const runtime = createRuntime({ config, options: toMemoryOptions(config), clock: new FakeClock(T0) });
+  const runtime = createRuntime({ config, options: toMemoryOptions(config), clock: new FakeClock(T0), orchestrator: createOrchestratorStub() });
   try {
     runtime.start();
     await runtime.ready;
