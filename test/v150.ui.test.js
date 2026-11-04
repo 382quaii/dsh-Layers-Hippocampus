@@ -473,10 +473,10 @@ test('webRoutes: the v1.5.0 config keys are whitelisted and nest under their gro
   assert.throws(() => validatePatch({ 'index.unknown': 1 }), /not editable/);
 });
 
-test('webRoutes: exactly eight exact routes, transfer/memories/spaces/session-reset included', () => {
+test('webRoutes: exactly nine exact routes, transfer/memories/spaces/session-reset/install included', () => {
   const { runtime } = fakeRuntime();
   const routes = createMemoryRoutes({ runtime });
-  assert.equal(routes.length, 8);
+  assert.equal(routes.length, 9);
   assert.deepEqual(routes.map((route) => route.path), [
     MEMORY_API.stats,
     MEMORY_API.config,
@@ -486,8 +486,9 @@ test('webRoutes: exactly eight exact routes, transfer/memories/spaces/session-re
     MEMORY_API.memories,
     MEMORY_API.spaces,
     MEMORY_API.sessionReset,
+    MEMORY_API.orchestratorInstall,
   ]);
-  assert.deepEqual(routes.map((route) => route.kind), ['exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact']);
+  assert.deepEqual(routes.map((route) => route.kind), ['exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact']);
   assert.equal(MEMORY_API.transfer, '/api/hippocampus/transfer');
   assert.equal(MEMORY_API.memories, '/api/hippocampus/memories');
   assert.equal(MEMORY_API.spaces, '/api/hippocampus/spaces');

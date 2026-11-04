@@ -304,8 +304,9 @@ test('registerMemoryRoutes registers the full route table and disposes it, or re
     MEMORY_API.memories,
     MEMORY_API.spaces,
     MEMORY_API.sessionReset,
+    MEMORY_API.orchestratorInstall,
   ]);
-  assert.deepEqual(registered.map((route) => route.kind), ['exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact']);
+  assert.deepEqual(registered.map((route) => route.kind), ['exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact']);
   result.dispose();
   assert.deepEqual(
     disposed.sort(),
@@ -313,6 +314,7 @@ test('registerMemoryRoutes registers the full route table and disposes it, or re
       MEMORY_API.config,
       MEMORY_API.graph,
       MEMORY_API.memories,
+      MEMORY_API.orchestratorInstall,
       MEMORY_API.retry,
       MEMORY_API.sessionReset,
       MEMORY_API.spaces,

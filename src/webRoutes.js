@@ -38,6 +38,8 @@ export const MEMORY_API = Object.freeze({
   spaces: '/api/hippocampus/spaces',
   // Escape hatch (v1.5.4): clear a wedged rollover/handoff state from the UI.
   sessionReset: '/api/hippocampus/session/reset',
+  // Settings-page button: install the GitHub Orchestrator through the Host manager.
+  orchestratorInstall: '/api/hippocampus/orchestrator/install',
 });
 
 /** Only these keys may change over HTTP; anything else is rejected, not dropped. */
@@ -83,6 +85,10 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   'features.multiSpace',
   'features.crossSpaceTransfer',
   'features.crossSpaceRecall',
+  // v1.5.6: client half may open a fresh conversation when a handoff turns active.
+  'context.autoNewSession',
+  'context.autoNewSessionPoll',
+  'context.autoNewSessionIntervalSeconds',
   // v1.5.6 L2 multi-merge tunables (offline maintain phase).
   'l2Merge.enabled',
   'l2Merge.minGroupSize',
@@ -562,6 +568,43 @@ export function createMemoryRoutes({ runtime, persist = null, logger = null }) {
     }
   };
 
+  const orchestratorInstallHandler = async (req, res) => {
+    if (req.method !== 'POST') {
+      sendState(res, 405, runtime, { ok: false, error: { code: 'MEM_E_INVALID_INPUT', message: 'use POST' } });
+      return;
+    }
+    try {
+      if (stateOf(runtime) !== 'ready') {
+        sendState(res, 409, runtime, { ok: false, error: asMemoryError(runtime.notReady('install_orchestrator')).toJSON() });
+        return;
+      }
+      let body = {};
+      try {
+        body = (await readJsonBody(req)) ?? {};
+      } catch {
+        body = {};
+      }
+      if (!body || body.confirm !== true) {
+        sendState(res, 400, runtime, {
+          ok: false,
+          error: {
+            code: 'MEM_E_INVALID_INPUT',
+            message: 'installing dsh-orchestrator mutates the profile; send {confirm:true} after the user confirms',
+          },
+        });
+        return;
+      }
+      const result = await runtime.installOrchestrator({ confirm: true, repo: typeof body.repo === 'string' ? body.repo : undefined });
+      const status = result.ok || result.state === 'already-installed' ? 200 : result.state === 'manual' ? 501 : 400;
+      // `state` is the runtime phase in every payload; keep the install verdict in
+      // its own field instead of overwriting it.
+      sendState(res, status, runtime, { ...result, installState: result.state });
+    } catch (error) {
+      log(`orchestrator install failed: ${error?.message ?? error}`);
+      fail(res, 400, error, runtime);
+    }
+  };
+
   return [
     { kind: 'exact', path: MEMORY_API.stats, handler: statsHandler },
     { kind: 'exact', path: MEMORY_API.config, handler: configHandler },
@@ -571,6 +614,7 @@ export function createMemoryRoutes({ runtime, persist = null, logger = null }) {
     { kind: 'exact', path: MEMORY_API.memories, handler: memoriesHandler },
     { kind: 'exact', path: MEMORY_API.spaces, handler: spacesHandler },
     { kind: 'exact', path: MEMORY_API.sessionReset, handler: sessionResetHandler },
+    { kind: 'exact', path: MEMORY_API.orchestratorInstall, handler: orchestratorInstallHandler },
   ];
 }
 

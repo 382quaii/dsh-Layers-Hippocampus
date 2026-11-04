@@ -1,7 +1,9 @@
-# Release 1.5.6 — 发布准备（本地）
+# Release 1.5.7 — 发布准备（本地）
+
+> 版本冻结：**1.5.7 是本次发布版本，后续不再升版本号**。
 
 > 状态：**代码与文档已就绪；仓库推送 / npm 发布 / 市场 PR 需要你的 GitHub 与 npm 凭据，代理与网络，本会话未执行。**
-> 基线：`dsh-memory` 工作区，全量 **389/389 测试通过**（62 个测试文件；另有 `dsh-orchestrator` 31/31）。
+> 基线：`dsh-memory` 工作区，全量 **399/399 测试通过**（64 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；插件市场仍无条目（未发布 npm）。
 
 ## 本版内容
@@ -21,7 +23,7 @@
 
 ## 发布步骤（需要你执行）
 
-> 两个包：`dsh-layers-hippocampus@1.5.6`（已有 git remote）与
+> 两个包：`dsh-layers-hippocampus@1.5.7`（版本冻结，已有 git remote）与
 > `dsh-layers-orchestrator@0.1.0`（**目前不是 git 仓库**，需先 init/建远端）。
 > 全部命令在 PowerShell 下执行；`node`/`npm`/`pnpm` 用 DSH runtime 自带的绝对路径。
 
@@ -29,11 +31,11 @@
 
 ```powershell
 cd C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory
-node test/run.mjs                # 期望 389/389
+node test/run.mjs                # 期望 399/399
 cd ..\dsh-orchestrator
 node test/run.mjs                # 期望 31/31
 cd ..\dsh-memory
-git status --short               # 72 个改动：全都要进本次 release
+git status --short               # 全部改动都在本次 release
 git check-ignore node_modules    # 必须输出 node_modules
 npm pack --dry-run               # 预检实际发布内容（含/不含不该发布的文件）
 ```
@@ -44,11 +46,11 @@ npm pack --dry-run               # 预检实际发布内容（含/不含不该�
 cd C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory
 git add -A
 git status --short                 # 最后确认没有 node_modules / state / 测试临时目录
-git commit -m "release: v1.5.6 — raw cursor scan, payload cap, tagging, pinned memory, relevance hints, feature flags, cross-space recall, local low-valley scheduler"
+git commit -m "release: v1.5.7 — raw cursor scan, payload cap, tagging, pinned memory, hints, feature flags, federation/dedupe, cross-space recall, orchestrator installer, durable state, auto new conversation, low-valley scheduler"
 
-# 1.5.5/1.5.6 两个版本都未打 tag：补上（历史缺口的 tag 见 ROADMAP）
+# 版本冻结：只打 v1.5.7；1.5.6 是未发布草稿，已并入本版
 git tag -a v1.5.5 -m "v1.5.5: offline Dream LLM distillation with local fallback" 2>$null
-git tag -a v1.5.6 -m "v1.5.6: raw line cursor, payload budget, tagging, pinned memory, hints, feature flags, spark fixes, orchestrator split, low-valley scheduler"
+git tag -a v1.5.7 -m "v1.5.7: final release (version freeze) — 1.5.6 features + federation, read merge, cross-space recall, durable state, installer, auto new conversation"
 git push origin main --follow-tags
 ```
 

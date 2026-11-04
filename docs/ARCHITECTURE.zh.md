@@ -571,7 +571,7 @@ window.__ModuleLoader__.load({
 
 运行器带**看门狗**：默认 **60s**（`MEM_TEST_TIMEOUT_MS` 可调）仍未退出，就打印**卡住时正在导入/执行的文件、最后完成的测试名与完成数、活动资源、尚未触发的定时器**，然后 `process.exit(1)`。它不会用 `process.exit(0)` 掩盖超时——挂起即失败。`MEM_TEST_TRACE=1` 可看文件级进度，`MEM_TEST_ONLY=<子串>` 只跑一组。
 
-389 个用例（62 个文件）覆盖：
+399 个用例（64 个文件）覆盖：
 
 - 索引与标签：重建 digest 一致、行号漂移防护（eventId 不变、行号变）、同义合并、活跃集 cap 挤出、规则变更不改清单、空活跃集降级、top-k 有界有序去重。
 - 衰减与删除：30 天半衰期、reinforce 移动锚点（不存字段）、仅文本粗筛、标签过滤、维护代切换且旧代可读、boot 检查、压缩不丢记录、并发维护串行化、四阶段删除、archive 可回滚 vs purge 不可、strict 巩固暂停与恢复、任务重放幂等、错误 id 零变更。
@@ -616,6 +616,7 @@ window.__ModuleLoader__.load({
 - v1.5.6 低谷调度 Phase 2（`test/v156.lowValley2.test.js`，4 个用例）：峰时唤醒重新 arm 不执行；睡过头唤醒报 `lateMs`/`catchUp`；谷时过期队列 delay 0 catch-up；runtime 集成峰时延后→定时器触发→队列清空、`dreamTimer.runs=1`。
 - v1.5.6 读时 merge（`test/v156.readMerge.test.js`，2 个用例）：月记 `meta.source_event_ids` 进索引投影，recall 走 `mergeForRead()` 丢弃其 owned 事件并回报 `merge` 统计；无 dedupe 服务时 payload 形状不变。
 - v1.5.6 跨空间 recall 聚合（`test/v156.crossSpaceRecall.test.js`，2 个用例）：逐空间加锁取原始命中（`mergeRecall:false`）、带 `spaceId` 合并；月记在 default、事件在 work 时仍能隐藏 owned 事件；`test/v156.crossSpaceRecallFlag.test.js`（3 个用例）锁定 `features.crossSpaceRecall` 默认 false、fail-fast、开关行为。
+- v1.5.6 设置页安装器（`test/v156.orchestratorInstall.test.js`，5 个用例）：已安装短路；`{confirm:true}` 强制；无 `pluginManager` 时给出手动步骤；有服务时以 `git+https` spec 调用 `installBundle` 并回报 `restart-required`；HTTP 路由与 UI 源码契约（按钮/仓库链接/确认框）。
 
 
 ## SLO / 容量

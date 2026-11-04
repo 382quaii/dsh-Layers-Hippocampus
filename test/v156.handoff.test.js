@@ -289,5 +289,5 @@ test('escape hatches over tool and HTTP: admin reset_session + POST /session/res
   assert.equal(res.status, 200);
   assert.equal(JSON.parse(res.text).ok, true);
   assert.equal(JSON.parse(res.text).reset, true);
-  assert.equal(routes.length, 8, 'the route table grew by exactly the escape hatch');
+  assert.equal(routes.length, 9, 'the route table grew by the escape hatch + install route');
 });

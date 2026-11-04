@@ -180,6 +180,14 @@ export const DEFAULT_CONFIG = Object.freeze({
     threshold: 0.85,
     target: 0.7,
     injectPrompt: true,
+    // v1.5.6: when a handoff becomes active the CLIENT half asks the Host client
+    // service `uiWorkspace.startSession()` to open a fresh conversation (opt-out).
+    autoNewSession: true,
+    // v1.5.6: how the client half decides a new conversation is due. `interval`
+    // polls /stats every `autoNewSessionIntervalSeconds`; `once` checks only once
+    // per page load (no recurring traffic).
+    autoNewSessionPoll: 'interval',
+    autoNewSessionIntervalSeconds: 15,
     // REMOVED in v1.5.3: `minInjectConfidence`. It never demonstrably saved tokens
     // (0.6 vs 0 produced byte-identical payloads) and every hit-shaping pass is a
     // permanent token tax; keeping a misleading knob is worse than having none.
@@ -545,6 +553,22 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
   }
   const contextInjectPrompt =
     contextIn.injectPrompt === undefined ? defaults.context.injectPrompt : requireBoolean(contextIn.injectPrompt, 'context.injectPrompt');
+  const contextAutoNewSession = requireBoolean(
+    contextIn.autoNewSession === undefined ? defaults.context.autoNewSession : contextIn.autoNewSession,
+    'context.autoNewSession',
+  );
+  const contextAutoNewSessionPoll = requireEnum(
+    contextIn.autoNewSessionPoll === undefined ? defaults.context.autoNewSessionPoll : contextIn.autoNewSessionPoll,
+    'context.autoNewSessionPoll',
+    ['interval', 'once'],
+  );
+  const contextAutoNewSessionIntervalSeconds = requireInteger(
+    contextIn.autoNewSessionIntervalSeconds === undefined
+      ? defaults.context.autoNewSessionIntervalSeconds
+      : contextIn.autoNewSessionIntervalSeconds,
+    'context.autoNewSessionIntervalSeconds',
+    { min: 5, max: 3600 },
+  );
   // REMOVED KEY (v1.5.3), loud on purpose: nested groups normally ignore unknown
   // keys, but silently ignoring a removed confidence knob would let a profile run
   // with a false belief about token behaviour. Fail fast with the exact path.
@@ -1028,6 +1052,9 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
       threshold: contextThreshold,
       target: contextTarget,
       injectPrompt: contextInjectPrompt,
+      autoNewSession: contextAutoNewSession,
+      autoNewSessionPoll: contextAutoNewSessionPoll,
+      autoNewSessionIntervalSeconds: contextAutoNewSessionIntervalSeconds,
       // v1.5.0 routing knobs below; v1.5.3 removed minInjectConfidence entirely.
       autoSpaceFollow: contextAutoSpaceFollow,
       autoRolloverEnabled: contextAutoRolloverEnabled,

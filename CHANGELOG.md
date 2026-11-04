@@ -4,12 +4,24 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.7] — 2026-11-04
+
+**Version freeze: 1.5.7 is the shipped release; no further version bumps follow.**
+This release folds in everything added after the 1.5.6 draft — Orchestrator
+federation/dedupe wiring, read-time merge, cross-space recall aggregation (opt-in
+`features.crossSpaceRecall`), durable Orchestrator state, the settings-page GitHub
+installer, the verified automatic new-conversation handoff (with configurable
+once/interval detection), low-valley Dream Phase 2, space deletion, graph
+interaction, and the rest of the 1.5.6 section below. Annotations of the form
+`v1.5.6:` below record the version in which a feature was introduced; they are
+history, not the current version. **399 tests green** (64 files).
+
 ## [1.5.6] — 2026-11-03
 
 **`deep_raw` now scans by line cursor: a huge day shard is never loaded whole.**
 The black box is read newest-first in fixed chunks; peak memory is one chunk plus
 one partial line (test-locked), not the file size. `hit.line` keeps its absolute
-1-based semantics. **389 tests green** (was 303).
+1-based semantics. **399 tests green** (was 303).
 
 ### Changed — raw scan / restore (zero-dependency, O(chunk) memory)
 
@@ -396,12 +408,33 @@ one partial line (test-locked), not the file size. `hit.line` keeps its absolute
 - New `test/v156.crossSpaceRecallFlag.test.js` (3 cases): default false + fail-fast
   (`true` without multiSpace is a contradiction, non-boolean rejected); flag true
   aggregates open spaces; flag false keeps the single-space payload.
+- **Settings-page GitHub installer**: new `POST /api/hippocampus/orchestrator/install`
+  (requires `{confirm:true}`) delegates to the Host's
+  `pluginManager.installBundle('git+https://github.com/382quaii/dsh-Layers-Orchestrator.git', {enabled:true})`,
+  short-circuits when the service is already present, and reports
+  `applied | restart-required | manual | failed`. The settings page ships a
+  “从 GitHub 安装 dsh-orchestrator” button (human confirm dialog) plus the repo link;
+  without `pluginManager` it shows the exact manual steps instead of failing silently.
+- **Automatic new conversation on handoff (verified feasible)**: the Host exposes
+  `agents.create/resume` and, decisively, the CLIENT service
+  `uiWorkspace.startSession()` — the same action the “+” button uses. A client-half
+  controller polls `/stats`, and when `handoff.active && handoff.autoNewSession` it
+  calls `uiWorkspace.startSession(undefined, {agentPreset})` once per handoff marker
+  (sessionStorage guard, lifecycle-owned interval, capability-guarded no-op on old
+  hosts). New config `context.autoNewSession` (default **true**, fail-fast,
+  HTTP-editable, settings toggle), plus `context.autoNewSessionPoll`
+  (`interval` | `once`, default `interval`) and
+  `context.autoNewSessionIntervalSeconds` (5–3600, default 15): the settings page
+  now exposes a “按间隔轮询 / 只检查一次” select and an interval slider; the client
+  configures its timer from the FIRST stats response (`once` clears the recurring
+  timer). The workspace-file handoff scheme is no longer needed and stays documented
+  only as a fallback.
 - **Durable Orchestrator state**: `<root>/state/orchestrator.json` now persists the
   global federation map and the monthly-memo claims (atomic tmp+rename on every
   mutation); it is loaded before the services become observable, and a corrupt file
   is treated as empty instead of failing activation — a restart no longer forgets
   cross-space dedupe.
-- Full suite: **389 tests / 389 pass / 0 fail**, 62 test files. Orchestrator:
+- Full suite: **399 tests / 399 pass / 0 fail**, 64 test files. Orchestrator:
   **31/31** (`service` + `spaces` deletion + `persistence` round-trip/corrupt state).
   **Installed locally**: desktop profile gets a `link:` dependency + an ordered patch
   insert BEFORE the hippocampus entries, so the service exists at activation. Two

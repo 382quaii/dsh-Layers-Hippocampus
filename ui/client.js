@@ -50,6 +50,8 @@
         spaces: '/api/hippocampus/spaces',
         // Escape hatch: reset a wedged rollover/handoff state.
         sessionReset: '/api/hippocampus/session/reset',
+        // Settings page: install the GitHub Orchestrator through the Host manager.
+        orchestratorInstall: '/api/hippocampus/orchestrator/install',
       };
       const POLL_MS = 3000;
       /** Fallback ring budget (MB) when the Host has not sent the config yet. */
@@ -2513,6 +2515,9 @@
             autoSpaceFollow: Boolean((config.context && config.context.autoSpaceFollow) ?? false),
             autoRolloverEnabled: (config.context && config.context.autoRolloverEnabled) !== false,
             autoRolloverThreshold: Number((config.context && config.context.autoRolloverThreshold) ?? 0.85),
+            autoNewSession: (config.context && config.context.autoNewSession) !== false,
+            autoNewSessionPoll: (config.context && config.context.autoNewSessionPoll) === 'once' ? 'once' : 'interval',
+            autoNewSessionIntervalSeconds: Number((config.context && config.context.autoNewSessionIntervalSeconds) ?? 15),
             nativeTokenLimit: Number((config.context && config.context.nativeTokenLimit) ?? 8000),
             // Security red line (v1.5.1): default TRUE, only an explicit operator
             // choice may turn the engine-level consent gate off.
@@ -2682,6 +2687,96 @@
         );
       }
 
+      /**
+       * v1.5.6: one-click install of the GitHub multi-space engine.
+       *
+       * The browser cannot run pnpm; this posts {confirm:true} to the Host route,
+       * which delegates to pluginManager.installBundle(). The human confirm dialog is
+       * here; the server ALSO refuses without confirm so a stray request cannot
+       * mutate the profile.
+       */
+      function OrchestratorInstallCard({ installed }) {
+        const [busy, setBusy] = React.useState(false);
+        const [result, setResult] = React.useState(null);
+        const install = async () => {
+          if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
+            const ok = window.confirm('从 GitHub 安装 dsh-layers-orchestrator？这会修改当前 profile，并可能要求重启 DSH。');
+            if (!ok) return;
+          }
+          setBusy(true);
+          setResult(null);
+          try {
+            const { status: httpStatus, body } = await getJson(API.orchestratorInstall, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ confirm: true }),
+            });
+            setResult({ httpStatus, ...(body && typeof body === 'object' ? body : {}), state: (body && (body.installState ?? body.state)) || 'unknown' });
+          } catch (error) {
+            setResult({ ok: false, state: 'network', message: String((error && error.message) || error) });
+          } finally {
+            setBusy(false);
+          }
+        };
+        const resultText = result
+          ? result.ok
+            ? result.restartRequired
+              ? '安装完成：重启 DSH 后生效。'
+              : '安装完成并已激活。'
+            : result.state === 'already-installed'
+              ? '已经安装并启用。'
+              : result.state === 'manual'
+                ? '当前宿主未提供插件管理器，请按下方步骤手动安装。'
+                : `安装失败：${result.problem || result.code || result.state || 'unknown'}${result.message ? ' — ' + result.message : ''}`
+          : '';
+        return h(
+          Section,
+          {
+            title: '多空间引擎（dsh-orchestrator）',
+            hint: '从 GitHub 安装 dsh-layers-orchestrator：联邦标签、跨空间去重、多空间路由与迁移都由它提供。安装会修改当前 profile（pnpm），完成后可能需要重启 DSH。',
+          },
+          h(
+            'div',
+            { style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' } },
+            installed
+              ? h('span', { style: { ...labelStyle, marginBottom: 0 } }, '已安装并启用（capabilities.spaces=true）')
+              : h(
+                  'button',
+                  { type: 'button', style: smallButtonStyle, onClick: install, disabled: busy },
+                  busy ? '安装中…' : '从 GitHub 安装 dsh-orchestrator',
+                ),
+            h(
+              'a',
+              {
+                href: 'https://github.com/382quaii/dsh-Layers-Orchestrator',
+                target: '_blank',
+                rel: 'noreferrer',
+                style: { ...labelStyle, marginBottom: 0, textDecoration: 'underline', color: palette.accent },
+              },
+              'GitHub 仓库 ↗',
+            ),
+          ),
+          resultText ? h('div', { style: { ...labelStyle, marginTop: 6, marginBottom: 0 } }, resultText) : null,
+          result && Array.isArray(result.steps) && result.steps.length > 0
+            ? h(
+                'pre',
+                {
+                  style: {
+                    marginTop: 6,
+                    padding: 8,
+                    borderRadius: 8,
+                    border: `1px solid ${palette.border}`,
+                    fontSize: 11,
+                    whiteSpace: 'pre-wrap',
+                    userSelect: 'text',
+                  },
+                },
+                result.steps.join('\n'),
+              )
+            : null,
+        );
+      }
+
       function MemorySettings() {
         const activeSpace = useActiveSpace();
         const state = useMemoryStats(activeSpace);
@@ -2794,6 +2889,9 @@
             'context.injectPrompt': Boolean(draft.context.injectPrompt),
             'context.autoSpaceFollow': Boolean(draft.context.autoSpaceFollow),
             'context.autoRolloverEnabled': Boolean(draft.context.autoRolloverEnabled),
+            'context.autoNewSession': Boolean(draft.context.autoNewSession),
+            'context.autoNewSessionPoll': draft.context.autoNewSessionPoll === 'once' ? 'once' : 'interval',
+            'context.autoNewSessionIntervalSeconds': Number(draft.context.autoNewSessionIntervalSeconds),
             'context.autoRolloverThreshold': Number(draft.context.autoRolloverThreshold),
             'context.nativeTokenLimit': Number(draft.context.nativeTokenLimit),
             'context.requireExplicitConsentForTransfer': Boolean(draft.context.requireExplicitConsentForTransfer),
@@ -3040,6 +3138,9 @@
               disabled: disabled || !draft.features.multiSpace,
             }),
           ),
+          h(OrchestratorInstallCard, {
+            installed: Boolean(state.payload && state.payload.capabilities && state.payload.capabilities.spaces === true),
+          }),
           h(
             Section,
             {
@@ -3343,6 +3444,35 @@
               onChange: (value) => edit('context.autoRolloverEnabled', value),
               disabled,
             }),
+            h(Toggle, {
+              label: '自动开启新会话（context.autoNewSession）',
+              hint: '交接标记生效后，客户端调用宿主 uiWorkspace.startSession() 打开一个新会话（工作模式与摘要自动带入）；关闭则只提示、由你手动新建。',
+              checked: draft.context.autoNewSession,
+              onChange: (value) => edit('context.autoNewSession', value),
+              disabled,
+            }),
+            h(Select, {
+              label: '新会话检测方式（context.autoNewSessionPoll）',
+              hint: '按间隔轮询：客户端每 N 秒拉一次 /stats；只检查一次：页面加载后仅检查一次，之后不再产生请求（可能错过之后才出现的交接标记）。',
+              value: draft.context.autoNewSessionPoll,
+              options: [
+                { value: 'interval', label: '按间隔轮询 /stats' },
+                { value: 'once', label: '只检查一次' },
+              ],
+              onChange: (value) => edit('context.autoNewSessionPoll', value),
+              disabled,
+            }),
+            h(Slider, {
+              label: '轮询间隔秒数（context.autoNewSessionIntervalSeconds）',
+              hint: '仅“按间隔轮询”生效；默认 15 秒，范围 5–3600 秒。调大→更省请求、交接后开新会话更慢。',
+              value: draft.context.autoNewSessionIntervalSeconds,
+              min: 5,
+              max: 3600,
+              step: 5,
+              suffix: ' 秒',
+              onChange: (value) => edit('context.autoNewSessionIntervalSeconds', value),
+              disabled: disabled || draft.context.autoNewSessionPoll === 'once',
+            }),
             h(Slider, {
               label: '交接触发比例（context.autoRolloverThreshold）',
               hint: '占原生窗口的比例，默认 0.85（85%）：达到后触发自动交接。调低→更早交班、原生窗口用得更短；调高→更晚交班、更接近窗口上限。',
@@ -3629,6 +3759,79 @@
           ),
         );
       }
+      /**
+       * v1.5.6: open a fresh conversation once an active handoff appears.
+       *
+       * The CLIENT half is the only place that can switch the visible session:
+       * `ctx.get('uiWorkspace').startSession()` is the Host's own new-conversation
+       * action (same path the "+" button uses). Guarded by (a) the config flag the
+       * Host reports, (b) one fire per handoff marker via sessionStorage, and (c) a
+       * hard capability check so an old Host/clients without the service do nothing.
+       */
+      function startAutoNewSession(ctx) {
+        if (!ctx || typeof ctx.get !== 'function') return () => {};
+        let stopped = false;
+        let fired = false;
+        let timer = null;
+        let scheduled = false;
+        // Decide the poll mode ONCE from the first stats response: `once` clears the
+        // timer after the initial check; `interval` replaces the default 15 s timer
+        // with the configured seconds (5–3600).
+        const configure = (body) => {
+          if (scheduled) return;
+          scheduled = true;
+          const contextConfig = (body && body.config && body.config.context) || {};
+          const poll = contextConfig.autoNewSessionPoll === 'once' ? 'once' : 'interval';
+          if (timer) {
+            clearInterval(timer);
+            timer = null;
+          }
+          if (poll === 'once') return;
+          const seconds = Math.max(5, Math.min(3600, Number(contextConfig.autoNewSessionIntervalSeconds) || 15));
+          timer = setInterval(check, seconds * 1000);
+        };
+        const keyFor = (handoff) => `hippocampus-auto-session:${handoff.at || handoff.summaryEventId || 'unknown'}`;
+        const check = async () => {
+          if (stopped || fired) return;
+          try {
+            const { body } = await getJson(API.stats);
+            configure(body);
+            const handoff = body && body.handoff;
+            if (!handoff || handoff.active !== true || handoff.autoNewSession !== true) return;
+            const key = keyFor(handoff);
+            try {
+              if (window.sessionStorage && window.sessionStorage.getItem(key)) {
+                fired = true;
+                return;
+              }
+            } catch (ignored) {
+              // sessionStorage can be unavailable; the in-memory guard still holds.
+            }
+            const workspace = ctx.get('uiWorkspace');
+            if (!workspace || typeof workspace.startSession !== 'function') return;
+            fired = true;
+            try {
+              if (window.sessionStorage) window.sessionStorage.setItem(key, '1');
+            } catch (ignored) {
+              // storage quota/privacy: the in-memory `fired` flag prevents a loop.
+            }
+            workspace.startSession(undefined, handoff.agentPreset ? { agentPreset: handoff.agentPreset } : undefined);
+          } catch (ignored) {
+            // A missing route / offline Host must never throw out of the poll.
+          }
+        };
+        (function boot() {
+          // Start with the default interval so the FIRST stats request happens now;
+          // configure() then replaces or clears it.
+          timer = setInterval(check, 15000);
+          check();
+        })();
+        return () => {
+          stopped = true;
+          if (timer) clearInterval(timer);
+        };
+      }
+
       return {
         inject: ['slots'],
         // Exported for the bundle-contract tests: the pure retry decision is the
@@ -3647,6 +3850,12 @@
         spaceCreateAvailable,
         describeSpaceError,
         apply(ctx) {
+          try {
+            if (ctx && typeof ctx.effect === 'function') ctx.effect(() => startAutoNewSession(ctx));
+            else startAutoNewSession(ctx);
+          } catch (error) {
+            report('auto-new-session', error);
+          }
           let slots = null;
           try {
             slots = ctx && ctx.slots;

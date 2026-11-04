@@ -44,6 +44,8 @@ import { MEMORY_API, registerMemoryRoutes } from './src/webRoutes.js';
 
 export const name = 'memory';
 export const inject = ['tools', 'systemPrompt'];
+/** The GitHub address the settings-page install button asks the Host to install. */
+export const ORCHESTRATOR_REPO = 'https://github.com/382quaii/dsh-Layers-Orchestrator.git';
 
 /** Re-exported so the client bundle and tests share one route table. */
 export { MEMORY_API };
@@ -726,6 +728,7 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
         dreamWindow: runtime.dreamWindow?.() ?? null,
         dreamQueue: memory.dreamQueue(),
         dreamTimer: runtime.dreamTimer?.status() ?? null,
+        handoff: runtime.handoffView(),
         panel: { ...status.panel, migration: runtime.migrationStatus() },
         briefing: memory.briefing(),
         config: uiConfig(runtime.config),
@@ -802,7 +805,21 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     // but no spacesDelete, so the client hides the delete button instead of sending an
     // action the old server would misread as CREATE ("空间已存在").
     spacesDelete: runtime.multiSpaceAvailable() && typeof memory.spaces?.deleteSpace === 'function',
+    // v1.5.6: the client half may open a fresh conversation on an active handoff.
+    autoNewSession: runtime.config.context.autoNewSession === true,
   });
+
+  /** v1.5.6: handoff observability for the client-side auto-new-session controller. */
+  runtime.handoffView = () => {
+    const handoff = memory.handoffState();
+    return {
+      active: handoff?.active === true,
+      at: handoff?.at ?? null,
+      summaryEventId: handoff?.summaryEventId ?? null,
+      agentPreset: runtime.agentPreset ?? null,
+      autoNewSession: runtime.config.context.autoNewSession === true,
+    };
+  };
 
   /** "＋ 新建空间": creates the child store lazily, then returns the updated list. */
   runtime.ensureSpace = async (spaceId) => {
@@ -1043,6 +1060,69 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
         });
     });
     return { ok: true, phase: runtime.phase, retrying: true };
+  };
+
+  /**
+   * v1.5.6: settings-page install button for the GitHub Orchestrator.
+   *
+   * It never fabricates consent (`confirm` must be true) and never invents an
+   * installer: the Host's `pluginManager.installBundle()` does the pnpm work and
+   * reports whether a restart is required. Without that service (or on an old host)
+   * the caller gets the exact manual steps instead of a silent failure.
+   */
+  runtime.installOrchestrator = async ({ confirm = false, repo = ORCHESTRATOR_REPO } = {}) => {
+    if (ctx?.get?.('orchestrator')) return { ok: true, state: 'already-installed', repo };
+    if (confirm !== true) {
+      return {
+        ok: false,
+        state: 'confirmation-required',
+        repo,
+        message: 'installing a plugin mutates the current profile; retry with {confirm:true}',
+      };
+    }
+    const manager = ctx?.get?.('pluginManager') ?? null;
+    const manualSteps = [
+      '1) 在设置页打开“插件”，选择“从 GitHub 安装”，粘贴仓库地址；或',
+      `2) 终端执行：dsh plugin install ${repo} --profile desktop`,
+      '3) 重启 DSH；插件列表出现 include:orchestrator = active 即成功',
+    ];
+    if (!manager || typeof manager.installBundle !== 'function') {
+      return { ok: false, state: 'manual', repo, steps: manualSteps, reason: 'pluginManager-unavailable' };
+    }
+    try {
+      if (typeof manager.inspect === 'function') {
+        const inspection = await manager.inspect(repo);
+        if (inspection && inspection.status === 'refused') {
+          return {
+            ok: false,
+            state: 'refused',
+            repo,
+            problem: inspection.problem,
+            message: inspection.reason,
+            steps: manualSteps,
+          };
+        }
+      }
+      const result = await manager.installBundle(repo, { enabled: true });
+      const application = result?.application ?? 'unknown';
+      return {
+        ok: application === 'applied' || application === 'restart-required',
+        state: application,
+        repo,
+        restartRequired: application === 'restart-required',
+        result,
+        steps: manualSteps,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        state: 'failed',
+        repo,
+        code: error?.code ?? 'operation-error',
+        message: error?.message ?? String(error),
+        steps: manualSteps,
+      };
+    }
   };
 
   /**

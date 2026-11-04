@@ -263,5 +263,8 @@ L2.5 趋势隔离 / 幽灵节点 / 上下文分页 / cron+dream 单一闸门 / �
 - ✅ **读时 merge 已接 recall**：月记持久化 `meta.source_event_ids`，`projectEpisode` 暴露 `sourceEventIds`；`mergeRecallHits()` 走 `ContentRegistry.mergeForRead()`——月记覆盖其 owned 事件、重复内容折叠（monthly first），payload 带 `merge` 统计。仅在 dedupe 服务存在时生效，纯核心形状不变。2 个用例 `test/v156.readMerge.test.js`。
 - ✅ **跨空间 recall 聚合**：`Memory.recallAcrossSpaces()` 逐空间加锁查询（`mergeRecall:false` 拿原始命中）、带 `spaceId` 合并；返回 `mode:'cross-space'` / `spaces` / `merge` / 每命中 `spaceId`。**默认关闭**：`features.crossSpaceRecall`（默认 false，fail-fast、HTTP、设置页）为 true 时才由 `runtime.recall()` 自动聚合；显式 `targetSpaceId` 仍单空间。2+3 个用例（`v156.crossSpaceRecall` / `...Flag`）。
 - ✅ **Orchestrator 状态持久化**：`<root>/state/orchestrator.json` 原子写入联邦映射与月记认领，服务可见前恢复；损坏文件按空处理不阻断激活。3 个用例 `test/persistence.test.js`；`dsh-orchestrator` **31/31**。
-- **测试**：`dsh-memory` **389/389**（62 文件）；`dsh-orchestrator` **31/31**。
-- **仍未完成**：发布卫生（commit/tag/npm/市场）。
+- ✅ **设置页 GitHub 安装按钮**：`POST /api/hippocampus/orchestrator/install`（必须 `{confirm:true}`）→ Host `pluginManager.installBundle('git+https://github.com/382quaii/dsh-Layers-Orchestrator.git')`；已安装短路、无管理器给手动步骤、回报 applied/restart-required；设置页按钮 + 仓库链接 + 人类确认框。5 个用例。
+- ✅ **自动开启新会话（已验证可行并落地）**：Host `agents.create/resume` 存在；客户端服务 `uiWorkspace.startSession()` 即“+”按钮同一动作。客户端半区轮询 `/stats`，`handoff.active && handoff.autoNewSession` 时每个标记调用一次 `startSession(undefined,{agentPreset})`（sessionStorage 去重、生命周期清理、旧宿主 no-op）；`context.autoNewSession` 默认 true；**检测方式 UI 可选**：`context.autoNewSessionPoll`（`interval` 轮询 / `once` 只检查一次）+ `context.autoNewSessionIntervalSeconds`（5–3600，默认 15），设置页 Select + Slider，客户端按首个 stats 响应配置定时器。5 个用例。工作区交接文件方案改为后备。
+- **测试**：`dsh-memory` **399/399**（64 文件）；`dsh-orchestrator` **31/31**。
+- ✅ **版本冻结 1.5.7 + 本地发布卫生**：`package.json` 升到 1.5.7（后续不再升版本号）；本地 commit `release: v1.5.7 …` + tag `v1.5.7`（**未 push**）。
+- **仍未完成**：`git push` → npm publish（两个包）→ 市场目录 PR（需 GitHub/npm 凭据）。
