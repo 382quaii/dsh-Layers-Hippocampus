@@ -25,6 +25,12 @@ export const ErrorCodes = Object.freeze({
   TOMBSTONED: 'MEM_E_TOMBSTONED',
   INVALID_MEDIA: 'MEM_E_INVALID_MEDIA',
   NOT_READY: 'MEM_E_NOT_READY',
+  /** Another maintenance pass is already running; the service refuses to queue it. */
+  MAINTENANCE_RUNNING: 'MEM_E_MAINTENANCE_RUNNING',
+  /** The cross-plugin `hippocampus` service was disposed with its plugin fiber. */
+  SERVICE_DISPOSED: 'MEM_E_SERVICE_DISPOSED',
+  /** Federation bookkeeping failed; the write itself is unaffected. */
+  FEDERATION_FAILED: 'MEM_E_FEDERATION_FAILED',
 
   // ---- configuration (fail-fast at boot; never silently downgraded) ---------
   CONFIG_DEPRECATED: 'MEM_E_CONFIG_DEPRECATED',

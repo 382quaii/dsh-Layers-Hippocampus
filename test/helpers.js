@@ -183,6 +183,13 @@ export function fakeCtx({ orchestrator = true } = {}) {
     get(name) {
       return services.get(name) ?? null;
     },
+    /** Cordis `ctx.provide`: expose one service to sibling plugins; returns a disposer. */
+    provide(name, value) {
+      services.set(name, value);
+      return () => {
+        if (services.get(name) === value) services.delete(name);
+      };
+    },
     /**
      * Cordis `ctx.inject` starts a child fiber that activates when the services
      * exist. The fake provides them eagerly and runs the callback synchronously,
@@ -196,6 +203,7 @@ export function fakeCtx({ orchestrator = true } = {}) {
         systemPrompt: ctx.systemPrompt,
         effect: ctx.effect,
         get: (name) => ctx.get(name),
+        provide: (name, value) => ctx.provide(name, value),
         inject: ctx.inject,
       };
       callback(child);

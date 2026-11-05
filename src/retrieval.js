@@ -505,13 +505,17 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
     // and a small boost when the query is about a fuzzy historical period.
     // v1.5.6: pinned records never decay either — they are lessons, not episodes.
     const pinned = event.pinned === true;
+    // v1.5.7: a per-record decay multiplier (generic; no tag inspection anywhere)
+    // stretches/shrinks the effective half-life for this event only.
+    const eventHalfLife =
+      Number.isFinite(event.decayRate) && event.decayRate > 0 ? halfLife / event.decayRate : halfLife;
     const decay = monthly || pinned
       ? 1
       : decayFactor({
           eventTime: event.anchorTime ?? event.eventTime,
           lastReinforcedAt: event.lastReinforcedAt,
           now,
-          halfLifeDays: halfLife,
+          halfLifeDays: eventHalfLife,
           floor,
         });
     const tagScore = affinity.get(eventId) ?? 0;

@@ -14,14 +14,14 @@ installer, the verified automatic new-conversation handoff (with configurable
 once/interval detection), low-valley Dream Phase 2, space deletion, graph
 interaction, and the rest of the 1.5.6 section below. Annotations of the form
 `v1.5.6:` below record the version in which a feature was introduced; they are
-history, not the current version. **399 tests green** (64 files).
+history, not the current version. **411 tests green** (64 files).
 
 ## [1.5.6] — 2026-11-03
 
 **`deep_raw` now scans by line cursor: a huge day shard is never loaded whole.**
 The black box is read newest-first in fixed chunks; peak memory is one chunk plus
 one partial line (test-locked), not the file size. `hit.line` keeps its absolute
-1-based semantics. **399 tests green** (was 303).
+1-based semantics. **411 tests green** (was 303).
 
 ### Changed — raw scan / restore (zero-dependency, O(chunk) memory)
 
@@ -429,12 +429,39 @@ one partial line (test-locked), not the file size. `hit.line` keeps its absolute
   configures its timer from the FIRST stats response (`once` clears the recurring
   timer). The workspace-file handoff scheme is no longer needed and stays documented
   only as a fallback.
+- **Fixed — new-conversation failure `tool "subagent" is already registered`**:
+  handoff preset inheritance no longer calls `agentPresets.select()` when the new
+  session is ALREADY composed with the marker's preset. A redundant recompose
+  re-mounted the preset's `@deepseek-ai/dsh-tool-subagent` row and aborted session
+  creation; the skip is recorded as `presetInherit.reason='already-composed'` and
+  locked by a regression test in `test/v156.preset.test.js`.
+- **Persona section + generic custom decay (v1.5.7)**:
+  - `[Persona & Traits]` is its own prompt section (`name:'persona'`, **order 100**),
+    rendering the ≤10 highest-confidence L3 semantic summaries (live store read, not
+    the recall cache). The memory block/policy/reflection sections keep 2450/2455/2460.
+  - `service.remember()` accepts **`customDecayRate`** (finite, 0 < rate ≤ 10) OR
+    **`customHalfLifeDays`** (integer 1–36500), never both. The value is normalised to
+    `meta.decay_rate`, projected as `decayRate`, and applied as
+    `effectiveHalfLife = policyHalfLife / decayRate` for THAT record only. No
+    tag-prefix logic exists anywhere in the engine — an emotion plugin decides the
+    semantics by passing the parameter.
+- **Cross-plugin `ctx.provide('hippocampus', service)`** (user decision 2026-11-05:
+  in-process service only, NO HTTP write surface): `apiVersion=1`, `ready()`,
+  `capabilities()` (declares `l3Traits:10` plus per-method support), `remember()`
+  (L2-only; non-L2 layers are redirected with a warning; returns
+  `{status,eventId,eventTime,duplicate}`), `recall()`, `runMaintenance(source)`
+  (never queues: a running pass answers `MEM_E_MAINTENANCE_RUNNING`; manual passes
+  are rate-limited to 30 s while `cron` bypasses), `stats()/handoffView()/
+  promptState()` read-only snapshots and `onDispose()` hooks. The service disappears
+  with its plugin fiber; later calls answer `MEM_E_SERVICE_DISPOSED`. New codes
+  `MEM_E_MAINTENANCE_RUNNING`, `MEM_E_SERVICE_DISPOSED`, `MEM_E_FEDERATION_FAILED`
+  are registered append-only (8 cases in `test/v157.service.test.js`).
 - **Durable Orchestrator state**: `<root>/state/orchestrator.json` now persists the
   global federation map and the monthly-memo claims (atomic tmp+rename on every
   mutation); it is loaded before the services become observable, and a corrupt file
   is treated as empty instead of failing activation — a restart no longer forgets
   cross-space dedupe.
-- Full suite: **399 tests / 399 pass / 0 fail**, 64 test files. Orchestrator:
+- Full suite: **411 tests / 411 pass / 0 fail**, 64 test files. Orchestrator:
   **31/31** (`service` + `spaces` deletion + `persistence` round-trip/corrupt state).
   **Installed locally**: desktop profile gets a `link:` dependency + an ordered patch
   insert BEFORE the hippocampus entries, so the service exists at activation. Two

@@ -3,7 +3,7 @@
 > 版本冻结：**1.5.7 是本次发布版本，后续不再升版本号**。
 
 > 状态：**代码与文档已就绪；仓库推送 / npm 发布 / 市场 PR 需要你的 GitHub 与 npm 凭据，代理与网络，本会话未执行。**
-> 基线：`dsh-memory` 工作区，全量 **399/399 测试通过**（64 个测试文件；另有 `dsh-orchestrator` 31/31）。
+> 基线：`dsh-memory` 工作区，全量 **411/411 测试通过**（64 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；插件市场仍无条目（未发布 npm）。
 
 ## 本版内容
@@ -31,7 +31,7 @@
 
 ```powershell
 cd C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory
-node test/run.mjs                # 期望 399/399
+node test/run.mjs                # 期望 411/411
 cd ..\dsh-orchestrator
 node test/run.mjs                # 期望 31/31
 cd ..\dsh-memory

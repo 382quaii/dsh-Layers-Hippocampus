@@ -60,7 +60,7 @@ export { resolveConfig, DEFAULT_CONFIG };
  * of letting a raw 404 reach the user.
  */
 export const CAPABILITIES = Object.freeze({
-  version: '1.5.6',
+  version: '1.5.7',
   spaces: true,
   memories: true,
   transferConsent: true,
@@ -400,6 +400,42 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
   runtime.lastHintTags = [];
   runtime.resetInjection = (sessionId = runtime.injection.sessionId) => {
     runtime.injection = { sessionId, ids: new Set(), tags: new Set(), handoffAt: null };
+  };
+
+  /**
+   * v1.5.7: `[Persona & Traits]` — the top ≤10 L3 semantic summaries by confidence,
+   * injected at prompt order 100 (below any safety instruction). This is the memory
+   * plugin's OWN traits only; a sibling emotion plugin owns separate persona text.
+   */
+  runtime.personaTraitsText = () => {
+    if (runtime.phase !== 'ready') return '';
+    let summaries = [];
+    try {
+      // Read the LIVE semantic log, not the recall cache: a fresh L3 summary must
+      // reach the prompt without waiting for the next recall to invalidate it.
+      summaries =
+        typeof memory.semanticStore?.list === 'function'
+          ? memory.semanticStore.list()
+          : typeof memory.semanticSummaries === 'function'
+            ? memory.semanticSummaries()
+            : [];
+    } catch {
+      return '';
+    }
+    if (!Array.isArray(summaries) || summaries.length === 0) return '';
+    const ranked = [...summaries]
+      .sort(
+        (left, right) =>
+          (Number(right.confidence) || 0) - (Number(left.confidence) || 0) ||
+          String(right.summaryId ?? '').localeCompare(String(left.summaryId ?? '')),
+      )
+      .slice(0, 10);
+    if (ranked.length === 0) return '';
+    const oneLine = (value) => String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, 240);
+    return [
+      '[Persona & Traits]',
+      ...ranked.map((summary) => `- ${oneLine(summary.title) || 'trait'}: ${oneLine(summary.text)}`),
+    ].join('\n');
   };
 
   runtime.promptState = () => {
@@ -1148,6 +1184,18 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       return runtime.lastPresetInherit;
     }
     try {
+      // Never re-select a preset the new session is ALREADY composed with: a
+      // redundant select recomposes the agent context, and a preset that mounts
+      // `@deepseek-ai/dsh-tool-subagent` fails its tool registration on the second
+      // mount with `tool "subagent" is already registered in this scope`, which
+      // surfaced as "新建会话失败" on every handoff + new conversation.
+      const composed = typeof presets.composedPreset === 'function' ? presets.composedPreset(agent.ctx) : null;
+      if (typeof composed === 'string' && composed === preset) {
+        runtime.agentPreset = preset;
+        runtime.agentPresetSessionId = agent.id ?? null;
+        runtime.lastPresetInherit = { inherited: true, preset, at: memory.clock.now(), reason: 'already-composed' };
+        return runtime.lastPresetInherit;
+      }
       const committed = await presets.select(agent, preset);
       runtime.agentPreset = typeof committed === 'string' ? committed : preset;
       runtime.agentPresetSessionId = agent.id ?? null;
@@ -1970,6 +2018,16 @@ export async function apply(ctx, rawConfig = {}) {
 
     // ---- prompt surface ----------------------------------------------------
     if (config.promptSection) {
+      // v1.5.7: independent persona/traits section at the lowest permitted order
+      // (100 = under safety instructions). Memory plugin traits only; siblings own
+      // 150/2000/110/2100 and must not be folded into this block.
+      disposers.push(
+        ctx.systemPrompt.section({
+          name: 'persona',
+          order: 100,
+          text: () => runtime.personaTraitsText(),
+        }),
+      );
       disposers.push(
         ctx.systemPrompt.section({
           name: 'memory',
@@ -2043,6 +2101,124 @@ export async function apply(ctx, rawConfig = {}) {
         );
       }
     }
+
+    // ---- cross-plugin service (v1.5.7) -------------------------------------
+    // Sibling plugins (proactive engine / emotion plugin) call this IN-PROCESS;
+    // user decision 2026-11-05: provide a Cordis service, never an HTTP write API.
+    const serviceDisposers = [];
+    let serviceDisposed = false;
+    let lastServiceMaintenanceAt = 0;
+    const SERVICE_MAINTENANCE_MIN_MS = 30_000;
+    const hippocampusService = {
+      apiVersion: 1,
+      ready: () => !serviceDisposed && runtime.phase === 'ready',
+      capabilities: () => ({
+        ...runtime.capabilities(),
+        /** false after this plugin fiber is disposed; callers must re-resolve the service. */
+        available: !serviceDisposed,
+        l3Traits: 10,
+        service: { remember: true, recall: true, maintenance: true, handoff: true, promptState: true, stats: true },
+      }),
+      async remember(input = {}) {
+        if (serviceDisposed) throw new MemoryError(ErrorCodes.SERVICE_DISPOSED, 'hippocampus service is disposed');
+        if (runtime.phase !== 'ready') throw runtime.notReady('service_remember');
+        if (!input || typeof input !== 'object' || Array.isArray(input)) {
+          throw new MemoryError(ErrorCodes.INVALID_INPUT, 'hippocampus.remember expects one object', { got: typeof input });
+        }
+        const layer = typeof input.layer === 'string' ? input.layer : 'L2';
+        if (layer !== 'L2' && layer !== 'L1') {
+          ctx?.logger?.warn?.(`hippocampus service: layer "${layer}" is not writable; redirecting to L2`);
+        }
+        // v1.5.7: generic decay knob. NO tag-prefix logic lives in this plugin —
+        // the caller decides (e.g. an emotion plugin passing a longer half-life)
+        // and the engine only applies the arithmetic.
+        const customDecayRate = input.customDecayRate;
+        const customHalfLifeDays = input.customHalfLifeDays;
+        if (customDecayRate !== undefined && customHalfLifeDays !== undefined) {
+          throw new MemoryError(ErrorCodes.INVALID_INPUT, 'pass EITHER customDecayRate OR customHalfLifeDays, not both');
+        }
+        let decayRate = null;
+        if (customDecayRate !== undefined) {
+          const rate = Number(customDecayRate);
+          if (!Number.isFinite(rate) || rate <= 0 || rate > 10) {
+            throw new MemoryError(ErrorCodes.INVALID_INPUT, 'customDecayRate must be a finite number in (0, 10]', {
+              got: customDecayRate,
+            });
+          }
+          decayRate = rate;
+        } else if (customHalfLifeDays !== undefined) {
+          const days = Number(customHalfLifeDays);
+          if (!Number.isInteger(days) || days < 1 || days > 36_500) {
+            throw new MemoryError(ErrorCodes.INVALID_INPUT, 'customHalfLifeDays must be an integer in [1, 36500]', {
+              got: customHalfLifeDays,
+            });
+          }
+          decayRate = runtime.config.decay.halfLifeDays / days;
+        }
+        const baseMeta = input.meta && typeof input.meta === 'object' && !Array.isArray(input.meta) ? input.meta : {};
+        const result = await runtime.memory.remember({
+          content: input.content,
+          tags: input.tags,
+          salience: input.salience ?? input.emotionalWeight,
+          pinned: input.pinned,
+          eventTime: input.eventTime,
+          idempotencyKey: input.idempotencyKey,
+          meta: decayRate === null ? baseMeta : { ...baseMeta, decay_rate: decayRate },
+        });
+        return {
+          status: result.status,
+          eventId: result.eventId ?? null,
+          eventTime: result.eventTime ?? null,
+          duplicate: result.duplicate === true,
+          decayRate,
+        };
+      },
+      async recall(query = {}) {
+        if (serviceDisposed) throw new MemoryError(ErrorCodes.SERVICE_DISPOSED, 'hippocampus service is disposed');
+        if (runtime.phase !== 'ready') throw runtime.notReady('service_recall');
+        return runtime.recall(query);
+      },
+      async runMaintenance(source = 'manual') {
+        if (serviceDisposed) throw new MemoryError(ErrorCodes.SERVICE_DISPOSED, 'hippocampus service is disposed');
+        if (runtime.phase !== 'ready') throw runtime.notReady('service_maintenance');
+        if (runtime.maintenanceInFlight) return { ok: false, reason: 'running', code: ErrorCodes.MAINTENANCE_RUNNING };
+        const now = runtime.memory.clock.now();
+        const waitMs = SERVICE_MAINTENANCE_MIN_MS - (now - lastServiceMaintenanceAt);
+        if (source !== 'cron' && waitMs > 0) {
+          return { ok: false, reason: 'rate-limited', retryAfterMs: waitMs, code: ErrorCodes.MAINTENANCE_RUNNING };
+        }
+        lastServiceMaintenanceAt = now;
+        const result = await runtime.runMaintenance(source);
+        return { ok: true, source, ...result };
+      },
+      async stats() {
+        if (serviceDisposed) throw new MemoryError(ErrorCodes.SERVICE_DISPOSED, 'hippocampus service is disposed');
+        return runtime.uiPayload();
+      },
+      handoffView: () => (serviceDisposed ? null : runtime.handoffView()),
+      promptState: () => (serviceDisposed ? null : runtime.promptState()),
+      onDispose(callback) {
+        if (typeof callback !== 'function') return () => {};
+        serviceDisposers.push(callback);
+        return () => {
+          const index = serviceDisposers.indexOf(callback);
+          if (index >= 0) serviceDisposers.splice(index, 1);
+        };
+      },
+    };
+    if (typeof ctx.provide === 'function') {
+      disposers.push(ctx.provide('hippocampus', hippocampusService));
+    }
+    disposers.push(() => {
+      serviceDisposed = true;
+      for (const callback of serviceDisposers.splice(0)) {
+        try {
+          callback();
+        } catch (error) {
+          ctx.logger?.warn?.(`hippocampus: service onDispose failed: ${error?.message ?? error}`);
+        }
+      }
+    });
 
     // ---- UI ----------------------------------------------------------------
     // The visual surface lives in the Client half (ui/client.js): it registers

@@ -109,6 +109,11 @@ export function projectEpisode({ episode, aliases, reinforcement = null }) {
     salience: clamp01(Number(episode.salience ?? 0.5)),
     // v1.5.6: a pinned record never decays (charter: lessons must survive time).
     pinned: episode.meta?.pinned === true,
+    // v1.5.7: generic per-record decay multiplier supplied through the cross-plugin
+    // service (`customDecayRate` / `customHalfLifeDays`). The engine never inspects
+    // tags here; null means "use the policy default".
+    decayRate:
+      Number.isFinite(episode.meta?.decay_rate) && episode.meta.decay_rate > 0 ? episode.meta.decay_rate : null,
     // Federated big-tag metadata (Orchestrator) is META only: it is exposed for the
     // L2 merge / federation layer but is never a tag, so it cannot enter this
     // sub-space's inverted index.

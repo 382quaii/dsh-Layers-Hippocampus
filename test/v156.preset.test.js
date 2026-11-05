@@ -166,6 +166,34 @@ test('a new conversation restores the preset the handoff marker recorded', async
   }
 });
 
+test('an already-composed preset is never re-selected (duplicate tool "subagent" guard)', async () => {
+  const dir = tempDir('preset-already');
+  const { ctx, bus } = createMockHost();
+  const calls = [];
+  ctx.services.set('agentPresets', {
+    composedPreset: () => 'creative',
+    async select(agent, preset) {
+      calls.push({ agentId: agent.id, preset });
+      return preset;
+    },
+  });
+  try {
+    await apply(ctx, { dataDir: dir, maintenanceCron: '0 */6 * * *', autoMaintainOnBoot: false });
+    const runtime = getRuntime(ctx);
+    await runtime.ready;
+    writeMarker(dir, { active: true, sessionId: 'session-old', agentPreset: 'creative', summaryEventId: 'ev_x' });
+    const agent = { id: 'session-new', ctx: { preset: 'creative' } };
+    await bus.emit('agent/created', { agent, source: 'startup' });
+    assert.deepEqual(calls, [], 'select must not run when the preset already matches');
+    assert.equal(runtime.lastPresetInherit.inherited, true);
+    assert.equal(runtime.lastPresetInherit.reason, 'already-composed');
+    assert.equal(runtime.agentPreset, 'creative');
+  } finally {
+    await ctx.dispose();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('resume, same-session and a marker without a preset never re-apply', async () => {
   const dir = tempDir('preset-skip');
   const { ctx, bus } = createMockHost();
