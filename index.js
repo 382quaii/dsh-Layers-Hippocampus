@@ -60,7 +60,7 @@ export { resolveConfig, DEFAULT_CONFIG };
  * of letting a raw 404 reach the user.
  */
 export const CAPABILITIES = Object.freeze({
-  version: '1.5.7',
+  version: '1.6.0',
   spaces: true,
   memories: true,
   transferConsent: true,
@@ -397,6 +397,8 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
    * made the model look like it was rereading the same page.
    */
   runtime.injection = { sessionId: null, ids: new Set(), tags: new Set(), handoffAt: null };
+  // v1.6.0: set on agent/created(startup), consumed by the FIRST prompt assembly.
+  runtime.coldStartPending = false;
   runtime.lastHintTags = [];
   runtime.resetInjection = (sessionId = runtime.injection.sessionId) => {
     runtime.injection = { sessionId, ids: new Set(), tags: new Set(), handoffAt: null };
@@ -436,6 +438,67 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       '[Persona & Traits]',
       ...ranked.map((summary) => `- ${oneLine(summary.title) || 'trait'}: ${oneLine(summary.text)}`),
     ].join('\n');
+  };
+
+  /**
+   * v1.6.0: one-shot cold-start block for a brand-new conversation.
+   *
+   * Two independent switches (user request 2026-11-06):
+   *  - `context.coldStartInjectSummary`   → `[Cold-Start Summary]` (handoff summary
+   *    event, else the top L3 semantic summaries);
+   *  - `context.coldStartInjectRecentTurns` → `[Previous Context Tail]` (last ≤5
+   *    episodes, 200 chars each).
+   * Both off → an empty string, and the static anti-customer-service policy still
+   * keeps the model from the "how may I help you" opener.
+   */
+  runtime.coldStartText = () => {
+    if (runtime.phase !== 'ready' || runtime.coldStartPending !== true) return '';
+    const contextConfig = runtime.config?.context ?? {};
+    if (contextConfig.coldStartInjectSummary !== true && contextConfig.coldStartInjectRecentTurns !== true) return '';
+    try {
+      const view = memory.indexManager.snapshot();
+      const allEvents = Array.isArray(view?.events) ? [...view.events] : [];
+      // Bookkeeping tags (month:/status:) are not conversation topics; keep them out
+      // of the cold-start topic line and the "recent turns" tail.
+      const isBusiness = (event) =>
+        (event?.tags ?? []).some((tag) => !/^(?:month:|status:)/.test(tag?.tag ?? tag ?? ''));
+      const events = allEvents.filter(isBusiness);
+      events.sort((left, right) => (Number(right.eventTime) || 0) - (Number(left.eventTime) || 0));
+      const newest = events[0] ?? null;
+      const latestTopic = newest?.tags?.find((tag) => !/^(?:month:|status:)/.test(tag?.tag ?? tag ?? ''))?.tag ?? 'unknown';
+      const spaces = memory.spaces.status();
+      const activeSpace = spaces?.current ?? 'default';
+      const lines = ['', `[Cold-Start Detected: Active Space=${activeSpace}, Recent Topic=${latestTopic}]`];
+      if (contextConfig.coldStartInjectSummary === true) {
+        let summaryText = '';
+        const handoff = memory.handoffState();
+        if (handoff?.summaryEventId) {
+          const summaryEvent = events.find((event) => event.eventId === handoff.summaryEventId);
+          if (summaryEvent?.content) summaryText = String(summaryEvent.content);
+        }
+        if (!summaryText) {
+          const summaries = typeof memory.semanticStore?.list === 'function' ? memory.semanticStore.list() : [];
+          summaryText = [...summaries]
+            .sort((left, right) => (Number(right.confidence) || 0) - (Number(left.confidence) || 0))
+            .slice(0, 3)
+            .map((summary) => `${summary.title}: ${summary.text}`)
+            .join('\n');
+        }
+        if (summaryText.trim()) {
+          lines.push('[Cold-Start Summary]', summaryText.replace(/\s+/g, ' ').trim().slice(0, 800));
+        }
+      }
+      if (contextConfig.coldStartInjectRecentTurns === true && events.length > 0) {
+        const recent = events
+          .slice(0, 5)
+          .map((event) => `- ${String(event.content ?? '').replace(/\s+/g, ' ').trim().slice(0, 200)}`)
+          .filter((line) => line.length > 2);
+        if (recent.length > 0) lines.push('[Previous Context Tail]', ...recent);
+      }
+      return lines.join('\n');
+    } catch {
+      return '';
+    }
   };
 
   runtime.promptState = () => {
@@ -496,7 +559,15 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
             .filter(Boolean)
             .join('\n')
         : '';
-      return composePrompt({ rules: PROMPT_STATE_RULES, activeTask: activeTaskBlock, blocks, hints }) + marker;
+      // v1.6.0 cold-start block: volatile tail (after the cacheable prefix), injected
+      // exactly once on the first assembly of a brand-new conversation.
+      const coldStart = runtime.coldStartText();
+      if (runtime.coldStartPending === true) runtime.coldStartPending = false;
+      return (
+        composePrompt({ rules: PROMPT_STATE_RULES, activeTask: activeTaskBlock, blocks, hints }) +
+        marker +
+        (coldStart ? `\n${coldStart}` : '')
+      );
     }
     const error = runtime.phaseError ? ` — ${asMemoryError(runtime.phaseError).code}` : '';
     return `Memory state: ${runtime.phase}${error} (not ready: memory tools answer MEM_E_NOT_READY).`;
@@ -1227,6 +1298,9 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       runtime.agentPresetSessionId = sessionId ?? null;
     },
     onAgentCreated: async (payload) => {
+      // v1.6.0: a brand-new conversation needs one cold-start injection on its first
+      // prompt assembly (summary and/or previous turns, each behind its own flag).
+      if (payload?.source === 'startup') runtime.coldStartPending = true;
       // Track the mode this session actually runs in (a session may be created with
       // a preset without emitting a change event).
       try {
@@ -2071,6 +2145,11 @@ export async function apply(ctx, rawConfig = {}) {
           order: 2455,
           text: () =>
             [
+              // v1.6.0 anti-"customer service" wake-up. Static text on purpose: it must
+              // be present even when both cold-start injection switches are off.
+              '【🚨 状态唤醒】你不是一个初次见面的 AI 客服。通过本地海马体，你拥有与用户的长期连续记忆。如果你看到这条提示，请立刻回顾你的 L3 语义层与历史日记。不要用“请问有什么可以帮您”这种废话开场。请直接调用 ' +
+                `${config.toolPrefix}_recall 获取最近话题，用你一贯的极客风格，自然地接续你们之前的对话或打个招呼。`,
+              '',
               `【读取与检索纪律】当需要回忆历史、查阅文件、获取系统信息时，**必须优先调用 ${config.toolPrefix}_recall 工具**，严禁直接盲目读取外部超长文件或调用其他原生工具输出全文。`,
               `若 ${config.toolPrefix}_recall 返回了 [Slimmed] 标记，说明内容已被智能瘦身：如无绝对必要，请基于瘦身摘要和关键实体回答；若确实需要全文，请通过返回的 recovery_hash 指针再次向海马体请求原文（${config.toolPrefix}_recall mode="deep_raw", hash=...）。`,
               '',

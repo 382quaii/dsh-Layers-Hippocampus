@@ -270,7 +270,8 @@ L2.5 趋势隔离 / 幽灵节点 / 上下文分页 / cron+dream 单一闸门 / �
 - ✅ **通用衰减参数（替代 M4，2026-11-05）**：`remember()` 支持 `customDecayRate`（(0,10]）或 `customHalfLifeDays`（[1,36500]），二选一；统一转成 `meta.decay_rate` 存条目，`projectEpisode` 暴露 `decayRate`，检索按 `halfLife/rate` 计算该条目的衰减。**记忆插件内零标签前缀判断**，情感长效保留由调用方传参。
 - ✅ **M3 Persona 独立注入区（2026-11-05）**：新增 prompt section `persona` order=100，从 L3 语义日志实时取 confidence 最高 ≤10 条渲染 `[Persona & Traits]`；`memory:policy`(2455)/`memory`(2450)/`memory:reflection`(2460) 不变。
 - ✅ **profile 重复挂载清理（2026-11-04）**：desktop `cordis.patch.yml` 的旧 `- id: memory` 行已证明为 unaddressable no-op（实时只有 `include:hippocampus`），已删除并备份 `cordis.patch.yml.bak-20261104-221007-dedupe`。
-- **测试**：`dsh-memory` **411/411**（64 文件）；`dsh-orchestrator` **31/31**。
+- ✅ **冷启动防呆与注入开关（1.6.0，2026-11-06）**：`memory:policy` 静态前缀新增【状态唤醒】（禁止客服腔、先回看 L3 再 recall、自然接续）；新会话首轮附加 `[Cold-Start Detected: Active Space=…, Recent Topic=…]`，按两个独立开关注入 `[Cold-Start Summary]`（`context.coldStartInjectSummary`，默认 true；交接摘要优先、回退 L3 top3，≤800 字）与 `[Previous Context Tail]`（`context.coldStartInjectRecentTurns`，默认 false；最近 ≤5 条业务事件，每条 ≤200 字）。双关时不注入任何历史块，静态防呆仍在；冷启动块只在易变尾巴、每会话消费一次。5 个用例 `test/v160.coldStart.test.js`。
+- **测试**：`dsh-memory` **416/416**（64 文件）；`dsh-orchestrator` **31/31**。
 - **M3 待确认**：审计表 A21 称 `[Persona & Traits]` 在 `memory`(2450) 区块内，但当前代码无该 section（只有 memory/policy/reflection），需确认是“新功能”还是审计误读；M4 `emotion:*` 50% 衰减豁免未在 `decay.js` 实现，待裁决。
 - ✅ **版本冻结 1.5.7 + 本地发布卫生**：`package.json` 升到 1.5.7（后续不再升版本号）；本地 commit `release: v1.5.7 …` + tag `v1.5.7`（**未 push**）。
 - **仍未完成**：`git push` → npm publish（两个包）→ 市场目录 PR（需 GitHub/npm 凭据）。

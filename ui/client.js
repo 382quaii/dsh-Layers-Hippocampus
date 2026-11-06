@@ -2518,6 +2518,8 @@
             autoNewSession: (config.context && config.context.autoNewSession) !== false,
             autoNewSessionPoll: (config.context && config.context.autoNewSessionPoll) === 'once' ? 'once' : 'interval',
             autoNewSessionIntervalSeconds: Number((config.context && config.context.autoNewSessionIntervalSeconds) ?? 15),
+            coldStartInjectSummary: (config.context && config.context.coldStartInjectSummary) !== false,
+            coldStartInjectRecentTurns: (config.context && config.context.coldStartInjectRecentTurns) === true,
             nativeTokenLimit: Number((config.context && config.context.nativeTokenLimit) ?? 8000),
             // Security red line (v1.5.1): default TRUE, only an explicit operator
             // choice may turn the engine-level consent gate off.
@@ -2892,6 +2894,8 @@
             'context.autoNewSession': Boolean(draft.context.autoNewSession),
             'context.autoNewSessionPoll': draft.context.autoNewSessionPoll === 'once' ? 'once' : 'interval',
             'context.autoNewSessionIntervalSeconds': Number(draft.context.autoNewSessionIntervalSeconds),
+            'context.coldStartInjectSummary': Boolean(draft.context.coldStartInjectSummary),
+            'context.coldStartInjectRecentTurns': Boolean(draft.context.coldStartInjectRecentTurns),
             'context.autoRolloverThreshold': Number(draft.context.autoRolloverThreshold),
             'context.nativeTokenLimit': Number(draft.context.nativeTokenLimit),
             'context.requireExplicitConsentForTransfer': Boolean(draft.context.requireExplicitConsentForTransfer),
@@ -3449,6 +3453,20 @@
               hint: '交接标记生效后，客户端调用宿主 uiWorkspace.startSession() 打开一个新会话（工作模式与摘要自动带入）；关闭则只提示、由你手动新建。',
               checked: draft.context.autoNewSession,
               onChange: (value) => edit('context.autoNewSession', value),
+              disabled,
+            }),
+            h(Toggle, {
+              label: '上下文总结注入（context.coldStartInjectSummary）',
+              hint: '开启后，新对话将自动载入之前的记忆摘要（交接摘要优先，其次 L3 语义），让 AI 无缝接续；想彻底空白开局可关闭。',
+              checked: draft.context.coldStartInjectSummary,
+              onChange: (value) => edit('context.coldStartInjectSummary', value),
+              disabled,
+            }),
+            h(Toggle, {
+              label: '前几轮原话注入（context.coldStartInjectRecentTurns）',
+              hint: '开启后，新对话会强行带上之前最后 5 条记忆片段，适合极速上下文顶替；这会增加初始 Token 消耗。',
+              checked: draft.context.coldStartInjectRecentTurns,
+              onChange: (value) => edit('context.coldStartInjectRecentTurns', value),
               disabled,
             }),
             h(Select, {

@@ -188,6 +188,11 @@ export const DEFAULT_CONFIG = Object.freeze({
     // per page load (no recurring traffic).
     autoNewSessionPoll: 'interval',
     autoNewSessionIntervalSeconds: 15,
+    // v1.6.0 cold-start injection switches (user request 2026-11-06):
+    //  - summary: inject the previous handoff/L3 summary so the first turn inherits context
+    //  - recentTurns: inject the last few verbatim-ish episodes (costs more start tokens)
+    coldStartInjectSummary: true,
+    coldStartInjectRecentTurns: false,
     // REMOVED in v1.5.3: `minInjectConfidence`. It never demonstrably saved tokens
     // (0.6 vs 0 produced byte-identical payloads) and every hit-shaping pass is a
     // permanent token tax; keeping a misleading knob is worse than having none.
@@ -568,6 +573,18 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
       : contextIn.autoNewSessionIntervalSeconds,
     'context.autoNewSessionIntervalSeconds',
     { min: 5, max: 3600 },
+  );
+  const contextColdStartInjectSummary = requireBoolean(
+    contextIn.coldStartInjectSummary === undefined
+      ? defaults.context.coldStartInjectSummary
+      : contextIn.coldStartInjectSummary,
+    'context.coldStartInjectSummary',
+  );
+  const contextColdStartInjectRecentTurns = requireBoolean(
+    contextIn.coldStartInjectRecentTurns === undefined
+      ? defaults.context.coldStartInjectRecentTurns
+      : contextIn.coldStartInjectRecentTurns,
+    'context.coldStartInjectRecentTurns',
   );
   // REMOVED KEY (v1.5.3), loud on purpose: nested groups normally ignore unknown
   // keys, but silently ignoring a removed confidence knob would let a profile run
@@ -1055,6 +1072,9 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
       autoNewSession: contextAutoNewSession,
       autoNewSessionPoll: contextAutoNewSessionPoll,
       autoNewSessionIntervalSeconds: contextAutoNewSessionIntervalSeconds,
+      // v1.6.0 cold-start injection switches (independent booleans).
+      coldStartInjectSummary: contextColdStartInjectSummary,
+      coldStartInjectRecentTurns: contextColdStartInjectRecentTurns,
       // v1.5.0 routing knobs below; v1.5.3 removed minInjectConfidence entirely.
       autoSpaceFollow: contextAutoSpaceFollow,
       autoRolloverEnabled: contextAutoRolloverEnabled,

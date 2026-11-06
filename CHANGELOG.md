@@ -4,7 +4,30 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] — 2026-11-06
+
+**Version un-frozen (user directive 2026-11-06): 1.6.0 is the current release.**
+Cold-start wake-up + user-controlled cold-start injection:
+
+- **Anti-"customer service" wake-up** (static `memory:policy` prefix): the model is
+  told it has continuous long-term memory, must not open with "how may I help you",
+  and should recall the recent topic before replying.
+- **`context.coldStartInjectSummary`** (default **true**): on the first prompt
+  assembly of a brand-new conversation, inject `[Cold-Start Summary]` — the handoff
+  summary event when present, else the top-3 L3 semantic summaries (≤800 chars).
+- **`context.coldStartInjectRecentTurns`** (default **false**): inject
+  `[Previous Context Tail]` with the last ≤5 business episodes (200 chars each).
+- **`[Cold-Start Detected: Active Space=…, Recent Topic=…]`** header when either
+  switch is on; the block is volatile-tail only (prompt-cache prefix untouched) and
+  is consumed exactly once per new conversation.
+- Both switches off → no historical blocks; the static wake-up policy still ships.
+- UI: two independent toggles in the settings page's session group; HTTP-editable.
+- **416 tests green** (64 files).
+
 ## [1.5.7] — 2026-11-04
+
+> Historical note: 1.5.7 shipped under a temporary version freeze that the
+> 2026-11-06 directive superseded (current version: 1.6.0).
 
 **Version freeze: 1.5.7 is the shipped release; no further version bumps follow.**
 This release folds in everything added after the 1.5.6 draft — Orchestrator

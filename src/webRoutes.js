@@ -89,6 +89,9 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   'context.autoNewSession',
   'context.autoNewSessionPoll',
   'context.autoNewSessionIntervalSeconds',
+  // v1.6.0 cold-start injection switches (independent; default summary on, turns off).
+  'context.coldStartInjectSummary',
+  'context.coldStartInjectRecentTurns',
   // v1.5.6 L2 multi-merge tunables (offline maintain phase).
   'l2Merge.enabled',
   'l2Merge.minGroupSize',
