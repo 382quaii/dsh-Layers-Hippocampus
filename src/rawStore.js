@@ -842,13 +842,58 @@ export class RawStore {
   stats() {
     const shards = this.listShards();
     const indexedShards = shards.filter((name) => readIndex(path.join(this.dir, name)) !== null).length;
+    const archives = this.archive.listArchives();
+    let archivedBytes = 0;
+    const archiveMonths = [];
+    for (const name of archives) {
+      try {
+        archivedBytes += fs.statSync(path.join(this.dir, name)).size;
+      } catch {
+        /* removed mid-read */
+      }
+      archiveMonths.push({
+        name,
+        month: name.slice('raw-archive-'.length, 'raw-archive-'.length + 7),
+        engine: name.endsWith('.zst') ? 'zstd' : 'gzip',
+        bytes: (() => {
+          try {
+            return fs.statSync(path.join(this.dir, name)).size;
+          } catch {
+            return 0;
+          }
+        })(),
+      });
+    }
+    const plaintextBytes = this.totalBytes();
+    const archiveState = this.archive.readState();
+    let savedBytes = 0;
+    let beforeKnown = 0;
+    let afterKnown = 0;
+    for (const record of Object.values(archiveState.archives ?? {})) {
+      if (Number.isFinite(record?.bytesBefore) && Number.isFinite(record?.bytesAfter)) {
+        beforeKnown += record.bytesBefore;
+        afterKnown += record.bytesAfter;
+        savedBytes += Math.max(0, record.bytesBefore - record.bytesAfter);
+      }
+    }
+    const compressionRatio = beforeKnown > 0 ? Math.round((afterKnown / beforeKnown) * 1000) / 1000 : null;
     return {
       shards: shards.length,
       indexedShards,
-      bytes: this.totalBytes(),
+      bytes: plaintextBytes,
       newest: shards.at(-1) ?? null,
       oldest: shards[0] ?? null,
       tombstones: this._loadTombstones().size,
+      archiveCount: archives.length,
+      archivedBytes,
+      totalBytes: plaintextBytes + archivedBytes,
+      archiveMonths: archiveMonths.slice(-12),
+      engines: {
+        gzip: archiveMonths.filter((entry) => entry.engine === 'gzip').length,
+        zstd: archiveMonths.filter((entry) => entry.engine === 'zstd').length,
+      },
+      savedBytes,
+      compressionRatio,
     };
   }
 }

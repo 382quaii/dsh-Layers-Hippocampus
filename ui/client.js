@@ -2062,6 +2062,7 @@
         const generations = panel.generations || {};
         const graphInfo = panel.graph || {};
         const tagTreeInfo = panel.tagTree || {};
+        const rawInfo = panel.raw || {};
         const session = panel.session || null;
         const spaces = panel.spaces || null;
         const spaceIds = spaceList || (spaces && Array.isArray(spaces.ids) ? spaces.ids : [activeSpace]);
@@ -2169,6 +2170,26 @@
                 label: '标签树',
                 value: `${fmtNumber(tagTreeInfo.nodeCount)} 节点`,
                 hint: `幽灵 ${fmtNumber(tagTreeInfo.ghostCount)} · 待修剪 ${fmtNumber(tagTreeInfo.pendingQueue)}`,
+              }),
+              h(StatCard, {
+                label: 'raw 索引覆盖',
+                value:
+                  rawInfo.shards > 0
+                    ? `${fmtNumber(rawInfo.indexedShards || 0)} / ${fmtNumber(rawInfo.shards)}`
+                    : '—',
+                hint:
+                  rawInfo.compressionRatio !== null && rawInfo.compressionRatio !== undefined
+                    ? `归档压缩率 ${Math.round(rawInfo.compressionRatio * 100)}%`
+                    : '稀疏行索引（.idx.json）',
+              }),
+              h(StatCard, {
+                label: 'raw 冷归档',
+                value: rawInfo.archiveCount === undefined ? '—' : `${fmtNumber(rawInfo.archiveCount)} 个月`,
+                hint:
+                  rawInfo.archiveCount === undefined
+                    ? '旧宿主未上报'
+                    : `gzip ${fmtNumber(rawInfo.engines?.gzip || 0)} · zstd ${fmtNumber(rawInfo.engines?.zstd || 0)}` +
+                      (rawInfo.savedBytes ? ` · 省 ${fmtBytes(rawInfo.savedBytes)}` : ''),
               }),
             ),
           ),

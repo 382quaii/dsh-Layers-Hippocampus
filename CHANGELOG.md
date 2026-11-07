@@ -26,6 +26,14 @@ resumes; 1.6.1 is the current release (patch on top of 1.6.0).**
   `archiveErrors`/`notes: archive-corrupt:<name>` for a corrupt archive, and keep
   plaintext `.jsonl` reads unchanged. `raw.retentionDays` default moves **30 → 90**
   and must stay strictly above `archiveAfterDays` (fail-fast otherwise).
+- **`/stats` panel: archive + index visualization**: `panel.raw` now reports
+  `archiveCount`, `archivedBytes`, `totalBytes`, `archiveMonths`, `engines`
+  (`{gzip,zstd}`), `savedBytes` (sum of bytesBefore−bytesAfter), `compressionRatio`
+  (null when no measured archive) and `indexedShards`. Each archive records
+  `bytesBefore`/`bytesAfter` in `state/raw-archive.json`, so the ratio and saved
+  bytes are real measurements, not estimates. The panel gains two StatCards
+  (“raw 索引覆盖”, “raw 冷归档”) with graceful “—” for an older host; 3 cases in
+  `test/v161.stats.test.js`.
 - **Sparse line index for raw shards** (performance audit item C): one
   `<day>.jsonl.idx.json` per shard, sampled every 64 lines with
   `{line, offset, timestamp}` plus `bytes/mtimeMs/lineCount/minTs/maxTs/sorted`.
@@ -59,7 +67,7 @@ resumes; 1.6.1 is the current release (patch on top of 1.6.0).**
   (`O(K log K)` ordering) but the per-candidate decay/similarity work is skipped
   for the long low-salience tail.
 - Regression: pinned decay stays exactly 1 (bypass path), monthly memos unchanged.
-- **442 tests green** (64 files).
+- **446 tests green** (64 files).
 
 ## [1.6.0] — 2026-11-06
 

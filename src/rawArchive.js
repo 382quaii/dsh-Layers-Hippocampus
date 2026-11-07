@@ -108,6 +108,7 @@ export class RawArchive {
     }
     const archived = [];
     const skipped = [];
+    const archiveStats = new Map();
     const existing = new Set(this.listArchives().map((name) => name.slice(ARCHIVE_PREFIX.length, ARCHIVE_PREFIX.length + 7)));
     let bytes = 0;
     for (const [month, days] of byMonth) {
@@ -124,6 +125,13 @@ export class RawArchive {
         skipped.push(month);
         continue;
       }
+      const bytesBefore = sources.reduce((sum, day) => {
+        try {
+          return sum + fs.statSync(path.join(this.rawDir, `${day}.jsonl`)).size;
+        } catch {
+          return sum;
+        }
+      }, 0);
       try {
         await mergeShardsToArchive({
           files: sources.map((day) => path.join(this.rawDir, `${day}.jsonl`)),
@@ -132,14 +140,16 @@ export class RawArchive {
         });
         for (const day of sources) fs.rmSync(path.join(this.rawDir, `${day}.jsonl`), { force: true });
         archived.push(month);
-        bytes += fs.existsSync(target) ? fs.statSync(target).size : 0;
+        const targetBytes = fs.existsSync(target) ? fs.statSync(target).size : 0;
+        bytes += targetBytes;
+        archiveStats.set(month, { bytesBefore, bytesAfter: targetBytes });
       } catch (error) {
         skipped.push(`${month}:${error?.code ?? error?.message ?? 'failed'}`);
       }
     }
     if (archived.length > 0) {
       const archives = { ...(state.archives ?? {}) };
-      for (const month of archived) archives[month] = { name: archiveName(month, resolved.engine), at: now, engine: resolved.engine };
+      for (const month of archived) archives[month] = { name: archiveName(month, resolved.engine), at: now, engine: resolved.engine, ...(archiveStats.get(month) ?? {}) };
       writeJsonAtomic(this.archiveFile, { lastRunAt: now, archives });
     }
     return { archived, month: archived[0] ?? null, bytes, skipped, engine: resolved.engine, fallback: resolved.fallback };

@@ -47,6 +47,16 @@ test('the engine card uses the Select component and statsPayload capabilities', 
   assert.match(card, /statsPayload && statsPayload\.capabilities && statsPayload\.capabilities\.compression/);
 });
 
+test('the panel renders the archive/index StatCards from panel.raw', () => {
+  assert.match(source, /const rawInfo = panel\.raw \|\| \{\};/, 'panel reads raw stats defensively');
+  assert.match(source, /label: 'raw 索引覆盖'/);
+  assert.match(source, /label: 'raw 冷归档'/);
+  assert.match(source, /rawInfo\.indexedShards/);
+  assert.match(source, /rawInfo\.archiveCount/);
+  assert.match(source, /rawInfo\.compressionRatio/);
+  assert.match(source, /fmtBytes\(rawInfo\.savedBytes\)/, 'saved bytes are humanised');
+});
+
 test('the enable/disable buttons toggle rawCompressionEngine only', () => {
   assert.match(source, /启用 Zstd（内置引擎）/);
   assert.match(source, /停用 Zstd（切回 Gzip）/);
