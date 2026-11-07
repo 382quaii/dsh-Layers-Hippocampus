@@ -271,9 +271,10 @@ L2.5 趋势隔离 / 幽灵节点 / 上下文分页 / cron+dream 单一闸门 / �
 - ✅ **M3 Persona 独立注入区（2026-11-05）**：新增 prompt section `persona` order=100，从 L3 语义日志实时取 confidence 最高 ≤10 条渲染 `[Persona & Traits]`；`memory:policy`(2455)/`memory`(2450)/`memory:reflection`(2460) 不变。
 - ✅ **profile 重复挂载清理（2026-11-04）**：desktop `cordis.patch.yml` 的旧 `- id: memory` 行已证明为 unaddressable no-op（实时只有 `include:hippocampus`），已删除并备份 `cordis.patch.yml.bak-20261104-221007-dedupe`。
 - ✅ **冷启动防呆与注入开关（1.6.0，2026-11-06）**：`memory:policy` 静态前缀新增【状态唤醒】（禁止客服腔、先回看 L3 再 recall、自然接续）；新会话首轮附加 `[Cold-Start Detected: Active Space=…, Recent Topic=…]`，按两个独立开关注入 `[Cold-Start Summary]`（`context.coldStartInjectSummary`，默认 true；交接摘要优先、回退 L3 top3，≤800 字）与 `[Previous Context Tail]`（`context.coldStartInjectRecentTurns`，默认 false；最近 ≤5 条业务事件，每条 ≤200 字）。双关时不注入任何历史块，静态防呆仍在；冷启动块只在易变尾巴、每会话消费一次。5 个用例 `test/v160.coldStart.test.js`。
-- ✅ **检索上限剪枝（1.7.0，2026-11-07，性能审计 A）**：每个命中分数 = `salience × decay × tagAffinity(≤3) × lexicalBoost(≤1) × association(≤1) × timeBoost(≤1.3) × handoff(≤1)`，故 `salience × 3.9` 是硬上界；候选按 salience 降序访问，一旦上界打不过当前第 k 名分数即停止评分（严格 `<` 保证并列仍被访问）。pinned 命中绕过剪枝，best-k 窗口保证上界精确；结果带 `pruned` 与 `notes: pruned:<n>`。最坏复杂度仍为 O(K log K)（排序），但长尾候选的 decay/similarity 计算被跳过。4 个用例 `test/v170.pruning.test.js`。
-- ✅ **版本解冻（2026-11-07）**：移除 1.5.7 的“版本冻结/不再升版本号”表述，自 1.6.0 起恢复语义化版本节奏；当前 **1.7.0**。
+- ✅ **检索上限剪枝（1.6.1，2026-11-07，性能审计 A）**：每个命中分数 = `salience × decay × tagAffinity(≤3) × lexicalBoost(≤1) × association(≤1) × timeBoost(≤1.3) × handoff(≤1)`，故 `salience × 3.9` 是硬上界；候选按 salience 降序访问，一旦上界打不过当前第 k 名分数即停止评分（严格 `<` 保证并列仍被访问）。pinned 命中绕过剪枝，best-k 窗口保证上界精确；结果带 `pruned` 与 `notes: pruned:<n>`。最坏复杂度仍为 O(K log K)（排序），但长尾候选的 decay/similarity 计算被跳过。4 个用例 `test/v170.pruning.test.js`。
+- ✅ **段记 Token 审计（1.6.1，2026-11-07）**：`docs/AUDIT-2026-11-07-segment-token.md` — 无 P0 重复注入；6 个注入面分别有会话级/标签级去重；记录 2 个 P3 优化点（Active Task 跨面去重、Persona 按 L3 版本 memo）。
+- ✅ **版本解冻（2026-11-07）**：移除 1.5.7 的“版本冻结/不再升版本号”表述，自 1.6.0 起恢复语义化版本节奏；当前 **1.6.1**。
 - **测试**：`dsh-memory` **420/420**（64 文件）；`dsh-orchestrator` **31/31**。
 - **M3/M4 状态更新**：M3 已落地（独立 `persona` section order=100）；M4 已改为通用 `customDecayRate`/`customHalfLifeDays`，由情感插件调用时传参，插件内不再判断 `emotion:` 前缀。
-- ✅ **版本冻结 1.5.7 + 本地发布卫生**（历史，2026-11-04）：`package.json` 升到 1.5.7；本地 commit `release: v1.5.7 …` + tag `v1.5.7`（**未 push**）。该冻结已于 2026-11-07 解除，当前 1.7.0。
+- ✅ **版本冻结 1.5.7 + 本地发布卫生**（历史，2026-11-04）：`package.json` 升到 1.5.7；本地 commit `release: v1.5.7 …` + tag `v1.5.7`（**未 push**）。该冻结已于 2026-11-07 解除，当前 1.6.1。
 - **仍未完成**：`git push` → npm publish（两个包）→ 市场目录 PR（需 GitHub/npm 凭据）。

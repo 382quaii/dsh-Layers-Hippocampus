@@ -1,6 +1,6 @@
-# Release 1.7.0 — 发布准备（本地）
+# Release 1.6.1 — 发布准备（本地）
 
-> 版本：**1.7.0**（2026-11-07：全面解除 1.5.7 的版本冻结，恢复语义化版本；本版新增检索上限剪枝）。
+> 版本：**1.6.1**（2026-11-07：全面解除 1.5.7 的版本冻结，恢复语义化版本；本版新增检索上限剪枝与段记 Token 审计）。
 
 > 状态：**代码与文档已就绪；仓库推送 / npm 发布 / 市场 PR 需要你的 GitHub 与 npm 凭据，代理与网络，本会话未执行。**
 > 基线：`dsh-memory` 工作区，全量 **420/420 测试通过**（64 个测试文件；另有 `dsh-orchestrator` 31/31）。
@@ -8,7 +8,8 @@
 
 ## 本版内容
 
-- **A 检索上限剪枝（1.7.0 新增）**：命中分数上界 `salience × 3.9`（tagAffinity≤3、timeBoost≤1.3 等因子封顶），候选按 salience 降序访问，上界打不过第 k 名即停止评分；pinned 绕过剪枝；`pruned`/`notes` 可观测；4 个用例 `test/v170.pruning.test.js`。
+- **A 检索上限剪枝（1.6.1 新增）**：命中分数上界 `salience × 3.9`（tagAffinity≤3、timeBoost≤1.3 等因子封顶），候选按 salience 降序访问，上界打不过第 k 名即停止评分；pinned 绕过剪枝；`pruned`/`notes` 可观测；4 个用例 `test/v170.pruning.test.js`。
+- **段记 Token 审计（1.6.1）**：`docs/AUDIT-2026-11-07-segment-token.md` 证明无 P0 重复注入，列出 6 个注入面与 2 个 P3 优化点。
 - **版本解冻（2026-11-07）**：删除全部“版本冻结/不再升版本号”表述，自 1.6.0 起恢复正常版本节奏。
 - **P0-1** `deep_raw` 按行游标扫描：`readLinesReverse()` 64 KiB 反向分块、逐行产出；`hit.line` 仍为绝对行号；引擎结果硬上限 `MAX_SCAN_RESULTS=500`；`restoreByHash` / tombstone / hash 读取全部流式化。
 - **P0-2** maintain 事件循环延迟监控：`perf_hooks.monitorEventLoopDelay`，阶段间 `yieldIfLagging()`（>100ms 让出 50ms），报告 `eventLoop:{maxMs,p99Ms,yields}`。
@@ -25,7 +26,7 @@
 
 ## 发布步骤（需要你执行）
 
-> 两个包：`dsh-layers-hippocampus@1.7.0`（已解冻，已有 git remote）与
+> 两个包：`dsh-layers-hippocampus@1.6.1`（已解冻，已有 git remote）与
 > `dsh-layers-orchestrator@0.1.0`（**目前不是 git 仓库**，需先 init/建远端）。
 > 全部命令在 PowerShell 下执行；`node`/`npm`/`pnpm` 用 DSH runtime 自带的绝对路径。
 
@@ -48,10 +49,10 @@ npm pack --dry-run               # 预检实际发布内容（含/不含不该�
 cd C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory
 git add -A
 git status --short                 # 最后确认没有 node_modules / state / 测试临时目录
-git commit -m "release: v1.7.0 — recall bound pruning; version un-frozen; cold-start, persona, custom decay included"
+git commit -m "release: v1.6.1 — recall bound pruning; segment-token audit; version un-frozen"
 
-# 历史 tag 已存在（v1.5.5 / v1.5.7 / v1.6.0）；本次新增 v1.7.0
-git tag -a v1.7.0 -m "v1.7.0: recall bound-based early exit; version un-frozen"
+# 历史 tag 已存在（v1.5.5 / v1.5.7 / v1.6.0）；本次新增 v1.6.1
+git tag -a v1.6.1 -m "v1.6.1: recall bound-based early exit; segment-token audit; version un-frozen"
 git push origin main --follow-tags
 ```
 

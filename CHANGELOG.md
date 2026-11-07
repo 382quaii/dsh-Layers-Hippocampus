@@ -4,10 +4,15 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.7.0] — 2026-11-07
+## [1.6.1] — 2026-11-07
 
 **Version fully un-frozen (user directive 2026-11-07): normal semantic versioning
-resumes; 1.7.0 is the current release.**
+resumes; 1.6.1 is the current release (patch on top of 1.6.0).**
+
+- **Segment-token audit** (`docs/AUDIT-2026-11-07-segment-token.md`): no P0
+  same-segment re-injection exists; the six injection surfaces are documented with
+  their dedup mechanisms. Two P3 optimizations recorded (Active-Task cross-surface
+  dedup; Persona render memoization), not applied yet.
 
 - **Recall bound-based early exit** (performance audit item A): every score is
   `salience × decay × tagAffinity(≤3) × lexicalBoost(≤1) × association(≤1) ×
@@ -46,7 +51,7 @@ Cold-start wake-up + user-controlled cold-start injection:
 
 > Historical note: 1.5.7 shipped under a temporary version freeze; the 2026-11-07
 > directive removed ALL freeze language and resumed normal semantic versioning
-> (current version: 1.7.0). The sentence below is the historical 1.5.7 statement.
+> (current version: 1.6.1). The sentence below is the historical 1.5.7 statement.
 
 **Version freeze (historical, superseded): 1.5.7 was the shipped release.**
 This release folds in everything added after the 1.5.6 draft — Orchestrator
