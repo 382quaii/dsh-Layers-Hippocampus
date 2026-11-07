@@ -123,6 +123,7 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   'raw.maxTotalMb',
   'raw.retentionDays',
   'raw.archiveAfterDays',
+  'raw.compressionEngine',
   'raw.maxScanMb',
   'raw.maxScanTurns',
   'raw.maxResultTokens',

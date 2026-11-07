@@ -15,9 +15,16 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import zlib from 'node:zlib';
 import readline from 'node:readline';
 import { ensureDir, readJson, writeJsonAtomic } from './util.js';
+import {
+  archiveExtension,
+  createCompressStream,
+  createDecompressStream,
+  engineForArchive,
+  isArchiveFile,
+  resolveEngine,
+} from './compression.js';
 
 export const ARCHIVE_PREFIX = 'raw-archive-';
 const MONTH_MS = 30 * 86_400_000;
@@ -26,12 +33,12 @@ export function archiveMonthOf(day) {
   return String(day).slice(0, 7); // YYYY-MM
 }
 
-export function archiveName(month) {
-  return `${ARCHIVE_PREFIX}${month}.jsonl.gz`;
+export function archiveName(month, engine = 'gzip') {
+  return `${ARCHIVE_PREFIX}${month}${archiveExtension(engine)}`;
 }
 
 export function isArchiveName(name) {
-  return /^raw-archive-\d{4}-\d{2}\.jsonl\.gz$/.test(name);
+  return isArchiveFile(name);
 }
 
 export class RawArchive {
@@ -85,12 +92,13 @@ export class RawArchive {
    * Build (or extend) the month archive from eligible shards.
    * @returns {Promise<{ archived: string[], month: string|null, bytes: number, skipped: string[], reason?: string }>}
    */
-  async archive({ shards, eligible, now = this.clock.now() }) {
+  async archive({ shards, eligible, now = this.clock.now(), engine = 'gzip' }) {
     const state = this.readState();
     const monthGateMs = Number(state.lastRunAt ?? 0);
     if (monthGateMs > 0 && now - monthGateMs < MONTH_MS) {
       return { archived: [], month: null, bytes: 0, skipped: [], reason: 'monthly-gate' };
     }
+    const resolved = resolveEngine(engine);
     const byMonth = new Map();
     for (const day of eligible) {
       const month = archiveMonthOf(day);
@@ -100,9 +108,16 @@ export class RawArchive {
     }
     const archived = [];
     const skipped = [];
+    const existing = new Set(this.listArchives().map((name) => name.slice(ARCHIVE_PREFIX.length, ARCHIVE_PREFIX.length + 7)));
     let bytes = 0;
     for (const [month, days] of byMonth) {
-      const name = archiveName(month);
+      if (existing.has(month)) {
+        // A month already has an archive (any engine): re-merging would duplicate rows
+        // in deep_raw, so the old archive stays authoritative.
+        skipped.push(`${month}:already-archived`);
+        continue;
+      }
+      const name = archiveName(month, resolved.engine);
       const target = this.archivePath(name);
       const sources = days.filter((day) => shards.includes(`${day}.jsonl`)).sort();
       if (sources.length === 0) {
@@ -110,9 +125,10 @@ export class RawArchive {
         continue;
       }
       try {
-        await mergeShardsToGzip({
+        await mergeShardsToArchive({
           files: sources.map((day) => path.join(this.rawDir, `${day}.jsonl`)),
           target,
+          engine: resolved.engine,
         });
         for (const day of sources) fs.rmSync(path.join(this.rawDir, `${day}.jsonl`), { force: true });
         archived.push(month);
@@ -123,52 +139,54 @@ export class RawArchive {
     }
     if (archived.length > 0) {
       const archives = { ...(state.archives ?? {}) };
-      for (const month of archived) archives[month] = { name: archiveName(month), at: now };
+      for (const month of archived) archives[month] = { name: archiveName(month, resolved.engine), at: now, engine: resolved.engine };
       writeJsonAtomic(this.archiveFile, { lastRunAt: now, archives });
     }
-    return { archived, month: archived[0] ?? null, bytes, skipped };
+    return { archived, month: archived[0] ?? null, bytes, skipped, engine: resolved.engine, fallback: resolved.fallback };
   }
 }
 
 /**
- * Concatenate `files` into ONE gzip line stream. The write is crash-safe: gzip is
- * produced at `<target>.tmp` and renamed only after it is fully flushed.
+ * Concatenate `files` into ONE compressed line stream (engine: gzip | zstd). The
+ * write is crash-safe: output goes to `<target>.tmp` and is renamed only after the
+ * compressor has fully flushed.
  */
-export async function mergeShardsToGzip({ files, target }) {
+export async function mergeShardsToArchive({ files, target, engine = 'gzip' }) {
   ensureDir(path.dirname(target));
   const tmp = `${target}.tmp`;
   const out = fs.createWriteStream(tmp);
-  const gzip = zlib.createGzip({ level: 6 });
+  const compressor = createCompressStream(engine);
   const finished = new Promise((resolve, reject) => {
     out.on('error', reject);
     out.on('finish', resolve);
-    gzip.on('error', reject);
+    compressor.on('error', reject);
   });
-  gzip.pipe(out);
+  compressor.pipe(out);
   for (const file of files) {
     const input = fs.createReadStream(file);
     const rl = readline.createInterface({ input, crlfDelay: Infinity });
     for await (const line of rl) {
       if (!line.trim()) continue;
-      if (!gzip.write(`${line}\n`)) {
-        await new Promise((resolve) => gzip.once('drain', resolve));
+      if (!compressor.write(`${line}\n`)) {
+        await new Promise((resolve) => compressor.once('drain', resolve));
       }
     }
   }
-  gzip.end();
+  compressor.end();
   await finished;
   fs.renameSync(tmp, target);
   return target;
 }
 
 /**
- * Stream one gzip archive line by line, calling `onLine(record)` until it returns
- * `false`. Peak memory is one chunk plus one line — never the archive.
+ * Stream one archive line by line, calling `onLine(record)` until it returns
+ * `false`. Decompressor is chosen by extension (.gz → gunzip, .zst → zstd).
+ * Peak memory is one chunk plus one line — never the archive.
  */
-export async function scanGzipArchive(file, onLine) {
+export async function scanArchive(file, onLine) {
   const input = fs.createReadStream(file);
-  const gunzip = zlib.createGunzip();
-  const rl = readline.createInterface({ input: input.pipe(gunzip), crlfDelay: Infinity });
+  const decompressor = createDecompressStream(engineForArchive(file));
+  const rl = readline.createInterface({ input: input.pipe(decompressor), crlfDelay: Infinity });
   let stopped = false;
   try {
     for await (const line of rl) {
@@ -188,7 +206,11 @@ export async function scanGzipArchive(file, onLine) {
     if (stopped) {
       rl.close();
       input.destroy();
-      gunzip.destroy();
+      decompressor.destroy();
     }
   }
 }
+
+/** Back-compat aliases (1.6.1 pre-engine call sites/tests). */
+export const mergeShardsToGzip = mergeShardsToArchive;
+export const scanGzipArchive = scanArchive;

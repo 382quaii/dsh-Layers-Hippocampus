@@ -40,6 +40,7 @@ import { renderMemoryHints, selectRelevantTags } from './src/utils/memoryHints.j
 import { HostBridge } from './src/hostBridge.js';
 import { isLowValley, nextLowValleyStart, windowInfo } from './src/priceWindow.js';
 import { DreamTimer } from './src/dreamTimer.js';
+import { probeCompression, resolveEngine } from './src/compression.js';
 import { MEMORY_API, registerMemoryRoutes } from './src/webRoutes.js';
 
 export const name = 'memory';
@@ -930,6 +931,19 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     spacesDelete: runtime.multiSpaceAvailable() && typeof memory.spaces?.deleteSpace === 'function',
     // v1.5.6: the client half may open a fresh conversation on an active handoff.
     autoNewSession: runtime.config.context.autoNewSession === true,
+    // v1.6.1: cold-archive compression engines available in THIS Node runtime.
+    compression: (() => {
+      const probe = probeCompression();
+      const resolved = resolveEngine(runtime.config.raw?.compressionEngine ?? 'gzip', probe);
+      return {
+        requested: runtime.config.raw?.compressionEngine ?? 'gzip',
+        engine: resolved.engine,
+        fallback: resolved.fallback,
+        gzip: probe.gzip,
+        zstd: probe.zstd,
+        node: probe.node,
+      };
+    })(),
   });
 
   /** v1.5.6: handoff observability for the client-side auto-new-session controller. */

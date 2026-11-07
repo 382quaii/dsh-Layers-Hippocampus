@@ -231,6 +231,9 @@ export const DEFAULT_CONFIG = Object.freeze({
     // v1.6.1 cold-tier: shards older than this are candidates for monthly gzip
     // archiving (must stay strictly below retentionDays).
     archiveAfterDays: 7,
+    // Monthly archive compressor. `gzip` is the built-in default; `zstd` uses the
+    // Node runtime's built-in zstd when available and silently falls back otherwise.
+    compressionEngine: 'gzip',
     maxScanMb: 16,
     // Deep-scan turn budget. The scanner walks each shard NEWEST-FIRST, so this is
     // "how far back from the tail a single deep_raw may look" — a knob, not a
@@ -722,6 +725,11 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
       { key: 'raw.archiveAfterDays', got: rawArchiveAfterDays, retentionDays: rawRetentionDays },
     );
   }
+  const rawCompressionEngine = requireEnum(
+    rawIn.compressionEngine === undefined ? defaults.raw.compressionEngine : rawIn.compressionEngine,
+    'raw.compressionEngine',
+    ['gzip', 'zstd'],
+  );
   const rawMaxScanMb = requireInteger(
     rawIn.maxScanMb === undefined ? defaults.raw.maxScanMb : rawIn.maxScanMb,
     'raw.maxScanMb',
@@ -1111,6 +1119,7 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
       maxTotalMb: rawMaxTotalMb,
       retentionDays: rawRetentionDays,
       archiveAfterDays: rawArchiveAfterDays,
+      compressionEngine: rawCompressionEngine,
       maxScanMb: rawMaxScanMb,
       maxScanTurns: rawMaxScanTurns,
       maxResultTokens: rawMaxResultTokens,

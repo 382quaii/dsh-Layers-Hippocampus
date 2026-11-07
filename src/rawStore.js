@@ -499,7 +499,7 @@ export class RawStore {
     for (let cursor = startTime; cursor <= endTime; cursor += 86_400_000) wantedMonths.add(archiveMonthOf(dayKey(cursor)));
     const archives = this.archive
       .listArchives()
-      .filter((name) => wantedMonths.has(name.replace(/^raw-archive-/, '').replace(/(\.jsonl\.gz)$/, '')));
+      .filter((name) => wantedMonths.has(name.replace(/^raw-archive-/, '').replace(/\.jsonl\.(gz|zst)$/, '')));
 
     const hits = [];
     const archiveErrors = [];
@@ -758,7 +758,12 @@ export class RawStore {
       }
       eligible.push(day);
     }
-    const result = await this.archive.archive({ shards: this.listShards(), eligible, now });
+    const result = await this.archive.archive({
+      shards: this.listShards(),
+      eligible,
+      now,
+      engine: config.compressionEngine ?? 'gzip',
+    });
     if (result.archived.length > 0) {
       this._total = null;
       this._hashes.clear();

@@ -26,6 +26,14 @@ resumes; 1.6.1 is the current release (patch on top of 1.6.0).**
   `archiveErrors`/`notes: archive-corrupt:<name>` for a corrupt archive, and keep
   plaintext `.jsonl` reads unchanged. `raw.retentionDays` default moves **30 → 90**
   and must stay strictly above `archiveAfterDays` (fail-fast otherwise).
+- **Compression-engine selection (zero install)**: `raw.compressionEngine`
+  (`gzip` default | `zstd`) + a settings-page engine picker with an
+  enable/disable button. Zstd uses Node's BUILT-IN `node:zlib` zstd — nothing is
+  downloaded and there is no package to uninstall; "停用" switches back to gzip.
+  Archives are `raw-archive-YYYY-MM.jsonl.gz` / `.jsonl.zst`, dispatch is by
+  extension, and a legacy gzip archive stays readable after switching to zstd.
+  When the runtime lacks zstd the config silently falls back to gzip and
+  `capabilities.compression` reports `{engine, fallback, zstd, node}` for the UI.
 
 - **Recall bound-based early exit** (performance audit item A): every score is
   `salience × decay × tagAffinity(≤3) × lexicalBoost(≤1) × association(≤1) ×
@@ -37,7 +45,7 @@ resumes; 1.6.1 is the current release (patch on top of 1.6.0).**
   (`O(K log K)` ordering) but the per-candidate decay/similarity work is skipped
   for the long low-salience tail.
 - Regression: pinned decay stays exactly 1 (bypass path), monthly memos unchanged.
-- **429 tests green** (64 files).
+- **433 tests green** (64 files).
 
 ## [1.6.0] — 2026-11-06
 

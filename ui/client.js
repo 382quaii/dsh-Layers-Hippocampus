@@ -2501,6 +2501,7 @@
           rawMaxTotalMb: Number((config.raw && config.raw.maxTotalMb) ?? 256),
           rawRetentionDays: Number((config.raw && config.raw.retentionDays) ?? 90),
           rawArchiveAfterDays: Number((config.raw && config.raw.archiveAfterDays) ?? 7),
+          rawCompressionEngine: (config.raw && config.raw.compressionEngine) === 'zstd' ? 'zstd' : 'gzip',
           rawMaxScanTurns: Number((config.raw && config.raw.maxScanTurns) ?? 5000),
           deleteGraceHours: Number((config.delete && config.delete.graceHours) ?? 24),
           reviewEnabled: (config.review && config.review.enabled) !== false,
@@ -2929,6 +2930,7 @@
             'raw.maxTotalMb': Number(draft.rawMaxTotalMb),
             'raw.retentionDays': Number(draft.rawRetentionDays),
             'raw.archiveAfterDays': Number(draft.rawArchiveAfterDays),
+            'raw.compressionEngine': draft.rawCompressionEngine === 'zstd' ? 'zstd' : 'gzip',
             'raw.maxScanTurns': Number(draft.rawMaxScanTurns),
             'delete.graceHours': Number(draft.deleteGraceHours),
             'review.enabled': Boolean(draft.reviewEnabled),
@@ -3590,6 +3592,47 @@
               onChange: (value) => edit('rawArchiveAfterDays', value),
               disabled,
             }),
+            h(Field, {
+              label: '冷压缩引擎（raw.compressionEngine）',
+              hint:
+                (payload && payload.capabilities && payload.capabilities.compression
+                  ? `当前运行时 Node ${payload.capabilities.compression.node}：gzip ${payload.capabilities.compression.gzip ? '可用' : '不可用'}，`
+                  : '') +
+                'Zstd 使用 Node 内置 zstandard（无需下载或安装外部包）。启用后新归档为 .jsonl.zst，压缩率更高；停用则切回 .jsonl.gz。历史归档保持原格式、两种格式都可流式读取。',
+              type: 'select',
+              value: draft.rawCompressionEngine,
+              options: [
+                { value: 'gzip', label: 'Gzip（Node 内置，默认）' },
+                { value: 'zstd', label: 'Zstd（Node 内置，压缩率更高）' },
+              ],
+              onChange: (value) => edit('rawCompressionEngine', value),
+              disabled,
+            }),
+            h(
+              'div',
+              { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', margin: '4px 0 10px' } },
+              h(
+                'button',
+                {
+                  type: 'button',
+                  style: smallButtonStyle,
+                  disabled,
+                  onClick: () =>
+                    edit(
+                      'rawCompressionEngine',
+                      draft.rawCompressionEngine === 'zstd' ? 'gzip' : 'zstd',
+                    ),
+                },
+                draft.rawCompressionEngine === 'zstd' ? '停用 Zstd（切回 Gzip）' : '启用 Zstd（内置引擎）',
+              ),
+              h(
+                'span',
+                { style: { ...labelStyle, marginBottom: 0 } },
+                draft.rawCompressionEngine === 'zstd'
+                  ? 'Zstd 已启用：点击“保存全部”后，新归档使用 .jsonl.zst。'
+                  : '当前使用 Gzip：点击“保存全部”后切换，下个月归档生效。',
+              ),
+            ),
             h(Field, {
               label: 'deep_raw 扫描回合上限（raw.maxScanTurns）',
               hint: 'deep_raw 从最新记录倒序最多扫描的回合数（默认 5000，下次 deep_raw 即生效）。调大可回溯更久但更慢；超出上限会 truncated=true 并在 notes 说明。',
