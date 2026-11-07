@@ -3592,14 +3592,13 @@
               onChange: (value) => edit('rawArchiveAfterDays', value),
               disabled,
             }),
-            h(Field, {
+            h(Select, {
               label: '冷压缩引擎（raw.compressionEngine）',
               hint:
-                (payload && payload.capabilities && payload.capabilities.compression
-                  ? `当前运行时 Node ${payload.capabilities.compression.node}：gzip ${payload.capabilities.compression.gzip ? '可用' : '不可用'}，`
+                (statsPayload && statsPayload.capabilities && statsPayload.capabilities.compression
+                  ? `当前运行时 Node ${statsPayload.capabilities.compression.node}：gzip ${statsPayload.capabilities.compression.gzip ? '可用' : '不可用'}，zstd ${statsPayload.capabilities.compression.zstd ? '可用' : '不可用'}。`
                   : '') +
                 'Zstd 使用 Node 内置 zstandard（无需下载或安装外部包）。启用后新归档为 .jsonl.zst，压缩率更高；停用则切回 .jsonl.gz。历史归档保持原格式、两种格式都可流式读取。',
-              type: 'select',
               value: draft.rawCompressionEngine,
               options: [
                 { value: 'gzip', label: 'Gzip（Node 内置，默认）' },

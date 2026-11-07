@@ -34,6 +34,11 @@ resumes; 1.6.1 is the current release (patch on top of 1.6.0).**
   extension, and a legacy gzip archive stays readable after switching to zstd.
   When the runtime lacks zstd the config silently falls back to gzip and
   `capabilities.compression` reports `{engine, fallback, zstd, node}` for the UI.
+- **Fixed — settings page rendered blank**: the compression-engine card referenced a
+  bare `payload` that only exists in other components' scopes; it now uses the local
+  `statsPayload` and the shared `Select` component (not a fake `type:'select'` on
+  `Field`). `test/v161.ui.test.js` pins the scope rule so the whole settings page
+  cannot be taken down by one card again.
 
 - **Recall bound-based early exit** (performance audit item A): every score is
   `salience × decay × tagAffinity(≤3) × lexicalBoost(≤1) × association(≤1) ×
@@ -45,7 +50,7 @@ resumes; 1.6.1 is the current release (patch on top of 1.6.0).**
   (`O(K log K)` ordering) but the per-candidate decay/similarity work is skipped
   for the long low-salience tail.
 - Regression: pinned decay stays exactly 1 (bypass path), monthly memos unchanged.
-- **433 tests green** (64 files).
+- **436 tests green** (64 files).
 
 ## [1.6.0] — 2026-11-06
 
