@@ -27,6 +27,7 @@ import { createHash } from 'node:crypto';
 import { MemoryError, ErrorCodes } from './errors.js';
 import { dayKey, ensureDir, sha256 } from './util.js';
 import { RawArchive, archiveMonthOf, isArchiveName, scanGzipArchive } from './rawArchive.js';
+import { buildIndex, indexFileFor, isIndexFile, readIndex, shardOverlapsWindow, writeIndex } from './rawIndex.js';
 
 export const RAW_DIR = 'raw';
 /** Records queued before a forced flush. */
@@ -510,9 +511,20 @@ export class RawStore {
     const effectiveLimit = Math.min(Math.max(1, Math.floor(Number(limit) || 20)), MAX_SCAN_RESULTS);
     let truncated = false;
     let tokensUsed = 0;
+    let indexedShards = 0;
     for (const name of shards) {
       if (truncated) break;
       const file = path.join(this.dir, name);
+      // v1.6.1 sparse index (best-effort): skip a shard whose [minTs, maxTs] cannot
+      // overlap the window, and reuse its lineCount instead of a second pass.
+      const shardIndex = readIndex(file);
+      if (shardIndex) {
+        indexedShards += 1;
+        if (!shardOverlapsWindow(shardIndex, startTime, endTime)) {
+          notes.push(`index-skip:${name}`);
+          continue;
+        }
+      }
       scanned.shards += 1;
       const shardHits = [];
       let tailIndex = 0; // 0 = the shard's last physical line
@@ -573,9 +585,9 @@ export class RawStore {
         throw error;
       }
       if (shardHits.length > 0) {
-        // Absolute line numbers need the shard's line count: ONE extra bounded
-        // streaming pass, paid only when this shard actually produced hits.
-        const total = await this._countLines(file);
+        // Absolute line numbers need the shard's line count. A FRESH sparse index
+        // already knows it; otherwise pay ONE extra bounded streaming pass.
+        const total = shardIndex?.lineCount ?? (await this._countLines(file));
         for (const hit of shardHits) {
           hit.line = total - hit.fromTail;
           delete hit.fromTail;
@@ -636,7 +648,7 @@ export class RawStore {
     return {
       mode: 'deep_raw',
       hits,
-      scanned,
+      scanned: { ...scanned, indexedShards },
       truncated: notesTruncated,
       budget: { maxBytes, maxTurns, maxTokens: tokenBudget, tokensUsed, maxHits: MAX_SCAN_RESULTS },
       notes,
@@ -787,6 +799,8 @@ export class RawStore {
         const file = path.join(this.dir, name);
         const size = fs.statSync(file).size;
         fs.rmSync(file, { force: true });
+        // The side-car index has no meaning without its shard.
+        fs.rmSync(indexFileFor(file), { force: true });
         freed += size;
         removed.push(day);
       } catch {
@@ -802,10 +816,35 @@ export class RawStore {
     return { removed, freedBytes: freed, retentionDays: retention, today };
   }
 
+  /**
+   * v1.6.1 sparse index maintenance: build/refresh one `.idx.json` per shard when
+   * missing or stale. Runs offline (maintain), never on the capture path.
+   */
+  async ensureIndexes({ step = 64, limit = Infinity } = {}) {
+    const built = [];
+    const errors = [];
+    const shards = this.listShards();
+    for (const name of shards.slice(0, limit)) {
+      const file = path.join(this.dir, name);
+      try {
+        if (readIndex(file)) continue;
+        const index = await buildIndex({ shardFile: file, day: name.replace('.jsonl', ''), step });
+        writeIndex(file, index);
+        built.push(name);
+      } catch (error) {
+        if (error?.code === 'ENOENT') continue;
+        errors.push({ shard: name, message: error?.message ?? String(error) });
+      }
+    }
+    return { indexed: built.length, total: shards.length, built, errors };
+  }
+
   stats() {
     const shards = this.listShards();
+    const indexedShards = shards.filter((name) => readIndex(path.join(this.dir, name)) !== null).length;
     return {
       shards: shards.length,
+      indexedShards,
       bytes: this.totalBytes(),
       newest: shards.at(-1) ?? null,
       oldest: shards[0] ?? null,

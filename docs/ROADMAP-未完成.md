@@ -277,7 +277,8 @@ L2.5 趋势隔离 / 幽灵节点 / 上下文分页 / cron+dream 单一闸门 / �
 - ✅ **P3 Token 收紧（1.6.1，2026-11-07）**：`[Active Task]` 的 eventId 同步进块去重池（同一事件不再以 Active Task + 召回块双形态注入）；`[Persona & Traits]` 按 L3 形状（`summaryId`+`updatedAt`+数量）memo 化，L3 不变时零渲染成本。2 个用例 `test/v161.p3.test.js`。
 - ✅ **raw 冷热分层压缩（1.6.1，2026-11-07）**：`maintain()` 中月度门控（每月最多一次）把超过 `raw.archiveAfterDays`（默认 7）的日分片按自然月合并为 `raw-archive-YYYY-MM.jsonl.gz`（Node 原生 `zlib`），成功后删除明文分片。三项豁免：近 30 天有访问（`state/raw-access.json`）、含 `pinned`、含 `status:handoff`、或含活跃高频标签。`deep_raw` 与 hash 恢复用 `createGunzip()` 流式逐行读取，命中即停；损坏归档记 `MEM_E_CORRUPTED_ARCHIVE` 并跳过该分片。`raw.retentionDays` 默认 **30 → 90**，且必须严格大于 `archiveAfterDays`（否则 fail-fast）。7 个用例 `test/v161.archive.test.js`。
 - ✅ **压缩引擎可选（1.6.1，2026-11-07）**：`raw.compressionEngine`（`gzip` 默认 / `zstd`）+ 设置页引擎选择与启用/停用按钮；Zstd 使用 Node 内置 `node:zlib`，**无需下载任何包，也没有可卸载的包**（“停用”= 切回 gzip）。归档扩展名 `.jsonl.gz` / `.jsonl.zst` 按扩展名分派解压，切换后旧 gzip 归档仍可读；运行时无 zstd 时静默回退并在 `capabilities.compression` 报告 `{engine, fallback, zstd, node}`。4 个用例 `test/v161.compression.test.js`。
-- **测试**：`dsh-memory` **436/436**（64 文件）；`dsh-orchestrator` **31/31**。
+- ✅ **稀疏行索引（1.6.1，2026-11-07，性能审计 C）**：每分片 `<day>.jsonl.idx.json`，每 64 行采样 `{line, offset, timestamp}`，含 `bytes/mtimeMs/lineCount/minTs/maxTs/sorted` 校验；`deep_raw` 用其**跳过时间不重叠分片**（不打开文件）并复用 `lineCount` 计算绝对 `hit.line`（省一次全量扫描）；维护时渐进补建（50 分片/轮），prune 随分片删除；索引缺失/陈旧/损坏/非单调时**静默顺序扫描降级**；`stats()` 暴露 `indexedShards`。6 个用例 `test/v161.rawIndex.test.js`。
+- **测试**：`dsh-memory` **442/442**（64 文件）；`dsh-orchestrator` **31/31**。
 - **M3/M4 状态更新**：M3 已落地（独立 `persona` section order=100）；M4 已改为通用 `customDecayRate`/`customHalfLifeDays`，由情感插件调用时传参，插件内不再判断 `emotion:` 前缀。
 - ✅ **版本冻结 1.5.7 + 本地发布卫生**（历史，2026-11-04）：`package.json` 升到 1.5.7；本地 commit `release: v1.5.7 …` + tag `v1.5.7`（**未 push**）。该冻结已于 2026-11-07 解除，当前 1.6.1。
 - **仍未完成**：`git push` → npm publish（两个包）→ 市场目录 PR（需 GitHub/npm 凭据）。

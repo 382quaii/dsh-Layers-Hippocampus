@@ -26,6 +26,15 @@ resumes; 1.6.1 is the current release (patch on top of 1.6.0).**
   `archiveErrors`/`notes: archive-corrupt:<name>` for a corrupt archive, and keep
   plaintext `.jsonl` reads unchanged. `raw.retentionDays` default moves **30 → 90**
   and must stay strictly above `archiveAfterDays` (fail-fast otherwise).
+- **Sparse line index for raw shards** (performance audit item C): one
+  `<day>.jsonl.idx.json` per shard, sampled every 64 lines with
+  `{line, offset, timestamp}` plus `bytes/mtimeMs/lineCount/minTs/maxTs/sorted`.
+  `deep_raw` uses it to SKIP a shard whose time range cannot overlap the window
+  (without opening the file) and to reuse `lineCount` for absolute `hit.line`
+  numbers (no second pass). Built offline by `maintain()` (50 shards/round,
+  progressive), deleted with its shard by `prune()`, and silently bypassed when
+  missing, stale (bytes/mtime mismatch), corrupt, or non-monotonic. `stats()`
+  reports `indexedShards`. 6 cases in `test/v161.rawIndex.test.js`.
 - **Compression-engine selection (zero install)**: `raw.compressionEngine`
   (`gzip` default | `zstd`) + a settings-page engine picker with an
   enable/disable button. Zstd uses Node's BUILT-IN `node:zlib` zstd — nothing is
@@ -50,7 +59,7 @@ resumes; 1.6.1 is the current release (patch on top of 1.6.0).**
   (`O(K log K)` ordering) but the per-candidate decay/similarity work is skipped
   for the long low-salience tail.
 - Regression: pinned decay stays exactly 1 (bypass path), monthly memos unchanged.
-- **436 tests green** (64 files).
+- **442 tests green** (64 files).
 
 ## [1.6.0] — 2026-11-06
 

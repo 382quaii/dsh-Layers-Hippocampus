@@ -2075,6 +2075,12 @@ export class Memory {
     } catch (error) {
       report.rawPruneError = error instanceof Error ? error.message : String(error);
     }
+    // v1.6.1 sparse side-car indexes: offline-only, never on the capture path.
+    try {
+      report.rawIndex = await this.raw.ensureIndexes({ limit: 50 });
+    } catch (error) {
+      report.rawIndexError = error instanceof Error ? error.message : String(error);
+    }
     try {
       const due = this.pendingDeletes.due(this.clock.now());
       const promoted = [];
