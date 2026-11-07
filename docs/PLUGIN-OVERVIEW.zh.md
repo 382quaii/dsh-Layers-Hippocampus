@@ -1,9 +1,9 @@
 # dsh-layers-hippocampus · 功能 / 实现 / 版本演进
 
-> 版本基线：**v1.5.7（版本冻结，功能冻结的发布线）**
-> 验证状态：**399 / 399 测试通过**（64 个测试文件 · 46 个源码文件 · 零运行时依赖）
+> 版本基线：**v1.7.0（2026-11-07 全面解冻，恢复语义化版本）**
+> 验证状态：**420 / 420 测试通过**（64 个测试文件 · 46 个源码文件 · 零运行时依赖）
 > 数据位置（本机当前）：`D:\Users\86135\memory`（本地 JSONL，可迁移）
-> 本文与 `README.md`、`docs/ARCHITECTURE.zh.md`、`CHANGELOG.md`、`docs/RELEASE-1.5.7.md` 配套。
+> 本文与 `README.md`、`docs/ARCHITECTURE.zh.md`、`CHANGELOG.md`、`docs/RELEASE-1.7.0.md` 配套。
 
 ---
 
@@ -160,7 +160,9 @@ DeepSeek Harness（DSH）的**本地优先长期记忆 Host 插件**。它不把
 | **1.5.4** | 交接加固、标签治理、空间 UI、**工具裁剪（`tools.disabled`，三核心不可关）** |
 | **1.5.5** | 维护性修复（tag `v1.5.5`） |
 | **1.5.6** | **raw 游标倒序扫描（O(chunk) 内存）**、响应 payload 上限（`maxInjectTokens`）、写入前启发式打标、pinned 记忆、相关性提示、L2 合并、L3 标签不变量、交接继承工作模式、Dream 补偿、多空间引擎外置到 `dsh-orchestrator` |
-| **1.5.7** | **版本冻结**：Orchestrator federation/dedupe 接线、读取时合并、跨空间召回（opt-in）、Orchestrator 状态持久化、设置页 GitHub 安装器、自动新会话交接、低峰 Dream Phase 2、空间删除、图谱交互 |
+| **1.5.7** | Orchestrator federation/dedupe 接线、读取时合并、跨空间召回（opt-in）、Orchestrator 状态持久化、设置页 GitHub 安装器、自动新会话交接、低峰 Dream Phase 2、空间删除、图谱交互（曾临时冻结，已被 1.6.0 解冻） |
+| **1.6.0** | 冷启动防呆（状态唤醒）、`coldStartInjectSummary` / `coldStartInjectRecentTurns` 两个注入开关、泛型 `customDecayRate` / `customHalfLifeDays`、`persona` section order=100、跨插件 `ctx.provide('hippocampus')` 服务 |
+| **1.7.0** | **检索上限剪枝**：`salience × 3.9` 硬上界 + 降序早停（pinned 绕过），结果带 `pruned` 观测；**版本全面解冻**，恢复语义化发布 |
 
 ---
 
@@ -175,7 +177,7 @@ DeepSeek Harness（DSH）的**本地优先长期记忆 Host 插件**。它不把
 ## 7. 已知边界与风险（诚实清单）
 
 1. **多空间依赖外部能力**：无 `dsh-orchestrator` 时只有单空间与 8 个工具，这是显式降级，不是 bug；
-2. **版本冻结**：1.5.7 后不再升版，修复策略需在发布说明中明确；
+2. **版本节奏**：1.5.7 的临时冻结已于 2026-11-07 全面解除，恢复语义化版本（当前 1.7.0）；
 3. **保存窗口**：日志 append 是 durable 的，但 manifest checkpoint 有 200ms 延迟；崩溃后依赖 `unflushedBytes` + 重建兜底；
 4. **raw 尾扫偏置**：单分片超过 `maxScanTurns`（默认 5000）时一次只看最新 N 条，更早历史需调大预算或按时间窗分页；
 5. **置信度阈值**：在高度同质的数据上不触发（A/B 已验证为 0 收益），不适合当作默认的“省 token”手段；

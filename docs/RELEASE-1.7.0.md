@@ -1,13 +1,15 @@
-# Release 1.6.0 — 发布准备（本地）
+# Release 1.7.0 — 发布准备（本地）
 
-> 版本：**1.6.0**（2026-11-06 用户指令解除 1.5.7 冻结；本版新增冷启动防呆与两个注入开关）。
+> 版本：**1.7.0**（2026-11-07：全面解除 1.5.7 的版本冻结，恢复语义化版本；本版新增检索上限剪枝）。
 
 > 状态：**代码与文档已就绪；仓库推送 / npm 发布 / 市场 PR 需要你的 GitHub 与 npm 凭据，代理与网络，本会话未执行。**
-> 基线：`dsh-memory` 工作区，全量 **416/416 测试通过**（64 个测试文件；另有 `dsh-orchestrator` 31/31）。
+> 基线：`dsh-memory` 工作区，全量 **420/420 测试通过**（64 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；插件市场仍无条目（未发布 npm）。
 
 ## 本版内容
 
+- **A 检索上限剪枝（1.7.0 新增）**：命中分数上界 `salience × 3.9`（tagAffinity≤3、timeBoost≤1.3 等因子封顶），候选按 salience 降序访问，上界打不过第 k 名即停止评分；pinned 绕过剪枝；`pruned`/`notes` 可观测；4 个用例 `test/v170.pruning.test.js`。
+- **版本解冻（2026-11-07）**：删除全部“版本冻结/不再升版本号”表述，自 1.6.0 起恢复正常版本节奏。
 - **P0-1** `deep_raw` 按行游标扫描：`readLinesReverse()` 64 KiB 反向分块、逐行产出；`hit.line` 仍为绝对行号；引擎结果硬上限 `MAX_SCAN_RESULTS=500`；`restoreByHash` / tombstone / hash 读取全部流式化。
 - **P0-2** maintain 事件循环延迟监控：`perf_hooks.monitorEventLoopDelay`，阶段间 `yieldIfLagging()`（>100ms 让出 50ms），报告 `eventLoop:{maxMs,p99Ms,yields}`。
 - **P0-3** recall 响应上限 `context.maxInjectTokens`（默认 4000，256–100 000），超限 `truncated:true` + `payload` 计数。
@@ -23,7 +25,7 @@
 
 ## 发布步骤（需要你执行）
 
-> 两个包：`dsh-layers-hippocampus@1.5.7`（版本冻结，已有 git remote）与
+> 两个包：`dsh-layers-hippocampus@1.7.0`（已解冻，已有 git remote）与
 > `dsh-layers-orchestrator@0.1.0`（**目前不是 git 仓库**，需先 init/建远端）。
 > 全部命令在 PowerShell 下执行；`node`/`npm`/`pnpm` 用 DSH runtime 自带的绝对路径。
 
@@ -31,7 +33,7 @@
 
 ```powershell
 cd C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory
-node test/run.mjs                # 期望 416/416
+node test/run.mjs                # 期望 420/420
 cd ..\dsh-orchestrator
 node test/run.mjs                # 期望 31/31
 cd ..\dsh-memory
@@ -46,11 +48,10 @@ npm pack --dry-run               # 预检实际发布内容（含/不含不该�
 cd C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory
 git add -A
 git status --short                 # 最后确认没有 node_modules / state / 测试临时目录
-git commit -m "release: v1.5.7 — raw cursor scan, payload cap, tagging, pinned memory, hints, feature flags, federation/dedupe, cross-space recall, orchestrator installer, durable state, auto new conversation, low-valley scheduler"
+git commit -m "release: v1.7.0 — recall bound pruning; version un-frozen; cold-start, persona, custom decay included"
 
-# 版本冻结：只打 v1.5.7；1.5.6 是未发布草稿，已并入本版
-git tag -a v1.5.5 -m "v1.5.5: offline Dream LLM distillation with local fallback" 2>$null
-git tag -a v1.5.7 -m "v1.5.7: final release (version freeze) — 1.5.6 features + federation, read merge, cross-space recall, durable state, installer, auto new conversation"
+# 历史 tag 已存在（v1.5.5 / v1.5.7 / v1.6.0）；本次新增 v1.7.0
+git tag -a v1.7.0 -m "v1.7.0: recall bound-based early exit; version un-frozen"
 git push origin main --follow-tags
 ```
 

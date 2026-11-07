@@ -4,9 +4,27 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.7.0] — 2026-11-07
+
+**Version fully un-frozen (user directive 2026-11-07): normal semantic versioning
+resumes; 1.7.0 is the current release.**
+
+- **Recall bound-based early exit** (performance audit item A): every score is
+  `salience × decay × tagAffinity(≤3) × lexicalBoost(≤1) × association(≤1) ×
+  timeBoost(≤1.3) × handoff(≤1)`, so `salience × 3.9` is a hard upper bound.
+  Candidates are visited salience-DESC and scoring stops as soon as that bound
+  cannot beat the current k-th score. `pinned` hits bypass the cut, the best-k
+  window keeps the bound exact (ties still visited), and the result reports
+  `pruned` + `notes: pruned:<n>`. Complexity unchanged in the worst case
+  (`O(K log K)` ordering) but the per-candidate decay/similarity work is skipped
+  for the long low-salience tail.
+- Regression: pinned decay stays exactly 1 (bypass path), monthly memos unchanged.
+- **420 tests green** (64 files).
+
 ## [1.6.0] — 2026-11-06
 
-**Version un-frozen (user directive 2026-11-06): 1.6.0 is the current release.**
+> Version note: 1.6.0 was the FIRST release after the temporary 1.5.7 freeze; the
+> 2026-11-07 directive removed all freeze language and resumed normal versioning.
 Cold-start wake-up + user-controlled cold-start injection:
 
 - **Anti-"customer service" wake-up** (static `memory:policy` prefix): the model is
@@ -26,10 +44,11 @@ Cold-start wake-up + user-controlled cold-start injection:
 
 ## [1.5.7] — 2026-11-04
 
-> Historical note: 1.5.7 shipped under a temporary version freeze that the
-> 2026-11-06 directive superseded (current version: 1.6.0).
+> Historical note: 1.5.7 shipped under a temporary version freeze; the 2026-11-07
+> directive removed ALL freeze language and resumed normal semantic versioning
+> (current version: 1.7.0). The sentence below is the historical 1.5.7 statement.
 
-**Version freeze: 1.5.7 is the shipped release; no further version bumps follow.**
+**Version freeze (historical, superseded): 1.5.7 was the shipped release.**
 This release folds in everything added after the 1.5.6 draft — Orchestrator
 federation/dedupe wiring, read-time merge, cross-space recall aggregation (opt-in
 `features.crossSpaceRecall`), durable Orchestrator state, the settings-page GitHub

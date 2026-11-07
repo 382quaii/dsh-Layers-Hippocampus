@@ -24,6 +24,8 @@ import { clamp, round, snippet } from './util.js';
 const TOKEN_RE = /[a-z0-9]{2,}|[\u4e00-\u9fff]{1,}/gi;
 /** Default penalty for an event reached through a graph neighbour. */
 const ASSOCIATION_PENALTY = 0.5;
+/** v1.7.0: hard upper bound factor for per-record score (tagAffinity≤3 × timeBoost≤1.3). */
+const PRUNE_BOUND_FACTOR = 3.9;
 /** Monthly memos never decay, and win ties on fuzzy historical queries. */
 const MONTHLY_TAG = 'status:monthly';
 /**
@@ -488,12 +490,31 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
   }
 
   // ---- scoring ------------------------------------------------------------
+  // v1.7.0: bound-based early exit (see docs/PERFORMANCE-AUDIT). Every score is
+  //   salience × decay × tagAffinity(≤3) × lexicalBoost(≤1) × association(≤1)
+  //   × timeBoost(≤1.3) × handoff(≤1)
+  // so `salience × 3.9` is a hard upper bound. We visit candidates in salience
+  // DESC order and stop as soon as that bound cannot beat the current k-th score.
+  // Pinned hits bypass pruning: they must be scored and returned first.
   const halfLife = policy.decay.halfLifeDays;
   const floor = policy.decay.floor;
+  const topKSort = (left, right) => right.score - left.score || left.eventId.localeCompare(right.eventId);
   let scored = [];
+  let pruned = 0;
+  const pruning = [];
+  const deferred = [];
   for (const eventId of candidates) {
     const event = eventById.get(eventId);
     if (!event) continue;
+    if (event.pinned === true) {
+      deferred.push(eventId);
+      continue;
+    }
+    pruning.push({ eventId, salience: Number(event.salience) || 0 });
+  }
+  pruning.sort((left, right) => right.salience - left.salience || left.eventId.localeCompare(right.eventId));
+  const scoreOne = (event, affinityValue) => {
+    const eventId = event.eventId;
     const tags = event.tags.map((t) => t.tag);
     const monthly = tags.includes(MONTHLY_TAG);
     // v1.5.4: internal handoff summaries are heavily down-ranked, never banned.
@@ -504,9 +525,9 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
     // A monthly memo is a stable summary, not a fading episode: no decay at all,
     // and a small boost when the query is about a fuzzy historical period.
     // v1.5.6: pinned records never decay either — they are lessons, not episodes.
-    const pinned = event.pinned === true;
     // v1.5.7: a per-record decay multiplier (generic; no tag inspection anywhere)
     // stretches/shrinks the effective half-life for this event only.
+    const pinned = event.pinned === true;
     const eventHalfLife =
       Number.isFinite(event.decayRate) && event.decayRate > 0 ? halfLife / event.decayRate : halfLife;
     const decay = monthly || pinned
@@ -518,7 +539,7 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
           halfLifeDays: eventHalfLife,
           floor,
         });
-    const tagScore = affinity.get(eventId) ?? 0;
+    const tagScore = affinityValue;
     const tagAffinity = 1 + Math.min(2, tagScore);
     const lexical = text ? similarity(text, event.content) : 0;
     const lexicalBoost = text ? 0.6 + 0.4 * lexical : 1;
@@ -526,7 +547,7 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
     const associationFactor = association ? association.penalty : 1;
     const timeBoost = monthly && text && FUZZY_TIME_RE.test(text) ? 1.3 : 1;
     const score = event.salience * decay * tagAffinity * lexicalBoost * associationFactor * timeBoost * handoffFactor;
-    scored.push({
+    return {
       eventId,
       eventTime: event.eventTime,
       day: event.day ?? blockByEvent.get(eventId) ?? null,
@@ -537,15 +558,40 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
       lexical: round(lexical, 4),
       tags,
       monthly,
-      ...(pinned ? { pinned: true } : {}),
+      ...(event.pinned === true ? { pinned: true } : {}),
       ...(association ? { association } : {}),
       // Marks the two hits that exist because the caller insisted on an oversized
       // tag, so the model knows this is a bounded preview, not the answer set.
       ...(oversizedRecentIds.has(eventId) ? { oversizedRecent: true } : {}),
       reinforcementCount: event.reinforcementCount ?? 0,
       snippet: snippet(event.content, 400),
-    });
+    };
+  };
+  // Keep the best k (k = topK) so the pruning bound is exact, not approximate.
+  let best = [];
+  for (let index = 0; index < pruning.length; index += 1) {
+    const { eventId, salience } = pruning[index];
+    // `bound <` (strict): a tie must still be visited so eventId tie-breaking is exact.
+    if (best.length >= topK && salience * PRUNE_BOUND_FACTOR < best[best.length - 1].score) {
+      pruned = pruning.length - index;
+      break;
+    }
+    const event = eventById.get(eventId);
+    if (!event) continue;
+    best.push(scoreOne(event, affinity.get(eventId) ?? 0));
+    best.sort(topKSort);
+    if (best.length > topK) best = best.slice(0, topK);
   }
+  // Pinned hits are never pruned; score them all and merge (pinned-first later).
+  for (const eventId of deferred) {
+    const event = eventById.get(eventId);
+    if (!event) continue;
+    scored.push(scoreOne(event, affinity.get(eventId) ?? 0));
+  }
+  scored.push(...best);
+  base.pruned = pruned;
+  if (pruned > 0) base.notes.push(`pruned:${pruned}`);
+
 
   scored.sort((a, b) => b.score - a.score || a.eventId.localeCompare(b.eventId));
   // v1.5.6: a pinned record that matches the query is returned FIRST, before any
