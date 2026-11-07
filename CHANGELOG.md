@@ -11,8 +11,21 @@ resumes; 1.6.1 is the current release (patch on top of 1.6.0).**
 
 - **Segment-token audit** (`docs/AUDIT-2026-11-07-segment-token.md`): no P0
   same-segment re-injection exists; the six injection surfaces are documented with
-  their dedup mechanisms. Two P3 optimizations recorded (Active-Task cross-surface
-  dedup; Persona render memoization), not applied yet.
+  their dedup mechanisms. Its two P3 items are now IMPLEMENTED:
+  - **P3-1** the `[Active Task]` event id also joins the block dedup pool, so one
+    event can never be injected both as Active Task and as a recall block;
+  - **P3-2** `[Persona & Traits]` is memoized by the L3 shape (`summaryId` +
+    `updatedAt` + count); unchanged L3 costs one signature, not a re-render.
+- **Raw cold-tier archiving (zero external deps)**: on `maintain()`, daily shards
+  older than `raw.archiveAfterDays` (default **7**) are merged per calendar month
+  into one `raw-archive-YYYY-MM.jsonl.gz` via Node's built-in `zlib`, then the
+  plaintext shard is removed. Archiving runs at most once per month and SKIPS any
+  shard that is recently read (`state/raw-access.json`), `pinned`,
+  `status:handoff`, or carries a hot active-set tag. `deep_raw` and hash restore
+  stream the archive with `createGunzip()` line-by-line (no full read), report
+  `archiveErrors`/`notes: archive-corrupt:<name>` for a corrupt archive, and keep
+  plaintext `.jsonl` reads unchanged. `raw.retentionDays` default moves **30 → 90**
+  and must stay strictly above `archiveAfterDays` (fail-fast otherwise).
 
 - **Recall bound-based early exit** (performance audit item A): every score is
   `salience × decay × tagAffinity(≤3) × lexicalBoost(≤1) × association(≤1) ×
@@ -24,7 +37,7 @@ resumes; 1.6.1 is the current release (patch on top of 1.6.0).**
   (`O(K log K)` ordering) but the per-candidate decay/similarity work is skipped
   for the long low-salience tail.
 - Regression: pinned decay stays exactly 1 (bypass path), monthly memos unchanged.
-- **420 tests green** (64 files).
+- **429 tests green** (64 files).
 
 ## [1.6.0] — 2026-11-06
 

@@ -3,13 +3,14 @@
 > 版本：**1.6.1**（2026-11-07：全面解除 1.5.7 的版本冻结，恢复语义化版本；本版新增检索上限剪枝与段记 Token 审计）。
 
 > 状态：**代码与文档已就绪；仓库推送 / npm 发布 / 市场 PR 需要你的 GitHub 与 npm 凭据，代理与网络，本会话未执行。**
-> 基线：`dsh-memory` 工作区，全量 **420/420 测试通过**（64 个测试文件；另有 `dsh-orchestrator` 31/31）。
+> 基线：`dsh-memory` 工作区，全量 **429/429 测试通过**（64 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；插件市场仍无条目（未发布 npm）。
 
 ## 本版内容
 
 - **A 检索上限剪枝（1.6.1 新增）**：命中分数上界 `salience × 3.9`（tagAffinity≤3、timeBoost≤1.3 等因子封顶），候选按 salience 降序访问，上界打不过第 k 名即停止评分；pinned 绕过剪枝；`pruned`/`notes` 可观测；4 个用例 `test/v170.pruning.test.js`。
-- **段记 Token 审计（1.6.1）**：`docs/AUDIT-2026-11-07-segment-token.md` 证明无 P0 重复注入，列出 6 个注入面与 2 个 P3 优化点。
+- **段记 Token 审计（1.6.1）**：`docs/AUDIT-2026-11-07-segment-token.md` 证明无 P0 重复注入，列出 6 个注入面；2 个 P3 已实施：Active Task 事件进块去重池、Persona 按 L3 形状 memo 化。
+- **raw 冷热分层压缩（1.6.1，零依赖）**：`maintain()` 月度门控，把超过 `raw.archiveAfterDays`（默认 7）的日分片按月合并为 `raw-archive-YYYY-MM.jsonl.gz`（Node 原生 `zlib`）后删除明文；豁免近 30 天有访问、`pinned`、`status:handoff`、高频标签；`deep_raw`/hash 恢复用 `createGunzip()` 流式逐行读、命中即停；损坏归档 `MEM_E_CORRUPTED_ARCHIVE` 跳过。`raw.retentionDays` 默认 30→90 且必须大于阈值（fail-fast）。7 个用例 `test/v161.archive.test.js`。
 - **版本解冻（2026-11-07）**：删除全部“版本冻结/不再升版本号”表述，自 1.6.0 起恢复正常版本节奏。
 - **P0-1** `deep_raw` 按行游标扫描：`readLinesReverse()` 64 KiB 反向分块、逐行产出；`hit.line` 仍为绝对行号；引擎结果硬上限 `MAX_SCAN_RESULTS=500`；`restoreByHash` / tombstone / hash 读取全部流式化。
 - **P0-2** maintain 事件循环延迟监控：`perf_hooks.monitorEventLoopDelay`，阶段间 `yieldIfLagging()`（>100ms 让出 50ms），报告 `eventLoop:{maxMs,p99Ms,yields}`。
@@ -34,7 +35,7 @@
 
 ```powershell
 cd C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory
-node test/run.mjs                # 期望 420/420
+node test/run.mjs                # 期望 429/429
 cd ..\dsh-orchestrator
 node test/run.mjs                # 期望 31/31
 cd ..\dsh-memory

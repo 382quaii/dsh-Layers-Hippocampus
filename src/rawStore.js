@@ -26,6 +26,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { createHash } from 'node:crypto';
 import { MemoryError, ErrorCodes } from './errors.js';
 import { dayKey, ensureDir, sha256 } from './util.js';
+import { RawArchive, archiveMonthOf, isArchiveName, scanGzipArchive } from './rawArchive.js';
 
 export const RAW_DIR = 'raw';
 /** Records queued before a forced flush. */
@@ -193,10 +194,16 @@ export function* readLinesForwardSync(file, { chunkSize = READ_CHUNK_BYTES } = {
 }
 
 export class RawStore {
-  constructor({ dataDir, clock, getConfig }) {
+  constructor({ dataDir, clock, getConfig, getHotTags = null }) {
     this.dir = path.join(dataDir, RAW_DIR);
     this.clock = clock;
     this.getConfig = getConfig;
+    this.getHotTags = getHotTags;
+    this.archive = new RawArchive({
+      rawDir: this.dir,
+      stateDir: path.join(dataDir, 'state'),
+      clock,
+    });
     this.queue = [];
     this._flushTimer = null;
     this._flushChain = Promise.resolve();
@@ -460,6 +467,7 @@ export class RawStore {
       throw new MemoryError(ErrorCodes.INVALID_INPUT, 'end_time must be >= start_time', { startTime, endTime });
     }
     await this.flush();
+    const now = this.clock.now();
     const tombstones = this._loadTombstones();
     const needle = String(text ?? '');
     let matcher;
@@ -485,8 +493,17 @@ export class RawStore {
         return day >= dayKey(startTime) && day <= dayKey(endTime);
       })
       .reverse();
+    // Cold-tier archives overlapping the requested window. Compressed shards have no
+    // seekable line index, so they are streamed start-to-end with an early stop.
+    const wantedMonths = new Set();
+    for (let cursor = startTime; cursor <= endTime; cursor += 86_400_000) wantedMonths.add(archiveMonthOf(dayKey(cursor)));
+    const archives = this.archive
+      .listArchives()
+      .filter((name) => wantedMonths.has(name.replace(/^raw-archive-/, '').replace(/(\.jsonl\.gz)$/, '')));
 
     const hits = [];
+    const archiveErrors = [];
+    const notes = [];
     const scanned = { turns: 0, bytes: 0, shards: 0, tombstonesSkipped: 0, peakBufferBytes: 0 };
     // The caller's `limit` is advisory; the engine enforces its own ceiling so a
     // direct embedder can never request an unbounded result set.
@@ -564,9 +581,56 @@ export class RawStore {
           delete hit.fromTail;
         }
         hits.push(...shardHits);
+        this.archive.recordAccess(name.replace('.jsonl', ''), now);
       }
     }
-    const notes = [];
+    // ---- cold archives ------------------------------------------------------
+    for (const archiveName of archives) {
+      if (truncated || hits.length >= effectiveLimit) break;
+      scanned.shards += 1;
+      const file = this.archive.archivePath(archiveName);
+      try {
+        await scanGzipArchive(file, (record) => {
+          scanned.turns += 1;
+          if (record?.type === 'raw_tombstone') return true;
+          if (typeof record?.turn_id !== 'string' || typeof record?.content !== 'string') return true;
+          if (record.timestamp < startTime || record.timestamp > endTime) return true;
+          if (tombstones.has(sha256(record.content))) {
+            scanned.tombstonesSkipped += 1;
+            return true;
+          }
+          if (!matcher.test(record.content)) return true;
+          const at = needle ? record.content.toLowerCase().indexOf(needle.toLowerCase()) : 0;
+          const snippet = redactSecrets(record.content.slice(Math.max(0, at - 120), at + 120 + needle.length));
+          const snippetTokens = Math.ceil(snippet.text.length / CHARS_PER_TOKEN);
+          if (tokensUsed + snippetTokens > tokenBudget) {
+            truncated = true;
+            return false;
+          }
+          tokensUsed += snippetTokens;
+          hits.push({
+            turnId: record.turn_id,
+            timestamp: record.timestamp,
+            role: record.role,
+            snippet: snippet.text,
+            redactions: snippet.redactions,
+            archive: archiveName,
+          });
+          if (hits.length >= effectiveLimit) return false;
+          return true;
+        });
+      } catch (error) {
+        if (error && error.code === 'ENOENT') continue;
+        // Fail-fast per archive, never for the whole scan: one corrupt cold file must
+        // not hide hits that live in the other archives / plaintext shards.
+        archiveErrors.push({
+          archive: archiveName,
+          code: ErrorCodes.CORRUPTED_ARCHIVE,
+          message: `raw archive unreadable: ${archiveName}: ${error?.message ?? error}`,
+        });
+        notes.push(`archive-corrupt:${archiveName}`);
+      }
+    }
     const notesTruncated = truncated || hits.length >= effectiveLimit;
     if (notesTruncated) notes.push(TOKEN_TRUNCATION_NOTE);
     return {
@@ -576,6 +640,7 @@ export class RawStore {
       truncated: notesTruncated,
       budget: { maxBytes, maxTurns, maxTokens: tokenBudget, tokensUsed, maxHits: MAX_SCAN_RESULTS },
       notes,
+      ...(archiveErrors.length > 0 ? { archiveErrors } : {}),
     };
   }
 
@@ -606,11 +671,103 @@ export class RawStore {
         throw error;
       }
     }
+    // Cold archives: same hash lookup, streamed (no seek, no full materialisation).
+    for (const name of this.archive.listArchives().reverse()) {
+      if (hits.length >= 5) break;
+      try {
+        await scanGzipArchive(this.archive.archivePath(name), (record) => {
+          if (hits.length >= 5) return false;
+          if (record?.type === 'raw_tombstone' || typeof record?.content !== 'string') return true;
+          const digest = sha256(record.content);
+          if (!digest.startsWith(wanted) || tombstones.has(digest)) return true;
+          hits.push({
+            turnId: record.turn_id,
+            timestamp: record.timestamp,
+            role: record.role,
+            content: record.content,
+            hash: digest,
+            archive: name,
+            restored: true,
+          });
+          return hits.length < 5;
+        });
+      } catch (error) {
+        if (error && error.code === 'ENOENT') continue;
+        /* a corrupt archive must not fail hash restore of plaintext shards */
+      }
+    }
     return { mode: 'deep_raw', hits: hits.slice(0, 5), truncated: hits.length > 5, notes: hits.length === 0 ? ['hash not found'] : [], restored: hits.length > 0 };
   }
 
-  /** TTL: delete whole shards strictly older than `today - retentionDays`. */
-  async prune({ now = this.clock.now() } = {}) {
+  /**
+   * Cold-tier archiving (v1.6.1). Runs at most once per month, merges all eligible
+   * daily shards of a calendar month into `raw-archive-YYYY-MM.jsonl.gz`.
+   *
+   * Eligibility (ALL must hold):
+   *   1. shard day is older than `raw.archiveAfterDays` (default 30);
+   *   2. access_count over the last 30 days is 0 (counter in state/raw-access.json);
+   *   3. the shard contains no pinned / status:handoff / hot-tag event.
+   */
+  async archiveCold({ now = this.clock.now(), hotTags = null, archiveAfterDays = null } = {}) {
+    const config = this.config();
+    const afterDays = Math.max(1, Number(archiveAfterDays ?? config.archiveAfterDays ?? 30));
+    const access = this.archive.readAccess();
+    const cutoff = dayKey(now - afterDays * 86_400_000);
+    const recentCutoff = now - 30 * 86_400_000;
+    const hot = new Set(Array.isArray(hotTags) ? hotTags : []);
+    const eligible = [];
+    const skipped = [];
+    for (const name of this.listShards()) {
+      const day = name.replace('.jsonl', '');
+      if (day >= cutoff) continue; // too fresh
+      const counter = access[day];
+      if (counter && (Number(counter.count) > 0 || Number(counter.lastAt) > recentCutoff)) {
+        skipped.push(`${day}:recent-access`);
+        continue;
+      }
+      let blocked = null;
+      try {
+        for await (const line of readLinesForward(path.join(this.dir, name))) {
+          if (!line.trim()) continue;
+          let record;
+          try {
+            record = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (record?.type === 'raw_tombstone') continue;
+          if (record?.pinned === true || record?.salience === 'pinned') {
+            blocked = 'pinned';
+            break;
+          }
+          if (Array.isArray(record?.tags) && record.tags.some((tag) => String(tag).includes('status:handoff'))) {
+            blocked = 'handoff';
+            break;
+          }
+          if (hot.size > 0 && Array.isArray(record?.tags) && record.tags.some((tag) => hot.has(String(tag)))) {
+            blocked = 'hot-tag';
+            break;
+          }
+        }
+      } catch (error) {
+        if (!error || error.code !== 'ENOENT') throw error;
+      }
+      if (blocked) {
+        skipped.push(`${day}:${blocked}`);
+        continue;
+      }
+      eligible.push(day);
+    }
+    const result = await this.archive.archive({ shards: this.listShards(), eligible, now });
+    if (result.archived.length > 0) {
+      this._total = null;
+      this._hashes.clear();
+      this._dayBytes.clear();
+    }
+    return { ...result, eligible: eligible.length, skipped };
+  }
+
+  /** TTL: delete whole shards strictly older than `today - retentionDays`. */  async prune({ now = this.clock.now() } = {}) {
     const config = this.config();
     const retention = Math.max(1, config.retentionDays ?? 30);
     const today = dayKey(now);

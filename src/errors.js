@@ -31,6 +31,8 @@ export const ErrorCodes = Object.freeze({
   SERVICE_DISPOSED: 'MEM_E_SERVICE_DISPOSED',
   /** Federation bookkeeping failed; the write itself is unaffected. */
   FEDERATION_FAILED: 'MEM_E_FEDERATION_FAILED',
+  /** A cold raw archive could not be decompressed; the shard is skipped. */
+  CORRUPTED_ARCHIVE: 'MEM_E_CORRUPTED_ARCHIVE',
 
   // ---- configuration (fail-fast at boot; never silently downgraded) ---------
   CONFIG_DEPRECATED: 'MEM_E_CONFIG_DEPRECATED',

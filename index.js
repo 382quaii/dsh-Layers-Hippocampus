@@ -424,7 +424,18 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     } catch {
       return '';
     }
-    if (!Array.isArray(summaries) || summaries.length === 0) return '';
+    if (!Array.isArray(summaries) || summaries.length === 0) {
+      runtime._personaCache = null;
+      return '';
+    }
+    // P3-2: memoize by the exact L3 shape (summaryId + updatedAt + count). Semantic
+    // summaries contain no fields missing from this signature, so any add/retire/edit
+    // invalidates the cache; unchanged L3 costs one string signature, not a render.
+    const signature = `${summaries.length}|${summaries
+      .map((summary) => `${summary.summaryId ?? ''}:${summary.updatedAt ?? ''}`)
+      .sort()
+      .join(',')}`;
+    if (runtime._personaCache?.signature === signature) return runtime._personaCache.text;
     const ranked = [...summaries]
       .sort(
         (left, right) =>
@@ -434,10 +445,12 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       .slice(0, 10);
     if (ranked.length === 0) return '';
     const oneLine = (value) => String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, 240);
-    return [
+    const text = [
       '[Persona & Traits]',
       ...ranked.map((summary) => `- ${oneLine(summary.title) || 'trait'}: ${oneLine(summary.text)}`),
     ].join('\n');
+    runtime._personaCache = { signature, text };
+    return text;
   };
 
   /**
@@ -537,6 +550,9 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       let activeTaskBlock = '';
       if (activeTask?.text && !runtime.injection.ids.has(`active:${activeTask.eventId}`)) {
         runtime.injection.ids.add(`active:${activeTask.eventId}`);
+        // P3-1: the SAME event must not appear again as a `[Memory Blocks]` entry.
+        // Block ids ARE event ids, so registering the bare id hides the block form.
+        runtime.injection.ids.add(activeTask.eventId);
         activeTaskBlock = renderActiveTask(activeTask);
       }
 

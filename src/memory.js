@@ -2060,6 +2060,16 @@ export class Memory {
     }
     // v1.4.0 offline jobs: raw retention, spaced-repetition due list, and the
     // promotion of expired pending deletes into the 4-phase pipeline.
+    // v1.6.1 cold-tier FIRST (prune would otherwise delete the archive candidates):
+    // monthly-gated gzip merge of cold, never-recently-read, non-pinned shards.
+    try {
+      const hotTags = (this.indexManager?.snapshot()?.activeSet?.entries ?? [])
+        .slice(0, 32)
+        .map((entry) => entry.tag);
+      report.rawArchive = await this.raw.archiveCold({ now: this.clock.now(), hotTags });
+    } catch (error) {
+      report.rawArchiveError = error instanceof Error ? error.message : String(error);
+    }
     try {
       report.rawPrune = await this.raw.prune({ now: this.clock.now() });
     } catch (error) {

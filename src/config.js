@@ -227,7 +227,10 @@ export const DEFAULT_CONFIG = Object.freeze({
     maxTurnKb: 64,
     maxBytesPerDay: 8,
     maxTotalMb: 256,
-    retentionDays: 30,
+    retentionDays: 90,
+    // v1.6.1 cold-tier: shards older than this are candidates for monthly gzip
+    // archiving (must stay strictly below retentionDays).
+    archiveAfterDays: 7,
     maxScanMb: 16,
     // Deep-scan turn budget. The scanner walks each shard NEWEST-FIRST, so this is
     // "how far back from the tail a single deep_raw may look" — a knob, not a
@@ -707,6 +710,18 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     'raw.retentionDays',
     { min: 1, max: 365 },
   );
+  const rawArchiveAfterDays = requireInteger(
+    rawIn.archiveAfterDays === undefined ? defaults.raw.archiveAfterDays : rawIn.archiveAfterDays,
+    'raw.archiveAfterDays',
+    { min: 1, max: 3650 },
+  );
+  if (rawArchiveAfterDays >= rawRetentionDays) {
+    throw configError(
+      ErrorCodes.CONFIG_OUT_OF_RANGE,
+      `config.raw.archiveAfterDays (${rawArchiveAfterDays}) must be strictly below config.raw.retentionDays (${rawRetentionDays}); otherwise there is nothing to archive`,
+      { key: 'raw.archiveAfterDays', got: rawArchiveAfterDays, retentionDays: rawRetentionDays },
+    );
+  }
   const rawMaxScanMb = requireInteger(
     rawIn.maxScanMb === undefined ? defaults.raw.maxScanMb : rawIn.maxScanMb,
     'raw.maxScanMb',
@@ -1095,6 +1110,7 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
       maxBytesPerDay: rawMaxBytesPerDay,
       maxTotalMb: rawMaxTotalMb,
       retentionDays: rawRetentionDays,
+      archiveAfterDays: rawArchiveAfterDays,
       maxScanMb: rawMaxScanMb,
       maxScanTurns: rawMaxScanTurns,
       maxResultTokens: rawMaxResultTokens,
