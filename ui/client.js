@@ -2042,6 +2042,9 @@
         const [selectedIds, setSelectedIds] = React.useState([]);
         const [transferOpen, setTransferOpen] = React.useState(false);
         const [spaceList, setSpaceList] = React.useState(null);
+        // v1.6.1: archive month details are collapsed by default (the summary cards
+        // above already answer "how many / how much"); expanding is opt-in.
+        const [archiveOpen, setArchiveOpen] = React.useState(false);
 
         if (state.state === 'migrating') {
           return h('div', { style: { padding: 16 } }, h(MigrationCard, { migration: payload?.migration ?? state.migration }));
@@ -2193,6 +2196,65 @@
               }),
             ),
           ),
+          Array.isArray(rawInfo.archiveMonths) && rawInfo.archiveMonths.length > 0
+            ? h(
+                'div',
+                { style: { marginTop: 10 } },
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    style: smallButtonStyle,
+                    onClick: () => setArchiveOpen((open) => !open),
+                  },
+                  `${archiveOpen ? '收起' : '查看'}归档月度明细（${rawInfo.archiveMonths.length}）`,
+                ),
+                archiveOpen
+                  ? h(
+                      'div',
+                      { style: { marginTop: 8, overflowX: 'auto' } },
+                      h(
+                        'table',
+                        { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
+                        h(
+                          'thead',
+                          null,
+                          h(
+                            'tr',
+                            null,
+                            ['月份', '引擎', '归档大小', '归档时间'].map((label) =>
+                              h(
+                                'th',
+                                {
+                                  key: label,
+                                  style: { textAlign: 'left', padding: '4px 8px', color: palette.muted, fontWeight: 600, borderBottom: `1px solid ${palette.border}` },
+                                },
+                                label,
+                              ),
+                            ),
+                          ),
+                        ),
+                        h(
+                          'tbody',
+                          null,
+                          [...rawInfo.archiveMonths]
+                            .sort((left, right) => String(right.month).localeCompare(String(left.month)))
+                            .map((entry) =>
+                              h(
+                                'tr',
+                                { key: entry.name },
+                                h('td', { style: { padding: '4px 8px' } }, entry.month || '—'),
+                                h('td', { style: { padding: '4px 8px' } }, entry.engine === 'zstd' ? 'zstd' : 'gzip'),
+                                h('td', { style: { padding: '4px 8px' } }, fmtBytes(entry.bytes || 0)),
+                                h('td', { style: { padding: '4px 8px', color: palette.muted } }, fmtTime(entry.at)),
+                              ),
+                            ),
+                        ),
+                      ),
+                    )
+                  : null,
+              )
+            : null,
           // Tag search above the graph: native Enter commits the query, and the
           // graph below receives the filtered projection (filterGraphByQuery).
           h(TagSearch, {

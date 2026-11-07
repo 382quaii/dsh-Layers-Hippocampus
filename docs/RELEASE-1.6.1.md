@@ -3,14 +3,14 @@
 > 版本：**1.6.1**（2026-11-07：全面解除 1.5.7 的版本冻结，恢复语义化版本；本版新增检索上限剪枝与段记 Token 审计）。
 
 > 状态：**代码与文档已就绪；仓库推送 / npm 发布 / 市场 PR 需要你的 GitHub 与 npm 凭据，代理与网络，本会话未执行。**
-> 基线：`dsh-memory` 工作区，全量 **446/446 测试通过**（64 个测试文件；另有 `dsh-orchestrator` 31/31）。
+> 基线：`dsh-memory` 工作区，全量 **447/447 测试通过**（64 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；插件市场仍无条目（未发布 npm）。
 
 ## 本版内容
 
 - **A 检索上限剪枝（1.6.1 新增）**：命中分数上界 `salience × 3.9`（tagAffinity≤3、timeBoost≤1.3 等因子封顶），候选按 salience 降序访问，上界打不过第 k 名即停止评分；pinned 绕过剪枝；`pruned`/`notes` 可观测；4 个用例 `test/v170.pruning.test.js`。
 - **压缩引擎可选（1.6.1）**：`raw.compressionEngine` 支持 `gzip`（默认）/ `zstd`，设置页可选择并一键启用/停用。Zstd 走 Node 内置 `node:zlib`，**不下载任何包、也没有可卸载的包**——“停用”即切回 gzip。归档扩展名 `.jsonl.gz` / `.jsonl.zst` 按扩展名分派解压，旧格式切换后仍可读；运行时无 zstd 则静默回退，`capabilities.compression` 报告可用性。4 个用例 `test/v161.compression.test.js`。
-- **/stats 面板可视化（1.6.1）**：`panel.raw` 增加 `archiveCount` / `archivedBytes` / `totalBytes` / `archiveMonths` / `engines{gzip,zstd}` / `savedBytes` / `compressionRatio` / `indexedShards`；归档记录 `bytesBefore`/`bytesAfter` 以计算真实压缩率。面板新增“raw 索引覆盖”“raw 冷归档”两卡，旧宿主缺字段显示“—”。3 个用例 `test/v161.stats.test.js`。
+- **/stats 面板可视化（1.6.1）**：`panel.raw` 增加 `archiveCount` / `archivedBytes` / `totalBytes` / `archiveMonths` / `engines{gzip,zstd}` / `savedBytes` / `compressionRatio` / `indexedShards`；归档记录 `bytesBefore`/`bytesAfter` 以计算真实压缩率。面板新增“raw 索引覆盖”“raw 冷归档”两卡与**可折叠归档月度明细表**（月份/引擎/归档大小/归档时间，月倒序，默认收起），旧宿主缺字段显示“—”。4 个用例 `test/v161.stats.test.js`。
 - **段记 Token 审计（1.6.1）**：`docs/AUDIT-2026-11-07-segment-token.md` 证明无 P0 重复注入，列出 6 个注入面；2 个 P3 已实施：Active Task 事件进块去重池、Persona 按 L3 形状 memo 化。
 - **raw 冷热分层压缩（1.6.1，零依赖）**：`maintain()` 月度门控，把超过 `raw.archiveAfterDays`（默认 7）的日分片按月合并为 `raw-archive-YYYY-MM.jsonl.gz`（Node 原生 `zlib`）后删除明文；豁免近 30 天有访问、`pinned`、`status:handoff`、高频标签；`deep_raw`/hash 恢复用 `createGunzip()` 流式逐行读、命中即停；损坏归档 `MEM_E_CORRUPTED_ARCHIVE` 跳过。`raw.retentionDays` 默认 30→90 且必须大于阈值（fail-fast）。7 个用例 `test/v161.archive.test.js`。
 - **版本解冻（2026-11-07）**：删除全部“版本冻结/不再升版本号”表述，自 1.6.0 起恢复正常版本节奏。
@@ -37,7 +37,7 @@
 
 ```powershell
 cd C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory
-node test/run.mjs                # 期望 446/446
+node test/run.mjs                # 期望 447/447
 cd ..\dsh-orchestrator
 node test/run.mjs                # 期望 31/31
 cd ..\dsh-memory

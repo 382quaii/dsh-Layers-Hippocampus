@@ -88,6 +88,14 @@ test('a real cold archive shows count, engine distribution and compression ratio
     assert.ok(raw.archivedBytes > 0);
     assert.ok(raw.compressionRatio !== null && raw.compressionRatio > 0);
     assert.ok(raw.savedBytes > 0, 'archive bytesBefore/bytesAfter are recorded');
+    // Month-detail rows power the expandable list in the panel.
+    assert.equal(raw.archiveMonths.length, 1);
+    const monthRow = raw.archiveMonths[0];
+    assert.equal(monthRow.month, day.slice(0, 7));
+    assert.equal(monthRow.engine, 'gzip');
+    assert.ok(monthRow.bytes > 0);
+    assert.ok(Number.isFinite(monthRow.at), 'archive timestamp is reported');
+    assert.ok(monthRow.bytesBefore > monthRow.bytesAfter, 'before/after bytes are reported per month');
   } finally {
     fixture.dispose();
     fs.rmSync(dir, { recursive: true, force: true });

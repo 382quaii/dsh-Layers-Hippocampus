@@ -57,6 +57,16 @@ test('the panel renders the archive/index StatCards from panel.raw', () => {
   assert.match(source, /fmtBytes\(rawInfo\.savedBytes\)/, 'saved bytes are humanised');
 });
 
+test('the archive month table is collapsible and lists engine/bytes/time', () => {
+  assert.match(source, /const \[archiveOpen, setArchiveOpen\] = React\.useState\(false\)/);
+  assert.match(source, /查看.*归档月度明细/);
+  assert.match(source, /rawInfo\.archiveMonths/);
+  assert.match(source, /\[\.\.\.rawInfo\.archiveMonths\]/);
+  assert.match(source, /localeCompare\(String\(left\.month\)\)/, 'rows are month-DESC sorted');
+  assert.match(source, /fmtTime\(entry\.at\)/);
+  assert.match(source, /entry\.engine === 'zstd' \? 'zstd' : 'gzip'/);
+});
+
 test('the enable/disable buttons toggle rawCompressionEngine only', () => {
   assert.match(source, /启用 Zstd（内置引擎）/);
   assert.match(source, /停用 Zstd（切回 Gzip）/);

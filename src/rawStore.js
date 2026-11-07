@@ -843,29 +843,31 @@ export class RawStore {
     const shards = this.listShards();
     const indexedShards = shards.filter((name) => readIndex(path.join(this.dir, name)) !== null).length;
     const archives = this.archive.listArchives();
+    const archiveState = this.archive.readState();
+    const stateByMonth = archiveState.archives ?? {};
     let archivedBytes = 0;
     const archiveMonths = [];
     for (const name of archives) {
+      const month = name.slice('raw-archive-'.length, 'raw-archive-'.length + 7);
+      const record = stateByMonth[month] ?? null;
+      let bytes = 0;
       try {
-        archivedBytes += fs.statSync(path.join(this.dir, name)).size;
+        bytes = fs.statSync(path.join(this.dir, name)).size;
+        archivedBytes += bytes;
       } catch {
         /* removed mid-read */
       }
       archiveMonths.push({
         name,
-        month: name.slice('raw-archive-'.length, 'raw-archive-'.length + 7),
+        month,
         engine: name.endsWith('.zst') ? 'zstd' : 'gzip',
-        bytes: (() => {
-          try {
-            return fs.statSync(path.join(this.dir, name)).size;
-          } catch {
-            return 0;
-          }
-        })(),
+        bytes,
+        at: Number.isFinite(record?.at) ? record.at : null,
+        bytesBefore: Number.isFinite(record?.bytesBefore) ? record.bytesBefore : null,
+        bytesAfter: Number.isFinite(record?.bytesAfter) ? record.bytesAfter : null,
       });
     }
     const plaintextBytes = this.totalBytes();
-    const archiveState = this.archive.readState();
     let savedBytes = 0;
     let beforeKnown = 0;
     let afterKnown = 0;

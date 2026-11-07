@@ -32,8 +32,10 @@ resumes; 1.6.1 is the current release (patch on top of 1.6.0).**
   (null when no measured archive) and `indexedShards`. Each archive records
   `bytesBefore`/`bytesAfter` in `state/raw-archive.json`, so the ratio and saved
   bytes are real measurements, not estimates. The panel gains two StatCards
-  (“raw 索引覆盖”, “raw 冷归档”) with graceful “—” for an older host; 3 cases in
-  `test/v161.stats.test.js`.
+  (“raw 索引覆盖”, “raw 冷归档”) with graceful “—” for an older host, plus a
+  collapsible **archive month table** (月份 / 引擎 / 归档大小 / 归档时间, month-DESC,
+  collapsed by default); `archiveMonths` rows carry `at`/`bytesBefore`/`bytesAfter`.
+  4 cases in `test/v161.stats.test.js` + 2 UI contract cases.
 - **Sparse line index for raw shards** (performance audit item C): one
   `<day>.jsonl.idx.json` per shard, sampled every 64 lines with
   `{line, offset, timestamp}` plus `bytes/mtimeMs/lineCount/minTs/maxTs/sorted`.
@@ -67,7 +69,7 @@ resumes; 1.6.1 is the current release (patch on top of 1.6.0).**
   (`O(K log K)` ordering) but the per-candidate decay/similarity work is skipped
   for the long low-salience tail.
 - Regression: pinned decay stays exactly 1 (bypass path), monthly memos unchanged.
-- **446 tests green** (64 files).
+- **447 tests green** (64 files).
 
 ## [1.6.0] — 2026-11-06
 
