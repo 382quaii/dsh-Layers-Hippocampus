@@ -67,9 +67,14 @@ flowchart TD
 
     IDXA --> AS["活跃集合 active-set<br/>标签亲和与衰减"]
     IDXA --> DT["L2 日记 journal/ + archive/<br/>按天滚动，pinned 合并"]
-    IDXA --> L15["L1.5 标签树 state/tag-tree.json<br/>活树 + 幽灵节点"]
+    IDXA --> L15["L1.5 段记 state/tag-tree.json<br/>活树 + 幽灵节点（日记下一级）"]
 
     DT -->|"离线 Dream：LLM 蒸馏 / 本地降级"| L3["L3 语义 semantic/sem.log.jsonl<br/>置信度 + 来源事件溯源"]
+
+    T -->|"is_transient_trend / 爆发检测"| L25["L2.5 防热词隔离 semantic/temp.log.jsonl<br/>TTL 考察，永不直接晋升"]
+    L25 -->|"窗口内强化 且 hitCount≥2 → 晋升"| L3
+    L25 -->|"其余到期物理删除"| X["淘汰（不留字节）"]
+
     L15 --> HINT["Memory Hints<br/>词法匹配的 ≤5 个标签"]
 
     L3 --> P["Prompt 装配<br/>persona 100 + memory-state 220"]
@@ -293,7 +298,11 @@ flowchart TD
 - 检索兼容：隔离条目可被召回，但 `priority: "temp"`，分数乘 `retrievalPenalty=0.4`，并带 `ttlDays`/`expiresAt`；已过期未裁决的不返回（否则 TTL 是假的）。
 - 幂等与不复活：已晋升的条目再被提及 → `{action:"ignored", reason:"status:permanent"}`，不会重新进入隔离。
 
-## L1.5 标签层级树（幽灵宽限）
+## L1.5 段记（标签层级树，幽灵宽限）
+
+**定位**：段记属于 **L1 内、L2 日记的下一级**——它和 raw 一样**逐日持久落盘**（写入
+`state/tag-tree.json`），不是纯内存视图；但它同时是**派生结构**：活树可由 `maintain()` 从
+日志重建，删掉文件只丢幽灵历史，不影响真相源。
 
 层级标签（`tech/frontend/vue3`）先于 L2.5 成为"记忆的形状"：一棵**派生**的三层树，由 `maintain()` 从收敛后的索引投影，写在 `state/tag-tree.json`。宪章约束与实现纪律：
 
