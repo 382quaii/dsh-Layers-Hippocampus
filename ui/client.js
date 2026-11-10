@@ -2244,7 +2244,7 @@
                                 'tr',
                                 { key: entry.name },
                                 h('td', { style: { padding: '4px 8px' } }, entry.month || '—'),
-                                h('td', { style: { padding: '4px 8px' } }, entry.engine === 'zstd' ? 'zstd' : 'gzip'),
+                                h('td', { style: { padding: '4px 8px' } }, entry.engine === 'zstd' ? 'zstd' : entry.engine === 'brotli' ? 'brotli' : 'gzip'),
                                 h('td', { style: { padding: '4px 8px' } }, fmtBytes(entry.bytes || 0)),
                                 h('td', { style: { padding: '4px 8px', color: palette.muted } }, fmtTime(entry.at)),
                               ),
@@ -2584,7 +2584,9 @@
           rawMaxTotalMb: Number((config.raw && config.raw.maxTotalMb) ?? 256),
           rawRetentionDays: Number((config.raw && config.raw.retentionDays) ?? 90),
           rawArchiveAfterDays: Number((config.raw && config.raw.archiveAfterDays) ?? 7),
-          rawCompressionEngine: (config.raw && config.raw.compressionEngine) === 'zstd' ? 'zstd' : 'gzip',
+          rawCompressionEngine: ['brotli', 'zstd', 'gzip'].includes(config.raw && config.raw.compressionEngine)
+            ? config.raw.compressionEngine
+            : 'brotli',
           rawMaxScanTurns: Number((config.raw && config.raw.maxScanTurns) ?? 5000),
           deleteGraceHours: Number((config.delete && config.delete.graceHours) ?? 24),
           reviewEnabled: (config.review && config.review.enabled) !== false,
@@ -3013,7 +3015,9 @@
             'raw.maxTotalMb': Number(draft.rawMaxTotalMb),
             'raw.retentionDays': Number(draft.rawRetentionDays),
             'raw.archiveAfterDays': Number(draft.rawArchiveAfterDays),
-            'raw.compressionEngine': draft.rawCompressionEngine === 'zstd' ? 'zstd' : 'gzip',
+            'raw.compressionEngine': ['brotli', 'zstd', 'gzip'].includes(draft.rawCompressionEngine)
+              ? draft.rawCompressionEngine
+              : 'brotli',
             'raw.maxScanTurns': Number(draft.rawMaxScanTurns),
             'delete.graceHours': Number(draft.deleteGraceHours),
             'review.enabled': Boolean(draft.reviewEnabled),
@@ -3679,13 +3683,14 @@
               label: '冷压缩引擎（raw.compressionEngine）',
               hint:
                 (statsPayload && statsPayload.capabilities && statsPayload.capabilities.compression
-                  ? `当前运行时 Node ${statsPayload.capabilities.compression.node}：gzip ${statsPayload.capabilities.compression.gzip ? '可用' : '不可用'}，zstd ${statsPayload.capabilities.compression.zstd ? '可用' : '不可用'}。`
+                  ? `当前运行时 Node ${statsPayload.capabilities.compression.node}：brotli ${statsPayload.capabilities.compression.brotli ? '可用' : '不可用'}，gzip ${statsPayload.capabilities.compression.gzip ? '可用' : '不可用'}，zstd ${statsPayload.capabilities.compression.zstd ? '可用' : '不可用'}。`
                   : '') +
-                'Zstd 使用 Node 内置 zstandard（无需下载或安装外部包）。启用后新归档为 .jsonl.zst，压缩率更高；停用则切回 .jsonl.gz。历史归档保持原格式、两种格式都可流式读取。',
+                '全部为 Node 内置编解码器（无需下载或安装外部包）。Brotli 11 级为冷数据默认的极限压缩；Gzip/Zstd 仍可选。历史归档保持原格式，三种格式都可流式读取。',
               value: draft.rawCompressionEngine,
               options: [
-                { value: 'gzip', label: 'Gzip（Node 内置，默认）' },
-                { value: 'zstd', label: 'Zstd（Node 内置，压缩率更高）' },
+                { value: 'brotli', label: 'Brotli 11 级（Node 内置，默认，压缩率最高）' },
+                { value: 'gzip', label: 'Gzip（Node 内置，兼容性最好）' },
+                { value: 'zstd', label: 'Zstd（Node 内置，解压更快）' },
               ],
               onChange: (value) => edit('rawCompressionEngine', value),
               disabled,
@@ -3702,17 +3707,17 @@
                   onClick: () =>
                     edit(
                       'rawCompressionEngine',
-                      draft.rawCompressionEngine === 'zstd' ? 'gzip' : 'zstd',
+                      draft.rawCompressionEngine === 'brotli' ? 'gzip' : 'brotli',
                     ),
                 },
-                draft.rawCompressionEngine === 'zstd' ? '停用 Zstd（切回 Gzip）' : '启用 Zstd（内置引擎）',
+                draft.rawCompressionEngine === 'brotli' ? '切回 Gzip（兼容模式）' : '启用 Brotli 11 级（极限压缩）',
               ),
               h(
                 'span',
                 { style: { ...labelStyle, marginBottom: 0 } },
-                draft.rawCompressionEngine === 'zstd'
-                  ? 'Zstd 已启用：点击“保存全部”后，新归档使用 .jsonl.zst。'
-                  : '当前使用 Gzip：点击“保存全部”后切换，下个月归档生效。',
+                draft.rawCompressionEngine === 'brotli'
+                  ? 'Brotli 11 级已选中：点击“保存全部”后，新归档使用 .jsonl.br。'
+                  : '当前未使用极限压缩：点击“保存全部”后切换，下个月归档生效。',
               ),
             ),
             h(Field, {

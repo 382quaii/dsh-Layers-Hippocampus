@@ -1446,6 +1446,8 @@ function uiConfig(config) {
     features: config.features,
     // v1.5.6 L2 multi-merge tunables.
     l2Merge: config.l2Merge,
+    // v1.6.1 L3 capacity breaker (semantic layer must not grow with conversation count).
+    semantic: config.semantic,
     // v1.5.6: offline Dream tunables — SAFE SUBSET ONLY. `dream.llm` is deliberately
     // absent: the endpoint/credential live in the profile or DSH_DREAM_LLM_* env and
     // must never round-trip through the browser.

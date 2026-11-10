@@ -1,6 +1,6 @@
 # @local/dsh-memory — 分层长期记忆 Host 插件
 
-> 版本：**1.6.1** ｜ 全量用例：**447/447** ｜ 运行时依赖：**零**
+> 版本：**1.6.1** ｜ 全量用例：**456/456** ｜ 运行时依赖：**零**
 
 给 DSH 智能体一份"活得比会话久"的记忆：**追加式原始日志是唯一真相源**，标签索引、日记、活跃集合全部是可丢弃、可重建的读模型，语义摘要独立于原始日志生死。
 
@@ -82,11 +82,55 @@ flowchart TD
     HINT --> P
     DT --> P
 
-    R -.->|"月度门控 + 冷热判定"| AR["冷归档<br/>raw-archive-YYYY-MM.jsonl.gz/.zst"]
+    R -.->|"月度门控 + 冷热判定(90天+零访问)"| AR["冷归档<br/>raw-archive-YYYY-MM.jsonl.br (brotli 11)"]
     AR -.->|"流式解压"| SCAN
+
+    R -.->|"distillPrune: 已蒸馏 + 出热窗"| TB
+    IDXA -.->|"重复长文本 → contentRef"| TPL["templates.json<br/>（只存一份）"]
 ```
 
 **读路径与写路径分离**：写入只 append 到 `log/`（加 `ledger` 幂等键），索引/日记/标签树/图谱全部由 `maintain()` 离线重建；**读路径永不修改真相源**，因此任何读模型损坏都只是性能事件，不是数据事件。
+
+## 打破线性增长：压缩、编码、语义三层
+
+append-only 且逐条存原文 ⇒ 增长 O(n)；Zstd 只改变斜率。三层分别作用于不同环节：
+
+### ① 压缩层（冷数据极限压榨）
+
+- **多维冷热判定**（`RawStore.archiveCold`，`src/rawStore.js`）——**全满足才归档**：
+  1. 分片日期 > `raw.archiveAfterDays`（默认 **90**）；
+  2. 近 `raw.coldAccessWindowDays`（默认 **90**）内 `access_count == 0`（`state/raw-access.json`）；
+  3. 无 `pinned` / `status:handoff` / 活跃高频标签。
+  近期被读过的「高龄」分片保持**明文**，O(1) 游标扫描不受影响。
+- **极限压缩**：`src/compression.js` 默认 Brotli **quality 11**（`.jsonl.br`），
+  `gzip`(9) / `zstd` 仍可选；三者全为 Node 内置 `node:zlib`，无外部依赖。
+- **月度门控**：`maintain()` 每月最多归档一次；同月已有归档则跳过（避免 deep_raw 重复行）。
+- **写入崩溃安全**：先写 `<target>.tmp`，压缩流完全 flush 后 `rename`。
+- 读取：`scanArchive()` 按扩展名分派解压器（`.br`/`.gz`/`.zst`），流式逐行、命中即停。
+
+### ② 编码层（引用去重，明确拒绝列式）
+
+- `src/index/templates.js`：`dedupeTemplates(events)` 把「≥512 字符且出现 ≥2 次」的重复长文本
+  提升为模板，事件侧置空 `content` 并写 `contentRef = tpl_<sha256 前16位>`。
+- 模板随索引代际落盘为 `templates.json`；`IndexStore.current()` 加载时用 `resolveTemplates()`
+  还原原文 —— 读者永远拿到完整内容。
+- **红线**：日志不参与替换。raw 仍是逐行原文，`deep_raw`、`restoreByHash`、行级游标全部不变；
+  数据本身即精确回答 O(n) 问题。
+- 收益记入 `stats.templateRefs / stats.templates / stats.templateSavedChars`。
+
+### ③ 语义层（从线性到亚线性）
+
+- **无损存记忆、有损存过程**：raw 降级为可选审计层，L2/L3 才是长期主体。
+- `RawStore.pruneDistilled()`：仅当 `raw.distillPrune === true` **且**调用方给出已蒸馏日集合
+  （来自 L3 摘要的 `sourceEvents` → 事件日）时，才删除出热窗分片；删除前先把每条内容哈希写入
+  **tombstone**，因此不可能被重建复活。默认关闭 —— raw 仍是绝对真相。
+- **L2 同类项合并**：`src/l2Merge.js`（`status:l2-merged` + `state/l2-merge.json`），不无限追加。
+- **L3 硬熔断 + LRU**：`SemanticStore.enforceCapacity()`，上限 `semantic.maxEntries`（默认 **100**）；
+  超限时按 `updatedAt` 最旧优先追认 `semantic_retire`（append-only，可审计、可重放）。
+  `semantic.lruOnCap=false` 可关闭。`maintain()` 报告 `report.semanticCapacity`。
+
+效果：日志只在一个**有界热窗**内保持全量原文；冷数据被极限压缩、重复模板只存一份、
+已被蒸馏的过程数据可安全回收，而 L2/L3 的上界由「事件重要性」决定，不随对话条数线性膨胀。
 
 ## 配置
 
@@ -637,7 +681,7 @@ window.__ModuleLoader__.load({
 
 运行器带**看门狗**：默认 **60s**（`MEM_TEST_TIMEOUT_MS` 可调）仍未退出，就打印**卡住时正在导入/执行的文件、最后完成的测试名与完成数、活动资源、尚未触发的定时器**，然后 `process.exit(1)`。它不会用 `process.exit(0)` 掩盖超时——挂起即失败。`MEM_TEST_TRACE=1` 可看文件级进度，`MEM_TEST_ONLY=<子串>` 只跑一组。
 
-447 个用例（64 个文件）覆盖：
+456 个用例（64 个文件）覆盖：
 
 - 索引与标签：重建 digest 一致、行号漂移防护（eventId 不变、行号变）、同义合并、活跃集 cap 挤出、规则变更不改清单、空活跃集降级、top-k 有界有序去重。
 - 衰减与删除：30 天半衰期、reinforce 移动锚点（不存字段）、仅文本粗筛、标签过滤、维护代切换且旧代可读、boot 检查、压缩不丢记录、并发维护串行化、四阶段删除、archive 可回滚 vs purge 不可、strict 巩固暂停与恢复、任务重放幂等、错误 id 零变更。

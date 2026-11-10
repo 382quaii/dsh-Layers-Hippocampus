@@ -14,6 +14,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { resolveTemplates } from './templates.js';
 import { MemoryError, ErrorCodes } from '../errors.js';
 import {
   ensureDir,
@@ -33,6 +34,7 @@ const FILES = {
   diary: 'diary.json',
   tombstones: 'tombstones.json',
   aliases: 'aliases.json',
+  templates: 'templates.json',
   manifest: 'manifest.json',
 };
 
@@ -73,13 +75,18 @@ export class IndexStore {
     if (!manifest) {
       throw new MemoryError(ErrorCodes.INDEX_MISSING, 'index generation has no manifest', { gen });
     }
+    const templates = readJson(path.join(dir, FILES.templates), {});
+    const rawEvents = readJson(path.join(dir, FILES.events), []);
     const view = {
       generation: gen,
       manifest,
       builtAt: manifest.builtAt,
       policyHash: manifest.policyHash,
       sourceLogGen: manifest.sourceLogGen,
-      events: readJson(path.join(dir, FILES.events), []),
+      // v1.6.1: the on-disk index stores repeated long contents ONCE (templates) and
+      // events point at them; every reader gets the resolved content back.
+      events: resolveTemplates(rawEvents, templates),
+      templates,
       tags: readJson(path.join(dir, FILES.tags), {}),
       activeSet: readJson(path.join(dir, FILES.activeSet), { cap: 0, entries: [], evicted: [], churn: {} }),
       diary: readJson(path.join(dir, FILES.diary), { blocks: [] }),
@@ -113,6 +120,7 @@ export class IndexStore {
     writeJsonAtomic(path.join(tmp, FILES.diary), index.diary);
     writeJsonAtomic(path.join(tmp, FILES.tombstones), index.tombstones);
     writeJsonAtomic(path.join(tmp, FILES.aliases), index.aliases);
+    writeJsonAtomic(path.join(tmp, FILES.templates), index.templates ?? {});
 
     const manifest = {
       v: 1,
@@ -136,7 +144,8 @@ export class IndexStore {
       builtAt: index.builtAt,
       policyHash: index.policyHash,
       sourceLogGen: manifest.sourceLogGen,
-      events: index.events,
+      events: resolveTemplates(index.events, index.templates ?? {}),
+      templates: index.templates ?? {},
       tags: index.tags,
       activeSet: index.activeSet,
       diary: index.diary,

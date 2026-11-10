@@ -64,12 +64,12 @@ test('the archive month table is collapsible and lists engine/bytes/time', () =>
   assert.match(source, /\[\.\.\.rawInfo\.archiveMonths\]/);
   assert.match(source, /localeCompare\(String\(left\.month\)\)/, 'rows are month-DESC sorted');
   assert.match(source, /fmtTime\(entry\.at\)/);
-  assert.match(source, /entry\.engine === 'zstd' \? 'zstd' : 'gzip'/);
+  assert.match(source, /entry\.engine === 'zstd' \? 'zstd' : entry\.engine === 'brotli' \? 'brotli' : 'gzip'/);
 });
 
 test('the enable/disable buttons toggle rawCompressionEngine only', () => {
-  assert.match(source, /启用 Zstd（内置引擎）/);
-  assert.match(source, /停用 Zstd（切回 Gzip）/);
+  assert.match(source, /启用 Brotli 11 级（极限压缩）/);
+  assert.match(source, /切回 Gzip（兼容模式）/);
   assert.match(source, /edit\(\s*'rawCompressionEngine'/);
   assert.match(source, /edit\('rawCompressionEngine', value\)/, 'Select onChange is wired');
 });

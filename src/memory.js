@@ -2126,6 +2126,38 @@ export class Memory {
     } catch (error) {
       report.tagTreeError = error instanceof Error ? error.message : String(error);
     }
+    // v1.6.1 semantic-layer evolution: "无损存记忆、有损存过程". Only when the
+    // operator opts in (raw.distillPrune) do we clean raw bytes whose day is already
+    // covered by an L3 summary — and always through the tombstone path.
+    try {
+      const events = this.indexManager?.snapshot?.()?.events ?? [];
+      const byId = new Map(events.map((event) => [event.eventId, event]));
+      const distilledDays = new Set();
+      for (const summary of this.semanticStore.list()) {
+        for (const eventId of summary.sourceEvents ?? []) {
+          const event = byId.get(eventId);
+          if (Number.isFinite(event?.eventTime)) distilledDays.add(dayKey(event.eventTime));
+        }
+      }
+      report.rawDistillPrune = await this.raw.pruneDistilled({
+        now: this.clock.now(),
+        hotWindowDays: this.config?.raw?.hotWindowDays ?? 30,
+        distilledDays,
+      });
+    } catch (error) {
+      report.rawDistillPruneError = error instanceof Error ? error.message : String(error);
+    }
+    // v1.6.1 L3 capacity breaker: keep the semantic layer bounded by importance, not
+    // by conversation count. Excess summaries are retired via LRU (append-only retire).
+    try {
+      report.semanticCapacity = this.semanticStore.enforceCapacity({
+        clock: this.clock,
+        maxEntries: this.config?.semantic?.maxEntries ?? 100,
+        lruOnCap: this.config?.semantic?.lruOnCap !== false,
+      });
+    } catch (error) {
+      report.semanticCapacityError = error instanceof Error ? error.message : String(error);
+    }
     this.refreshBriefing();
     return report;
   }

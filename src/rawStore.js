@@ -27,6 +27,7 @@ import { createHash } from 'node:crypto';
 import { MemoryError, ErrorCodes } from './errors.js';
 import { dayKey, ensureDir, sha256 } from './util.js';
 import { RawArchive, archiveMonthOf, isArchiveName, scanGzipArchive } from './rawArchive.js';
+import { engineForArchive } from './compression.js';
 import { buildIndex, indexFileFor, isIndexFile, readIndex, shardOverlapsWindow, writeIndex } from './rawIndex.js';
 
 export const RAW_DIR = 'raw';
@@ -500,7 +501,7 @@ export class RawStore {
     for (let cursor = startTime; cursor <= endTime; cursor += 86_400_000) wantedMonths.add(archiveMonthOf(dayKey(cursor)));
     const archives = this.archive
       .listArchives()
-      .filter((name) => wantedMonths.has(name.replace(/^raw-archive-/, '').replace(/\.jsonl\.(gz|zst)$/, '')));
+      .filter((name) => wantedMonths.has(name.replace(/^raw-archive-/, '').replace(/\.jsonl\.(gz|zst|br)$/, '')));
 
     const hits = [];
     const archiveErrors = [];
@@ -713,19 +714,20 @@ export class RawStore {
 
   /**
    * Cold-tier archiving (v1.6.1). Runs at most once per month, merges all eligible
-   * daily shards of a calendar month into `raw-archive-YYYY-MM.jsonl.gz`.
+   * daily shards of a calendar month into `raw-archive-YYYY-MM.jsonl.br` (brotli 11).
    *
-   * Eligibility (ALL must hold):
-   *   1. shard day is older than `raw.archiveAfterDays` (default 30);
-   *   2. access_count over the last 30 days is 0 (counter in state/raw-access.json);
+   * Multi-dimensional eligibility — ALL must hold (never age alone):
+   *   1. shard day is older than `raw.archiveAfterDays` (default 90);
+   *   2. access_count in `raw.coldAccessWindowDays` (default 90) is 0;
    *   3. the shard contains no pinned / status:handoff / hot-tag event.
    */
-  async archiveCold({ now = this.clock.now(), hotTags = null, archiveAfterDays = null } = {}) {
+  async archiveCold({ now = this.clock.now(), hotTags = null, archiveAfterDays = null, coldAccessWindowDays = null } = {}) {
     const config = this.config();
-    const afterDays = Math.max(1, Number(archiveAfterDays ?? config.archiveAfterDays ?? 30));
+    const afterDays = Math.max(1, Number(archiveAfterDays ?? config.archiveAfterDays ?? 90));
+    const accessWindowDays = Math.max(1, Number(coldAccessWindowDays ?? config.coldAccessWindowDays ?? 90));
     const access = this.archive.readAccess();
     const cutoff = dayKey(now - afterDays * 86_400_000);
-    const recentCutoff = now - 30 * 86_400_000;
+    const recentCutoff = now - accessWindowDays * 86_400_000;
     const hot = new Set(Array.isArray(hotTags) ? hotTags : []);
     const eligible = [];
     const skipped = [];
@@ -774,7 +776,7 @@ export class RawStore {
       shards: this.listShards(),
       eligible,
       now,
-      engine: config.compressionEngine ?? 'gzip',
+      engine: config.compressionEngine ?? 'brotli',
     });
     if (result.archived.length > 0) {
       this._total = null;
@@ -782,6 +784,71 @@ export class RawStore {
       this._dayBytes.clear();
     }
     return { ...result, eligible: eligible.length, skipped };
+  }
+
+  /**
+   * v1.6.1 semantic-layer evolution: "无损存记忆、有损存过程".
+   *
+   * A shard outside `raw.hotWindowDays` whose distillation already produced L2/L3
+   * output may be physically cleaned. Every removed record's content hash is written
+   * through the TOMBSTONE path first, so nothing can be resurrected by a later
+   * replay/rebuild — the deletion is real, not a hide.
+   *
+   * Safety: this never runs unless `raw.distillPrune` is on AND the caller passes the
+   * distilled day set (coverage proof). Raw remains the absolute truth by default.
+   *
+   * @param {{now?: number, hotWindowDays?: number, distilledDays?: Iterable<string>, limit?: number}} input
+   */
+  async pruneDistilled({ now = this.clock.now(), hotWindowDays = null, distilledDays = null, limit = Infinity } = {}) {
+    const config = this.config();
+    if (config.distillPrune !== true) {
+      return { enabled: false, removed: [], freedBytes: 0, tombstoned: 0, reason: 'distillPrune-disabled' };
+    }
+    const covered = new Set(Array.isArray(distilledDays) ? distilledDays : distilledDays ? [...distilledDays] : []);
+    if (covered.size === 0) {
+      return { enabled: true, removed: [], freedBytes: 0, tombstoned: 0, reason: 'no-distilled-days' };
+    }
+    const windowDays = Math.max(1, Number(hotWindowDays ?? config.hotWindowDays ?? 30));
+    const today = dayKey(now);
+    const cutoff = dayKey(now - windowDays * 86_400_000);
+    const removed = [];
+    const hashes = new Set();
+    let freed = 0;
+    for (const name of this.listShards().slice(0, Number.isFinite(limit) ? limit : undefined)) {
+      const day = name.replace('.jsonl', '');
+      if (day === today) continue; // never touch the shard being written
+      if (day >= cutoff) continue; // still hot: keep the verbatim window
+      if (!covered.has(day)) continue; // no distillation proof for this day
+      const file = path.join(this.dir, name);
+      try {
+        for await (const line of readLinesForward(file)) {
+          if (!line.trim()) continue;
+          try {
+            const record = JSON.parse(line);
+            if (record?.type === 'raw_tombstone' || typeof record?.content !== 'string') continue;
+            hashes.add(sha256(record.content));
+          } catch {
+            /* malformed line: it cannot be hashed, so it cannot be tombstoned */
+          }
+        }
+        const size = fs.statSync(file).size;
+        fs.rmSync(file, { force: true });
+        fs.rmSync(indexFileFor(file), { force: true });
+        freed += size;
+        removed.push(day);
+      } catch (error) {
+        if (error?.code === 'ENOENT') continue;
+        throw error;
+      }
+    }
+    if (hashes.size > 0) await this.tombstone([...hashes], { at: now });
+    if (removed.length > 0) {
+      this._total = null;
+      this._hashes.clear();
+      this._dayBytes.clear();
+      this._tombstones = null;
+    }
+    return { enabled: true, removed, freedBytes: freed, tombstoned: hashes.size, hotWindowDays: windowDays };
   }
 
   /** TTL: delete whole shards strictly older than `today - retentionDays`. */  async prune({ now = this.clock.now() } = {}) {
@@ -860,7 +927,7 @@ export class RawStore {
       archiveMonths.push({
         name,
         month,
-        engine: name.endsWith('.zst') ? 'zstd' : 'gzip',
+        engine: engineForArchive(name),
         bytes,
         at: Number.isFinite(record?.at) ? record.at : null,
         bytesBefore: Number.isFinite(record?.bytesBefore) ? record.bytesBefore : null,
@@ -891,6 +958,7 @@ export class RawStore {
       totalBytes: plaintextBytes + archivedBytes,
       archiveMonths: archiveMonths.slice(-12),
       engines: {
+        brotli: archiveMonths.filter((entry) => entry.engine === 'brotli').length,
         gzip: archiveMonths.filter((entry) => entry.engine === 'gzip').length,
         zstd: archiveMonths.filter((entry) => entry.engine === 'zstd').length,
       },

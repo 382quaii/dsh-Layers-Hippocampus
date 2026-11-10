@@ -80,21 +80,42 @@
   （`context.coldStartInjectSummary` 默认开、`context.coldStartInjectRecentTurns` 默认关）；
   静态「状态唤醒」策略常驻，两个开关都关时也不会退化成客服腔。
 
-### raw 冷热分层与按月归档
+### 打破线性增长：压缩 / 编码 / 语义三层
+
+append-only 日志天然是 O(n)，只压不改斜率。三层各自掰弯一段曲线：
+
+**① 压缩层（冷数据极限压榨）**
 
 - 原始回合按天分片（`raw/YYYY-MM-DD.jsonl`）；热数据保持明文，供 `deep_raw` **倒序流式扫描**
   （64 KiB 反向分块，峰值内存 = 一个 chunk + 一行）。
-- **冷数据按月归档**：`maintain()` 中月度门控（每月最多一次），把超过 `raw.archiveAfterDays`
-  （默认 7 天）的分片合并为 `raw-archive-YYYY-MM.jsonl.gz`（或 `.jsonl.zst`）后删除明文。
-- 压缩引擎可选 `gzip`（默认）/ `zstd`，均使用 Node 内置 `node:zlib`——**不下载任何依赖**；
-  运行时无 zstd 时静默回退并在 `capabilities.compression` 上报。
-- 归档**不碰**近 30 天被读过、`pinned`、`status:handoff` 或带高频标签的分片。
-- 读取归档时用 `createGunzip()` / `createZstdDecompress()` **流式逐行解压**，命中即停，
-  绝不把整个归档读进内存。
+- **多维冷热判定**（严禁只看时间）：同时满足 `生成时间 > raw.archiveAfterDays`（默认 **90 天**）、
+  近 `raw.coldAccessWindowDays`（默认 **90 天**）**零访问**、且不含 `pinned` / `status:handoff` /
+  高频标签，才进入归档。
+- **极限分层压缩**：冷数据按月合并为 `raw-archive-YYYY-MM.jsonl.br`，默认 **Brotli quality 11**；
+  可切 `gzip` / `zstd`（全部 Node 内置，**零依赖**）。旧格式历史归档依然可读。
+- 读取归档时用 `createBrotliDecompress()` / `createGunzip()` / `createZstdDecompress()`
+  **流式逐行解压**，命中即停，绝不把整个归档读进内存。
 - **稀疏行索引**：每个分片旁挂 `<day>.jsonl.idx.json`（每 64 行采样），`deep_raw` 据此跳过
   时间窗不重叠的分片并复用行数，索引缺失/陈旧/损坏时自动降级为顺序扫描。
 
-### 多维保留策略
+**② 编码层（引用去重，不碰列式存储）**
+
+- 明确拒绝 Parquet / 列式：那会摧毁事件溯源的行级读取能力。
+- 重复的超长内容（工具 schema、系统提示块，≥512 字符且出现 ≥2 次）在**索引层**只存一份
+  （`templates.json`），事件用 `contentRef` 指向它；索引加载时还原成原文，读者无感。
+- **日志本身一字不改**：raw 仍是逐行原文，`deep_raw`、哈希恢复、行级游标全部不受影响。
+
+**③ 语义层（从线性到亚线性）**
+
+- 哲学：**无损存记忆、有损存过程**。原始 raw 降级为可选审计层，蒸馏后的 L2/L3 才是长期主体。
+- 热窗口内保留 raw 原文；超出 `raw.hotWindowDays`（默认 30 天）且**已被 L3 摘要覆盖**的 raw
+  分片，可在 `raw.distillPrune: true` 下被物理清理——**必经 Tombstone 路径**，删除即不可复活。
+- **L2 走同类项合并**（`l2Merge`），绝不无限追加。
+- **L3 硬熔断**：`semantic.maxEntries`（默认 **100**），超限按 LRU 淘汰最久未更新的摘要，
+  淘汰以 append-only 的 `semantic_retire` 记录落盘（决策本身可审计）。
+- 结果：L2/L3 随**事件重要性**增长，而不是随对话条数线性膨胀。
+
+### raw 保留三档
 
 raw 层提供三档，覆盖从“只留关键”到“全留”：
 
@@ -104,8 +125,8 @@ raw 层提供三档，覆盖从“只留关键”到“全留”：
 | `salience` | **默认**。只保留高价值回合：`salience ≥ raw.minSalience`、代码块、栈轨迹、错误类型等形态 |
 | `all` | 全部保存，受 `maxTurnKb` / `maxBytesPerDay` / `maxTotalMb` 预算约束 |
 
-配合 `raw.retentionDays`（默认 90 天，必须严格大于 `archiveAfterDays`）与 `pinned` 永不清除，
-形成“高价值永存 / 全量短存 / 按需不存”的完整谱系。
+配合 `raw.retentionDays`（默认 **365 天**，必须严格大于 `archiveAfterDays`）与 `pinned` 永不清除，
+形成“高价值永存 / 全量长期存 / 按需不存”的完整谱系。
 
 ### 检索、衰减与面板
 
@@ -161,7 +182,7 @@ node scripts/wait-for-routes.mjs
 ### 4. 验证
 
 ```bash
-npm test        # 进程内全量用例（447 个）
+npm test        # 进程内全量用例（456 个）
 npm run check   # 语法检查 + 全量测试
 ```
 

@@ -9,6 +9,25 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 **Version fully un-frozen (user directive 2026-11-07): normal semantic versioning
 resumes; 1.6.1 is the current release (patch on top of 1.6.0).**
 
+- **Breaking the linear log curve — three layers** (`test/v162.nonlinear.test.js`, 9 cases):
+  - **Compression layer**: cold classification is now MULTI-dimensional (age >
+    `raw.archiveAfterDays` **AND** zero access for `raw.coldAccessWindowDays` **AND** no
+    `pinned` / `status:handoff` / hot-tag record). Defaults move to
+    `archiveAfterDays=90`, `coldAccessWindowDays=90`, `retentionDays=365`. Cold
+    archives default to **Brotli quality 11** (`.jsonl.br`, "极限压缩") instead of
+    gzip; `gzip`/`zstd` stay selectable and all three are Node built-ins.
+    Recently-read old shards stay PLAINTEXT for O(1) cursor scans.
+  - **Encoding layer (referential dedup, NOT columnar)**: repeated long content
+    (tool schemas / system prompt blocks, ≥512 chars, ≥2 occurrences) is stored ONCE
+    in `templates.json` at the INDEX layer; events carry `contentRef` instead of a
+    duplicate copy. Index loads resolve refs, so readers always see exact content —
+    the log itself is untouched (`src/index/templates.js`).
+  - **Semantic layer**: raw stops being the only home of truth. `raw.distillPrune`
+    (opt-in) lets `maintain()` physically clean raw shards that are outside
+    `raw.hotWindowDays` **and** already covered by an L3 summary — always through the
+    tombstone path, so nothing resurrects. L3 gains a hard capacity breaker
+    (`semantic.maxEntries`, default 100) with LRU retirement recorded as append-only
+    `semantic_retire` events.
 - **Archive month detail UI**: the panel's raw section now shows `indexedShards` /
   `archiveCount` StatCards plus a **collapsible month table** (月份 / 引擎 / 归档大小 /
   归档时间, month-DESC, collapsed by default). `panel.raw` carries `archivedBytes`,
@@ -80,7 +99,7 @@ resumes; 1.6.1 is the current release (patch on top of 1.6.0).**
   (`O(K log K)` ordering) but the per-candidate decay/similarity work is skipped
   for the long low-salience tail.
 - Regression: pinned decay stays exactly 1 (bypass path), monthly memos unchanged.
-- **447 tests green** (64 files).
+- **456 tests green** (64 files).
 
 ## [1.6.0] — 2026-11-06
 

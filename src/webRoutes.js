@@ -97,6 +97,9 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   'l2Merge.minGroupSize',
   'l2Merge.maxGroupsPerRun',
   'l2Merge.maxSummaryChars',
+  // v1.6.1 L3 capacity breaker.
+  'semantic.maxEntries',
+  'semantic.lruOnCap',
   // v1.5.6 offline Dream tunables. CREDENTIALS ARE NOT EDITABLE: `dream.llm.*`
   // (baseUrl/model/apiKey) stays in the profile / DSH_DREAM_LLM_* env.
   'dream.useLlm',
@@ -124,6 +127,9 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   'raw.retentionDays',
   'raw.archiveAfterDays',
   'raw.compressionEngine',
+  'raw.coldAccessWindowDays',
+  'raw.hotWindowDays',
+  'raw.distillPrune',
   'raw.maxScanMb',
   'raw.maxScanTurns',
   'raw.maxResultTokens',

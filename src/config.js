@@ -227,13 +227,22 @@ export const DEFAULT_CONFIG = Object.freeze({
     maxTurnKb: 64,
     maxBytesPerDay: 8,
     maxTotalMb: 256,
-    retentionDays: 90,
-    // v1.6.1 cold-tier: shards older than this are candidates for monthly gzip
-    // archiving (must stay strictly below retentionDays).
-    archiveAfterDays: 7,
-    // Monthly archive compressor. `gzip` is the built-in default; `zstd` uses the
-    // Node runtime's built-in zstd when available and silently falls back otherwise.
-    compressionEngine: 'gzip',
+    retentionDays: 365,
+    // v1.6.1 cold-tier: a shard becomes an archive CANDIDATE only when it is older
+    // than this AND has had zero access for `coldAccessWindowDays` AND carries no
+    // pinned / status:handoff / hot-tag record. Must stay strictly below retentionDays.
+    archiveAfterDays: 90,
+    // How long "no access" must hold before a cold shard may be archived.
+    coldAccessWindowDays: 90,
+    // Monthly archive compressor. `brotli` (quality 11) is the default极限压缩;
+    // `zstd` / `gzip` remain selectable. All three are Node built-ins — no installs.
+    compressionEngine: 'brotli',
+    // v1.6.1 semantic-layer evolution: once a shard falls outside the hot window AND
+    // its distillation has produced L2/L3 output, the raw bytes may be physically
+    // cleaned (always through the tombstone path, so nothing can resurrect).
+    // Default OFF: raw stays the absolute truth unless an operator opts in.
+    hotWindowDays: 30,
+    distillPrune: false,
     maxScanMb: 16,
     // Deep-scan turn budget. The scanner walks each shard NEWEST-FIRST, so this is
     // "how far back from the tail a single deep_raw may look" — a knob, not a
@@ -268,6 +277,10 @@ export const DEFAULT_CONFIG = Object.freeze({
   // v1.5.6 L2 multi-merge: condense duplicate same-tag episodes into one record,
   // pinned and ordinary groups strictly separated. Offline (maintain) only.
   l2Merge: Object.freeze({ enabled: true, minGroupSize: 2, maxGroupsPerRun: 5, maxSummaryChars: 400 }),
+  // v1.6.1 L3 capacity breaker: the semantic layer grows with EVENT IMPORTANCE, not
+  // with conversation count. At the cap, the least-recently-used summary is retired
+  // (LRU), never appended forever.
+  semantic: Object.freeze({ maxEntries: 100, lruOnCap: true }),
   policy: Object.freeze({}),
 });
 
@@ -725,10 +738,24 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
       { key: 'raw.archiveAfterDays', got: rawArchiveAfterDays, retentionDays: rawRetentionDays },
     );
   }
+  const rawColdAccessWindowDays = requireInteger(
+    rawIn.coldAccessWindowDays === undefined ? defaults.raw.coldAccessWindowDays : rawIn.coldAccessWindowDays,
+    'raw.coldAccessWindowDays',
+    { min: 1, max: 3650 },
+  );
   const rawCompressionEngine = requireEnum(
     rawIn.compressionEngine === undefined ? defaults.raw.compressionEngine : rawIn.compressionEngine,
     'raw.compressionEngine',
-    ['gzip', 'zstd'],
+    ['brotli', 'gzip', 'zstd'],
+  );
+  const rawHotWindowDays = requireInteger(
+    rawIn.hotWindowDays === undefined ? defaults.raw.hotWindowDays : rawIn.hotWindowDays,
+    'raw.hotWindowDays',
+    { min: 1, max: 3650 },
+  );
+  const rawDistillPrune = requireBoolean(
+    rawIn.distillPrune === undefined ? defaults.raw.distillPrune : rawIn.distillPrune,
+    'raw.distillPrune',
   );
   const rawMaxScanMb = requireInteger(
     rawIn.maxScanMb === undefined ? defaults.raw.maxScanMb : rawIn.maxScanMb,
@@ -941,8 +968,24 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     ),
   });
 
-  const policyIn = input.policy === undefined ? {} : input.policy;
-  if (!isPlainObject(policyIn)) {
+  // ---- L3 capacity breaker (v1.6.1) --------------------------------------
+  const semanticIn = input.semantic === undefined ? {} : input.semantic;
+  if (!isPlainObject(semanticIn)) {
+    throw configError(ErrorCodes.CONFIG_INVALID_TYPE, 'config.semantic must be an object', { key: 'semantic' });
+  }
+  const semanticConfig = Object.freeze({
+    maxEntries: requireInteger(
+      semanticIn.maxEntries === undefined ? defaults.semantic.maxEntries : semanticIn.maxEntries,
+      'semantic.maxEntries',
+      { min: 1, max: 100_000 },
+    ),
+    lruOnCap: requireBoolean(
+      semanticIn.lruOnCap === undefined ? defaults.semantic.lruOnCap : semanticIn.lruOnCap,
+      'semantic.lruOnCap',
+    ),
+  });
+
+  const policyIn = input.policy === undefined ? {} : input.policy;  if (!isPlainObject(policyIn)) {
     throw configError(ErrorCodes.CONFIG_INVALID_TYPE, 'config.policy must be an object', { key: 'policy' });
   }
   const identityIn = input.identity ?? {};
@@ -1119,7 +1162,10 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
       maxTotalMb: rawMaxTotalMb,
       retentionDays: rawRetentionDays,
       archiveAfterDays: rawArchiveAfterDays,
+      coldAccessWindowDays: rawColdAccessWindowDays,
       compressionEngine: rawCompressionEngine,
+      hotWindowDays: rawHotWindowDays,
+      distillPrune: rawDistillPrune,
       maxScanMb: rawMaxScanMb,
       maxScanTurns: rawMaxScanTurns,
       maxResultTokens: rawMaxResultTokens,
@@ -1133,6 +1179,7 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     tagging: taggingConfig,
     features: featuresConfig,
     l2Merge: l2MergeConfig,
+    semantic: semanticConfig,
     policy: policyIn,
   };
   return resolved;

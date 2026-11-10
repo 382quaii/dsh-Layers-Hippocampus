@@ -50,7 +50,7 @@ test('eligible cold shards merge into one monthly gzip and plaintext is removed'
     writeShard(dir, '2026-01-09', [{ turnId: 't3', timestamp: Date.UTC(2026, 0, 9), content: 'cold note gamma' }]);
     const result = await store.archiveCold({ now: Date.UTC(2026, 2, 15) });
     assert.deepEqual(result.archived, ['2026-01']);
-    const gz = path.join(dir, RAW_DIR, 'raw-archive-2026-01.jsonl.gz');
+    const gz = path.join(dir, RAW_DIR, 'raw-archive-2026-01.jsonl.br');
     assert.ok(fs.existsSync(gz), 'monthly archive exists');
     assert.ok(!fs.existsSync(path.join(dir, RAW_DIR, '2026-01-05.jsonl')), 'plaintext shard removed');
     assert.ok(!fs.existsSync(path.join(dir, RAW_DIR, '2026-01-09.jsonl')), 'second shard removed');
@@ -76,7 +76,7 @@ test('deep_raw streams a cold archive and still finds the target line', async ()
     });
     assert.equal(result.hits.length, 1);
     assert.match(result.hits[0].snippet, /needle cold record/);
-    assert.equal(result.hits[0].archive, 'raw-archive-2026-01.jsonl.gz');
+    assert.equal(result.hits[0].archive, 'raw-archive-2026-01.jsonl.br');
     assert.ok(result.scanned.shards >= 1);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

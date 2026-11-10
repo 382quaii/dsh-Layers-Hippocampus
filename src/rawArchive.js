@@ -33,7 +33,7 @@ export function archiveMonthOf(day) {
   return String(day).slice(0, 7); // YYYY-MM
 }
 
-export function archiveName(month, engine = 'gzip') {
+export function archiveName(month, engine = 'brotli') {
   return `${ARCHIVE_PREFIX}${month}${archiveExtension(engine)}`;
 }
 
@@ -92,7 +92,7 @@ export class RawArchive {
    * Build (or extend) the month archive from eligible shards.
    * @returns {Promise<{ archived: string[], month: string|null, bytes: number, skipped: string[], reason?: string }>}
    */
-  async archive({ shards, eligible, now = this.clock.now(), engine = 'gzip' }) {
+  async archive({ shards, eligible, now = this.clock.now(), engine = 'brotli' }) {
     const state = this.readState();
     const monthGateMs = Number(state.lastRunAt ?? 0);
     if (monthGateMs > 0 && now - monthGateMs < MONTH_MS) {
@@ -161,7 +161,7 @@ export class RawArchive {
  * write is crash-safe: output goes to `<target>.tmp` and is renamed only after the
  * compressor has fully flushed.
  */
-export async function mergeShardsToArchive({ files, target, engine = 'gzip' }) {
+export async function mergeShardsToArchive({ files, target, engine = 'brotli' }) {
   ensureDir(path.dirname(target));
   const tmp = `${target}.tmp`;
   const out = fs.createWriteStream(tmp);

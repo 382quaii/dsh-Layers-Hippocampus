@@ -197,6 +197,29 @@ export class SemanticStore {
     };
   }
 
+  /**
+   * L3 capacity breaker (v1.6.1): the semantic layer must grow with event
+   * IMPORTANCE, never with conversation count. When the folded view exceeds
+   * `maxEntries`, the least-recently-updated summaries are retired via the
+   * append-only `semantic_retire` record — never deleted from the file, so the
+   * decision itself stays auditable and replayable.
+   *
+   * @param {{clock: object, maxEntries?: number, lruOnCap?: boolean}} input
+   * @returns {{kept: number, retired: string[], capped: boolean}}
+   */
+  enforceCapacity({ clock, maxEntries, lruOnCap = true }) {
+    const cap = Number.isFinite(maxEntries) ? Math.max(1, Math.floor(maxEntries)) : Infinity;
+    const summaries = this.list();
+    if (!lruOnCap || !Number.isFinite(cap) || summaries.length <= cap) {
+      return { kept: summaries.length, retired: [], capped: false };
+    }
+    // `list()` is sorted newest-first by updatedAt, so the tail is the LRU end.
+    const excess = summaries.slice(cap);
+    const retired = excess.map((summary) => summary.summaryId);
+    for (const summaryId of retired) this.retire({ clock, summaryId, reason: 'capacity-lru' });
+    return { kept: summaries.length - retired.length, retired, capped: true };
+  }
+
   summarise(record) {
     return {
       summaryId: record.summary_id,

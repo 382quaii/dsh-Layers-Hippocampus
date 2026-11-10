@@ -20,6 +20,7 @@ import { buildAliasMap, hashPolicy, normalisedScore, normaliseTagToken } from '.
 import { decayFactor } from '../decay.js';
 import { clamp01, dayKey, round, sha256, snippet } from '../util.js';
 import { RECORD_TYPES } from '../log/records.js';
+import { dedupeTemplates } from './templates.js';
 
 /**
  * Fold the log into the three things derivation needs.
@@ -178,9 +179,15 @@ export function buildIndex({
   // identically across rebuilds, so no insertion-order dependence is allowed.
   events.sort((a, b) => b.anchorTime - a.anchorTime || a.eventId.localeCompare(b.eventId));
 
-  const tags = deriveTagTable(events, { policy, now, maxPostingsPerTag });
+  // v1.6.1 referential dedup: the LOG keeps every raw row; the index stores repeated
+  // long texts (tool schemas / system prompt blocks) ONCE and points at them.
+  const deduped = dedupeTemplates(events);
+  const indexedEvents = deduped.events;
+  const templates = deduped.templates;
+
+  const tags = deriveTagTable(indexedEvents, { policy, now, maxPostingsPerTag });
   const activeSet = deriveActiveSet(tags, { policy, now, previous });
-  const diary = deriveDiary(events, { policy, now });
+  const diary = deriveDiary(indexedEvents, { policy, now });
 
   const stats = {
     // Log-side counters make the boot check a two-counter comparison.
@@ -203,6 +210,11 @@ export function buildIndex({
     postingsDropped: Object.values(tags).reduce((sum, entry) => sum + entry.postingsDropped, 0),
     // v1.5.6: how many records are pinned (never decay, never archived).
     pinnedEvents: events.filter((event) => event.pinned === true).length,
+    // v1.6.1 referential dedup accounting: one template row per repeated long text,
+    // and how many characters the index no longer duplicates.
+    templateRefs: deduped.stats.refs,
+    templates: deduped.stats.templates,
+    templateSavedChars: deduped.stats.savedChars,
   };
 
   return {
@@ -211,7 +223,8 @@ export function buildIndex({
     policyHash: hashPolicy(policy),
     sourceLogGen,
     aliases: Object.fromEntries([...aliases.entries()].sort(([a], [b]) => a.localeCompare(b))),
-    events,
+    events: indexedEvents,
+    templates,
     tags,
     activeSet,
     diary,

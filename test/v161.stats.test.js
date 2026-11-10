@@ -28,7 +28,7 @@ test('panel.raw always reports archive + index fields', async () => {
     assert.equal(raw.archiveCount, 0);
     assert.equal(raw.archivedBytes, 0);
     assert.equal(raw.totalBytes, 0);
-    assert.deepEqual(raw.engines, { gzip: 0, zstd: 0 });
+    assert.deepEqual(raw.engines, { brotli: 0, gzip: 0, zstd: 0 });
     assert.equal(raw.compressionRatio, null, 'no archive yet = unknown, not 0');
     assert.ok(Array.isArray(raw.archiveMonths));
   } finally {
@@ -72,19 +72,19 @@ test('a real cold archive shows count, engine distribution and compression ratio
     await runtime.ready;
     const realRaw = runtime.memory.raw;
     fs.mkdirSync(path.join(dir, RAW_DIR), { recursive: true });
-    // 40 days before the injected clock: older than archiveAfterDays(7).
+    // 120 days before the injected clock: older than archiveAfterDays(90).
     const now = runtime.memory.clock.now();
-    const day = new Date(now - 40 * 86_400_000).toISOString().slice(0, 10);
+    const day = new Date(now - 120 * 86_400_000).toISOString().slice(0, 10);
     fs.writeFileSync(
       path.join(dir, RAW_DIR, `${day}.jsonl`),
-      `${JSON.stringify({ turn_id: 'old1', timestamp: now - 40 * 86_400_000, role: 'user', content: 'cold payload '.repeat(20) })}\n`,
+      `${JSON.stringify({ turn_id: 'old1', timestamp: now - 120 * 86_400_000, role: 'user', content: 'cold payload '.repeat(20) })}\n`,
     );
     const archived = await realRaw.archiveCold({ now });
     assert.ok(archived.archived.length === 1, `archived=${JSON.stringify(archived)}`);
     const payload = await runtime.uiPayload();
     const raw = payload.panel.raw;
     assert.equal(raw.archiveCount, 1);
-    assert.equal(raw.engines.gzip, 1);
+    assert.equal(raw.engines.brotli, 1);
     assert.ok(raw.archivedBytes > 0);
     assert.ok(raw.compressionRatio !== null && raw.compressionRatio > 0);
     assert.ok(raw.savedBytes > 0, 'archive bytesBefore/bytesAfter are recorded');
@@ -92,7 +92,7 @@ test('a real cold archive shows count, engine distribution and compression ratio
     assert.equal(raw.archiveMonths.length, 1);
     const monthRow = raw.archiveMonths[0];
     assert.equal(monthRow.month, day.slice(0, 7));
-    assert.equal(monthRow.engine, 'gzip');
+    assert.equal(monthRow.engine, 'brotli');
     assert.ok(monthRow.bytes > 0);
     assert.ok(Number.isFinite(monthRow.at), 'archive timestamp is reported');
     assert.ok(monthRow.bytesBefore > monthRow.bytesAfter, 'before/after bytes are reported per month');

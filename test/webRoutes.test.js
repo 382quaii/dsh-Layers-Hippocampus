@@ -238,6 +238,8 @@ test('validatePatch rejects non-objects and accepts only the editable set', () =
     'raw',
     'retrieval',
     'review',
+    // v1.6.1 L3 capacity breaker nests under its own group.
+    'semantic',
     'storageBudgetMb',
     'tagTree',
     // v1.5.6 pre-ingest tagging: autoTag/maxTags nest under their own group.

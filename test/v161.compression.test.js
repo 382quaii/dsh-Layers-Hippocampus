@@ -110,6 +110,6 @@ test('config rejects an unknown compression engine', async () => {
     () => resolveConfig({ raw: { compressionEngine: 'lz4' } }),
     (error) => error.code === 'MEM_E_CONFIG_UNKNOWN_ENUM',
   );
-  assert.equal(resolveConfig({}).raw.compressionEngine, 'gzip');
+  assert.equal(resolveConfig({}).raw.compressionEngine, 'brotli');
   assert.equal(resolveConfig({ raw: { compressionEngine: 'zstd' } }).raw.compressionEngine, 'zstd');
 });
