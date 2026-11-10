@@ -1,5 +1,7 @@
 # @local/dsh-memory — 分层长期记忆 Host 插件
 
+> 版本：**1.6.1** ｜ 全量用例：**447/447** ｜ 运行时依赖：**零**
+
 给 DSH 智能体一份"活得比会话久"的记忆：**追加式原始日志是唯一真相源**，标签索引、日记、活跃集合全部是可丢弃、可重建的读模型，语义摘要独立于原始日志生死。
 
 - 零运行时依赖（只用 Node 内置模块），不 import `@deepseek-ai/*`。
@@ -46,6 +48,40 @@ state/tag-tree.json              L1.5 标签层级树 + 幽灵宽限 + 待修剪
 **可重建**：`index/**`、`active-set.json`、`diary.json`、`temp.log.jsonl` 的折叠视图、`state/graph.json`、`state/tag-tree.json`。删掉 `index/` 后 `action=maintain` 可逐字节重建（digest 相同，见测试）；重建的输入是 **日志 − 墓碑**，因此已删事件不会被"重建复活"。
 
 **L1.5 的例外与代价**：标签树的**活树**同样由 `maintain()` 从索引重建；但"幽灵"（宽限中的 mid）是**跨维护的生命周期状态**，纯重建看不到已经死掉的子树，所以维护会读取上一份 `state/tag-tree.json` 做 carry-forward（失去全部活引用的节点以 `refCount=0` 接回，孤儿丢弃）。因此删除该文件只会丢失**幽灵历史**，不会影响活树——与 `graph.json` 同级的派生缓存定位。
+
+## 数据流转（raw → L1 → L1.5 → L2 → L3）
+
+```mermaid
+flowchart TD
+    T["对话回合 / 工具输出"] --> R["L1 raw 原始取证<br/>raw/YYYY-MM-DD.jsonl<br/>未索引，不进 prompt"]
+
+    T --> W["写入路径<br/>stage → commitMany"]
+    W --> L1["L1 事件日志（真相源）<br/>log/gen-*/seg-*.jsonl<br/>identity/ledger.jsonl"]
+    W --> TB["log/tombstones.jsonl<br/>墓碑（删除意图）"]
+
+    R --> SCAN["流式扫描<br/>倒序 64KiB / 冷归档 gunzip"]
+    IDX["稀疏索引 day.jsonl.idx.json"] -.->|"跳分片 + 行数"| SCAN
+
+    L1 --> IDXA["索引代发布 index/gen-*/<br/>A/B 双缓冲"]
+    TB -.->|"重建时剔除"| IDXA
+
+    IDXA --> AS["活跃集合 active-set<br/>标签亲和与衰减"]
+    IDXA --> DT["L2 日记 journal/ + archive/<br/>按天滚动，pinned 合并"]
+    IDXA --> L15["L1.5 标签树 state/tag-tree.json<br/>活树 + 幽灵节点"]
+
+    DT -->|"离线 Dream：LLM 蒸馏 / 本地降级"| L3["L3 语义 semantic/sem.log.jsonl<br/>置信度 + 来源事件溯源"]
+    L15 --> HINT["Memory Hints<br/>词法匹配的 ≤5 个标签"]
+
+    L3 --> P["Prompt 装配<br/>persona 100 + memory-state 220"]
+    AS --> P
+    HINT --> P
+    DT --> P
+
+    R -.->|"月度门控 + 冷热判定"| AR["冷归档<br/>raw-archive-YYYY-MM.jsonl.gz/.zst"]
+    AR -.->|"流式解压"| SCAN
+```
+
+**读路径与写路径分离**：写入只 append 到 `log/`（加 `ledger` 幂等键），索引/日记/标签树/图谱全部由 `maintain()` 离线重建；**读路径永不修改真相源**，因此任何读模型损坏都只是性能事件，不是数据事件。
 
 ## 配置
 
@@ -448,6 +484,27 @@ pending ──start()──▶ in_progress ──(打开日志/迁移/引导索�
 - **单飞串行**：并发调用返回 `skipped: dream-in-flight`，不排队；单次运行内按组严格串行，不会耗尽连接池。
 - **状态**：`state/dream.json` 记录已合并 source id（幂等）、每组结果、熔断状态与 `lastFallback`；它是可重建缓存，删掉最多重复合并一次，日志仍是唯一真相源。
 - **配置 UI 化（1.5.6）**：安全子集（`useLlm/minGroupSize/maxGroupsPerRun/maxSummaryChars/maxSourceChars/maxEventsPerGroup/llmTimeoutMs/failureThreshold/cooldownMinutes/compensateAfterHours`）同时暴露到 `/stats`、`/config` 与设置页；`dream.llm.{baseUrl,model,apiKey}` **永不下发浏览器、不可 HTTP 编辑**，只从 profile 或 `DSH_DREAM_LLM_*` 注入（测试断言 `/stats` 载荷不含凭据）。
+
+## 全局 Prompt 注入顺序
+
+DSH 的 system prompt 由多个 section 按 `order` 升序拼装。**本插件只注册下表中带 ✅ 的四段**，
+其余序号属于宿主安全层或兄弟插件，本插件绝不占用：
+
+| order | section | 归属 | 内容 |
+| --- | --- | --- | --- |
+| 0 | 安全指令 | 宿主 | 平台安全边界（本插件不写入） |
+| **100** | **`persona`** | ✅ 本插件 | `[Persona & Traits]`：L3 语义摘要 top ≤10（按置信度），按 L3 形状 memo 化 |
+| 110 | Persona 扩展 | 兄弟插件 | 预留，本插件不注册 |
+| 150 | Soul Anchor | 兄弟插件 | 预留，本插件不注册 |
+| **220** | **`memory-state`** | ✅ 本插件 | 每轮装配时读取的上下文段：`[Active Task]` / `[Memory Blocks]` / `[Memory Hints]` / 冷启动块 |
+| 2000 | proactive | 兄弟插件 | 预留，本插件不注册 |
+| 2100 | BioState | 兄弟插件 | 预留，本插件不注册 |
+| **2450** | **`memory`** | ✅ 本插件 | 工具契约与写入纪律（静态文本） |
+| **2455** | **`memory:policy`** | ✅ 本插件 | 状态唤醒、检索纪律、跨空间迁移安全红线（静态文本） |
+| **2460** | **`memory:reflection`** | ✅ 本插件 | 连续工具调用达阈值后的反思提示（`enableReflection:false` 时不注册） |
+
+**缓存稳定纪律**：2450 / 2455 / 2460 是静态文本；只有 220（易变段）会随对话变化，而它
+位于 `[Memory Blocks]` 标记之后，所以每轮变化的注入永远不会击穿前缀缓存。
 
 ## 提示注入按需（不预加载）
 

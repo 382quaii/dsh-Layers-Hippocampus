@@ -9,6 +9,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 **Version fully un-frozen (user directive 2026-11-07): normal semantic versioning
 resumes; 1.6.1 is the current release (patch on top of 1.6.0).**
 
+- **Archive month detail UI**: the panel's raw section now shows `indexedShards` /
+  `archiveCount` StatCards plus a **collapsible month table** (月份 / 引擎 / 归档大小 /
+  归档时间, month-DESC, collapsed by default). `panel.raw` carries `archivedBytes`,
+  `totalBytes`, `engines:{gzip,zstd}`, `savedBytes`, `compressionRatio` (null when
+  unmeasured) and `archiveMonths[]` with `at`/`bytesBefore`/`bytesAfter`; older hosts
+  degrade to “—” instead of breaking the panel.
 - **Segment-token audit** (`docs/AUDIT-2026-11-07-segment-token.md`): no P0
   same-segment re-injection exists; the six injection surfaces are documented with
   their dedup mechanisms. Its two P3 items are now IMPLEMENTED:
@@ -53,6 +59,11 @@ resumes; 1.6.1 is the current release (patch on top of 1.6.0).**
   extension, and a legacy gzip archive stays readable after switching to zstd.
   When the runtime lacks zstd the config silently falls back to gzip and
   `capabilities.compression` reports `{engine, fallback, zstd, node}` for the UI.
+- **Raw retention tiers documented**: the raw layer exposes exactly three modes —
+  `off` (keep nothing), `salience` (default: high-value turns/code/stack/errors only),
+  `all` (bounded by `maxTurnKb`/`maxBytesPerDay`/`maxTotalMb`) — plus
+  `retentionDays` (default 90) and `pinned` never pruned. README/ARCHITECTURE now
+  describe these implemented tiers only.
 - **Fixed — settings page rendered blank**: the compression-engine card referenced a
   bare `payload` that only exists in other components' scopes; it now uses the local
   `statsPayload` and the shared `Select` component (not a fake `type:'select'` on
