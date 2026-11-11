@@ -1,6 +1,6 @@
-# Release 1.6.1 — 发布准备（本地）
+# Release 1.6.2 — 发布准备（本地）
 
-> 版本：**1.6.1**（2026-11-07：全面解除 1.5.7 的版本冻结，恢复语义化版本；本版新增检索上限剪枝与段记 Token 审计）。
+> 版本：**1.6.2**（2026-11-11：冷归档保留期修复 + 三层打破线性增长；`CAPABILITIES.version` 与测试断言同步）。
 
 > 状态：**代码与文档已就绪；仓库推送 / npm 发布 / 市场 PR 需要你的 GitHub 与 npm 凭据，代理与网络，本会话未执行。**
 > 基线：`dsh-memory` 工作区，全量 **456/456 测试通过**（64 个测试文件；另有 `dsh-orchestrator` 31/31）。
@@ -8,7 +8,10 @@
 
 ## 本版内容
 
-- **A 检索上限剪枝（1.6.1 新增）**：命中分数上界 `salience × 3.9`（tagAffinity≤3、timeBoost≤1.3 等因子封顶），候选按 salience 降序访问，上界打不过第 k 名即停止评分；pinned 绕过剪枝；`pruned`/`notes` 可观测；4 个用例 `test/v170.pruning.test.js`。
+- **冷归档保留期修复（1.6.2）**：`raw.archiveAfterDays: 90` + `raw.retentionDays: 365` + 新增 `raw.coldAccessWindowDays: 90`；冷热判定为“超期 AND 零访问 AND 无高优标记”，三者同时满足才归档。
+- **多档保留策略（1.6.2）**：`raw.mode: off | salience | all`（off = 不保存，salience = 高价值，all = 全保存且受预算约束）；`raw.distillPrune`（默认 false）在蒸馏覆盖且已出热窗时物理清理 raw，必经 Tombstone；L2 同类项合并，L3 硬熔断 `semantic.maxEntries=100` + LRU。
+- **长窗口压缩与引用去重（1.6.2）**：冷归档默认 **Brotli quality 11**（`.jsonl.br`），`gzip`/`zstd` 可选，全部 Node 内置；重复长文本（≥512 字符、≥2 次）在索引层以 `templates.json` + `contentRef` 引用，日志本体不变。
+- **A 检索上限剪枝**：命中分数上界 `salience × 3.9`（tagAffinity≤3、timeBoost≤1.3 等因子封顶），候选按 salience 降序访问，上界打不过第 k 名即停止评分；pinned 绕过剪枝；`pruned`/`notes` 可观测；4 个用例 `test/v170.pruning.test.js`。
 - **压缩引擎可选（1.6.1）**：`raw.compressionEngine` 支持 `gzip`（默认）/ `zstd`，设置页可选择并一键启用/停用。Zstd 走 Node 内置 `node:zlib`，**不下载任何包、也没有可卸载的包**——“停用”即切回 gzip。归档扩展名 `.jsonl.gz` / `.jsonl.zst` 按扩展名分派解压，旧格式切换后仍可读；运行时无 zstd 则静默回退，`capabilities.compression` 报告可用性。4 个用例 `test/v161.compression.test.js`。
 - **/stats 面板可视化（1.6.1）**：`panel.raw` 增加 `archiveCount` / `archivedBytes` / `totalBytes` / `archiveMonths` / `engines{gzip,zstd}` / `savedBytes` / `compressionRatio` / `indexedShards`；归档记录 `bytesBefore`/`bytesAfter` 以计算真实压缩率。面板新增“raw 索引覆盖”“raw 冷归档”两卡与**可折叠归档月度明细表**（月份/引擎/归档大小/归档时间，月倒序，默认收起），旧宿主缺字段显示“—”。4 个用例 `test/v161.stats.test.js`。
 - **段记 Token 审计（1.6.1）**：`docs/AUDIT-2026-11-07-segment-token.md` 证明无 P0 重复注入，列出 6 个注入面；2 个 P3 已实施：Active Task 事件进块去重池、Persona 按 L3 形状 memo 化。
@@ -29,7 +32,7 @@
 
 ## 发布步骤（需要你执行）
 
-> 两个包：`dsh-layers-hippocampus@1.6.1`（已解冻，已有 git remote）与
+> 两个包：`dsh-layers-hippocampus@1.6.2`（已解冻，已有 git remote）与
 > `dsh-layers-orchestrator@0.1.0`（**目前不是 git 仓库**，需先 init/建远端）。
 > 全部命令在 PowerShell 下执行；`node`/`npm`/`pnpm` 用 DSH runtime 自带的绝对路径。
 
@@ -52,10 +55,10 @@ npm pack --dry-run               # 预检实际发布内容（含/不含不该�
 cd C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory
 git add -A
 git status --short                 # 最后确认没有 node_modules / state / 测试临时目录
-git commit -m "release: v1.6.1 — recall bound pruning; segment-token audit; version un-frozen"
+git commit -m "release: v1.6.2 — cold archive retention fix; brotli cold tier, referential dedupe, L3 LRU"
 
-# 历史 tag 已存在（v1.5.5 / v1.5.7 / v1.6.0）；本次新增 v1.6.1
-git tag -a v1.6.1 -m "v1.6.1: recall bound-based early exit; segment-token audit; version un-frozen"
+# 历史 tag 已存在（v1.5.5 / v1.5.7 / v1.6.0 / v1.6.1）；本次新增 v1.6.2
+git tag -a v1.6.2 -m "v1.6.2: archiveAfterDays=90 + retentionDays=365; brotli cold tier; templates refs; L3 LRU; distill prune"
 git push origin main --follow-tags
 ```
 

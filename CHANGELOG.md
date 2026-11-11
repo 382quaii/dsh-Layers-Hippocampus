@@ -4,10 +4,32 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.6.1] — 2026-11-07
+## [1.6.2] — 2026-11-11
 
-**Version fully un-frozen (user directive 2026-11-07): normal semantic versioning
-resumes; 1.6.1 is the current release (patch on top of 1.6.0).**
+**补丁版：修复冷数据归档与保留期的时间冲突，并把“打破日志线性增长”的三层机制并入正式记录。**
+
+- **修复冷数据归档时间冲突**：冷归档阈值与 TTL 保留期原本互相挤压（`archiveAfterDays` 与
+  `retentionDays` 同为 30/90 量级，冷分片常在归档前就被 TTL 删除）。现在默认值上调为
+  `archiveAfterDays: 90`、`retentionDays: 365`，并保留 fail-fast 校验
+  （`archiveAfterDays` 必须严格小于 `retentionDays`），同时新增 `raw.coldAccessWindowDays: 90`，
+  也就是“近 90 天零访问”才允许归档。
+- **实施多档保留策略（含遗忘性保存与全保存）**：raw 层保留谱系落地为
+  `raw.mode: off | salience | all` ——
+  `off` 为不保存（遗忘性保存，仅保留 L1 之上的记忆）、`salience` 为默认的高价值保存、
+  `all` 为全保存（受 `maxTurnKb` / `maxBytesPerDay` / `maxTotalMb` 预算约束）；
+  另加 `raw.distillPrune`（默认 false）：蒸馏产物覆盖第 i 天、且该分片已出
+  `raw.hotWindowDays` 热窗时，允许物理清理 raw 原文，**必经 Tombstone 防复活**。
+  L2 继续走同类项合并（`l2Merge`），L3 增加硬熔断 `semantic.maxEntries`（默认 100）+ LRU 淘汰，
+  语义层随“事件重要性”而非“对话条数”增长。
+- **优化长窗口压缩与高频引用去重**：
+  - 冷归档默认改用 **Brotli quality 11**（`.jsonl.br`，极限压缩），`gzip`(9) / `zstd` 仍可选，
+    全部来自 Node 内置 `node:zlib`，零外部依赖；读取按扩展名流式解压、命中即停。
+  - 高频重复的超长内容（工具 schema / 系统提示块，≥512 字符且出现 ≥2 次）在建索引时
+    只存一份到 `templates.json`，事件侧改为 `contentRef` 引用（`src/index/templates.js`），
+    索引加载时还原原文；**日志本体不参与替换**，raw 逐行真相、`deep_raw` 与行级游标不受影响。
+  - 稀疏行索引（每 64 行采样）继续用于跳过时间窗不重叠的分片并复用 `lineCount`。
+
+### 1.6.2 详细变更
 
 - **Breaking the linear log curve — three layers** (`test/v162.nonlinear.test.js`, 9 cases):
   - **Compression layer**: cold classification is now MULTI-dimensional (age >
@@ -28,6 +50,12 @@ resumes; 1.6.1 is the current release (patch on top of 1.6.0).**
     tombstone path, so nothing resurrects. L3 gains a hard capacity breaker
     (`semantic.maxEntries`, default 100) with LRU retirement recorded as append-only
     `semantic_retire` events.
+
+## [1.6.1] — 2026-11-07
+
+**Version fully un-frozen (user directive 2026-11-07): normal semantic versioning
+resumes; 1.6.1 was the release that followed 1.6.0.**
+
 - **Archive month detail UI**: the panel's raw section now shows `indexedShards` /
   `archiveCount` StatCards plus a **collapsible month table** (月份 / 引擎 / 归档大小 /
   归档时间, month-DESC, collapsed by default). `panel.raw` carries `archivedBytes`,
@@ -126,7 +154,7 @@ Cold-start wake-up + user-controlled cold-start injection:
 
 > Historical note: 1.5.7 shipped under a temporary version freeze; the 2026-11-07
 > directive removed ALL freeze language and resumed normal semantic versioning
-> (current version: 1.6.1). The sentence below is the historical 1.5.7 statement.
+> (current version: 1.6.2). The sentence below is the historical 1.5.7 statement.
 
 **Version freeze (historical, superseded): 1.5.7 was the shipped release.**
 This release folds in everything added after the 1.5.6 draft — Orchestrator
