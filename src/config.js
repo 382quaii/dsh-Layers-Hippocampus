@@ -726,17 +726,28 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
     'raw.retentionDays',
     { min: 1, max: 365 },
   );
-  const rawArchiveAfterDays = requireInteger(
-    rawIn.archiveAfterDays === undefined ? defaults.raw.archiveAfterDays : rawIn.archiveAfterDays,
+  // v1.6.2 compat: profiles written before 1.6.2 usually pin `retentionDays: 30`
+  // while `archiveAfterDays` did not exist yet. Failing fast there would leave the
+  // plugin unloaded (routes 404) for every existing install, so when the caller did
+  // NOT state `archiveAfterDays` explicitly we derive a valid one instead of throwing.
+  // An EXPLICIT archiveAfterDays that is out of range still fails fast.
+  const archiveAfterDaysExplicit = rawIn.archiveAfterDays !== undefined;
+  let rawArchiveAfterDays = requireInteger(
+    archiveAfterDaysExplicit ? rawIn.archiveAfterDays : defaults.raw.archiveAfterDays,
     'raw.archiveAfterDays',
     { min: 1, max: 3650 },
   );
+  let rawArchiveAfterDaysDerived = false;
   if (rawArchiveAfterDays >= rawRetentionDays) {
-    throw configError(
-      ErrorCodes.CONFIG_OUT_OF_RANGE,
-      `config.raw.archiveAfterDays (${rawArchiveAfterDays}) must be strictly below config.raw.retentionDays (${rawRetentionDays}); otherwise there is nothing to archive`,
-      { key: 'raw.archiveAfterDays', got: rawArchiveAfterDays, retentionDays: rawRetentionDays },
-    );
+    if (archiveAfterDaysExplicit) {
+      throw configError(
+        ErrorCodes.CONFIG_OUT_OF_RANGE,
+        `config.raw.archiveAfterDays (${rawArchiveAfterDays}) must be strictly below config.raw.retentionDays (${rawRetentionDays}); otherwise there is nothing to archive`,
+        { key: 'raw.archiveAfterDays', got: rawArchiveAfterDays, retentionDays: rawRetentionDays },
+      );
+    }
+    rawArchiveAfterDays = Math.max(1, rawRetentionDays - 1);
+    rawArchiveAfterDaysDerived = true;
   }
   const rawColdAccessWindowDays = requireInteger(
     rawIn.coldAccessWindowDays === undefined ? defaults.raw.coldAccessWindowDays : rawIn.coldAccessWindowDays,
@@ -1162,6 +1173,9 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
       maxTotalMb: rawMaxTotalMb,
       retentionDays: rawRetentionDays,
       archiveAfterDays: rawArchiveAfterDays,
+      // True when archiveAfterDays was DERIVED to stay below an older profile's
+      // retentionDays; surfaced so the settings page can explain the value.
+      archiveAfterDaysDerived: rawArchiveAfterDaysDerived,
       coldAccessWindowDays: rawColdAccessWindowDays,
       compressionEngine: rawCompressionEngine,
       hotWindowDays: rawHotWindowDays,

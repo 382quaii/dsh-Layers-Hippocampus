@@ -76,6 +76,15 @@ export class RawArchive {
     return value && typeof value === 'object' ? value : { lastRunAt: null, archives: {} };
   }
 
+  /** Persist the archive bookkeeping (used by prune when a whole month is dropped). */
+  writeState(state) {
+    ensureDir(this.stateDir);
+    writeJsonAtomic(this.archiveFile, {
+      lastRunAt: state?.lastRunAt ?? null,
+      archives: state?.archives ?? {},
+    });
+  }
+
   listArchives() {
     try {
       return fs.readdirSync(this.rawDir).filter(isArchiveName).sort();

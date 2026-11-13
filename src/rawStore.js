@@ -857,6 +857,7 @@ export class RawStore {
     const today = dayKey(now);
     const cutoff = dayKey(now - retention * 86_400_000);
     const removed = [];
+    const removedArchives = [];
     let freed = 0;
     for (const name of this.listShards()) {
       const day = name.replace('.jsonl', '');
@@ -874,13 +875,40 @@ export class RawStore {
         /* already gone */
       }
     }
-    if (removed.length > 0) {
+    // v1.6.2: archives obey the SAME retention. A whole month is dropped only when
+    // its last day is already before the cutoff, so a retention of 30 days can no
+    // longer turn cold data into unbounded `.br` files that outlive the policy.
+    const cutoffMonth = cutoff.slice(0, 7);
+    for (const name of this.archive.listArchives()) {
+      const month = name.slice('raw-archive-'.length, 'raw-archive-'.length + 7);
+      if (month >= cutoffMonth) continue; // month still inside the retention window
+      try {
+        const file = this.archive.archivePath(name);
+        const size = fs.statSync(file).size;
+        fs.rmSync(file, { force: true });
+        freed += size;
+        removedArchives.push(month);
+      } catch {
+        /* already gone */
+      }
+    }
+    if (removed.length > 0 || removedArchives.length > 0) {
       this._total = null;
       this._hashes.clear();
       this._dayBytes.clear();
       this._tombstones = null;
+      if (removedArchives.length > 0) {
+        try {
+          const state = this.archive.readState();
+          const archives = { ...(state.archives ?? {}) };
+          for (const month of removedArchives) delete archives[month];
+          if (typeof this.archive.writeState === 'function') this.archive.writeState({ ...state, archives });
+        } catch {
+          /* bookkeeping only: a stale archive index must not fail pruning */
+        }
+      }
     }
-    return { removed, freedBytes: freed, retentionDays: retention, today };
+    return { removed, removedArchives, freedBytes: freed, retentionDays: retention, today };
   }
 
   /**
