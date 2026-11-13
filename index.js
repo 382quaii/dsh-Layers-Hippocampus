@@ -413,8 +413,9 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
    *   - a different agent cannot consume someone else's injection silently: the new
    *     conversation arms its own pending entry on its first captured turn.
    */
-  runtime.coldStart = { pending: null, injected: new Set(), lastSessionId: null };
+  runtime.coldStart = { pending: new Map(), injected: new Set(), lastSessionId: null };
   const COLD_START_INJECTED_LIMIT = 64;
+  const COLD_START_PENDING_LIMIT = 8;
   const COLD_START_PENDING_TTL_MS = 5 * 60_000;
   runtime.lastHintTags = [];
   runtime.resetInjection = (sessionId = runtime.injection.sessionId) => {
@@ -475,9 +476,14 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
    *
    * Two independent hosts signal "a conversation started": `agent/created` (a new
    * agent, `source: startup`) and the first `session/event` of a session id we have
-   * not seen. Either one arms the SAME per-conversation pending entry, so a host that
-   * does not deliver one of them still gets the behaviour (and the second signal for
-   * the same conversation is a no-op, not a second injection).
+   * not seen. Either one arms the SAME per-conversation entry, so a host that does
+   * not deliver one of them still gets the behaviour (and the second signal for the
+   * same conversation is a no-op, not a second injection).
+   *
+   * A MAP of pendings, not a single slot: a title generator or a delegated sub-agent
+   * may be created right after the user's conversation and arm its own entry. With a
+   * single slot that later arm would OVERWRITE — and then consume — the user's entry,
+   * which is exactly the bug being fixed.
    *
    * Nothing is armed when there is nothing to inject: no handoff summary and no L3
    * summaries means a brand-new install, where a cold-start block would be noise.
@@ -490,15 +496,17 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     const epoch = `${handoff.at ?? 0}:${handoff.summaryEventId}`;
     const key = `${sessionId ?? agentId ?? 'unknown'}|${epoch}`;
     if (runtime.coldStart.injected.has(key)) return null;
-    const pending = runtime.coldStart.pending;
-    // Same conversation re-armed (created + first turn): keep the FIRST arming time
-    // and merge the identifiers instead of restarting the TTL.
-    if (pending && pending.key === key) {
-      pending.sessionId = pending.sessionId ?? sessionId;
-      pending.agentId = pending.agentId ?? agentId;
-      return pending;
+    const pendings = runtime.coldStart.pending;
+    runtime.pruneColdStartPendings();
+    const existing = pendings.get(key);
+    if (existing) {
+      // Same conversation re-armed (created + first turn): merge identifiers and keep
+      // the FIRST arming time instead of restarting the TTL.
+      existing.sessionId = existing.sessionId ?? sessionId;
+      existing.agentId = existing.agentId ?? agentId;
+      return existing;
     }
-    runtime.coldStart.pending = {
+    const entry = {
       key,
       sessionId,
       agentId,
@@ -507,16 +515,37 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       epoch,
       summaryEventId: handoff.summaryEventId,
     };
-    return runtime.coldStart.pending;
+    pendings.set(key, entry);
+    // Bounded: the oldest armed entry is dropped, so a long-lived process cannot grow
+    // this map without limit (each conversation adds at most a couple of entries).
+    while (pendings.size > COLD_START_PENDING_LIMIT) {
+      pendings.delete(pendings.keys().next().value);
+    }
+    return entry;
   };
 
-  /** True when `pending` belongs to the conversation currently assembling. */
+  /** Drop pendings that were never consumed (a conversation that never assembled). */
+  runtime.pruneColdStartPendings = () => {
+    const pendings = runtime.coldStart.pending;
+    if (pendings.size === 0) return 0;
+    const now = memory.clock.now();
+    let dropped = 0;
+    for (const [key, entry] of pendings) {
+      if (now - (Number(entry.at) || 0) > COLD_START_PENDING_TTL_MS) {
+        pendings.delete(key);
+        dropped += 1;
+      }
+    }
+    return dropped;
+  };
+
+  /** True when an armed entry belongs to the conversation currently assembling. */
   const coldStartMatches = (pending, sessionId, agentId) => {
     if (!pending) return false;
     if (pending.sessionId && sessionId && pending.sessionId === sessionId) return true;
     if (pending.agentId && agentId && pending.agentId === agentId) return true;
-    // Neither side known (older host without session/agent identity): the pending
-    // entry is still this process's ONLY armed injection, so let it through once.
+    // Neither side known (older host without session/agent identity): the entry is
+    // still this process's ONLY armed injection, so let it through once.
     return !pending.sessionId && !pending.agentId && !sessionId && !agentId;
   };
 
@@ -534,14 +563,22 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
    */
   runtime.coldStartText = ({ sessionId = null, agentId = null } = {}) => {
     if (runtime.phase !== 'ready') return '';
-    const pending = runtime.coldStart.pending;
-    if (!coldStartMatches(pending, sessionId, agentId)) return '';
+    runtime.pruneColdStartPendings();
+    const pendings = runtime.coldStart.pending;
+    let pending = null;
+    for (const entry of pendings.values()) {
+      if (coldStartMatches(entry, sessionId, agentId)) {
+        pending = entry;
+        break;
+      }
+    }
+    if (!pending) return '';
+    // Consume on the FIRST matching assembly, even when both switches are off: the
+    // entry must not linger and fire later on an unrelated conversation.
+    pendings.delete(pending.key);
     const contextConfig = runtime.config?.context ?? {};
     const wantSummary = contextConfig.coldStartInjectSummary === true;
     const wantTurns = contextConfig.coldStartInjectRecentTurns === true;
-    // Consume on the FIRST matching assembly, even when both switches are off: the
-    // pending entry must not linger and fire later on an unrelated conversation.
-    runtime.coldStart.pending = null;
     if (!wantSummary && !wantTurns) return '';
     try {
       const view = memory.indexManager.snapshot();

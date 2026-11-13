@@ -55,12 +55,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - **Fixed — 新对话拿不到交接摘要与前几轮原话**（2026-11-13 用户报告）：
   - 根因：冷启动注入是一个**进程级一次性布尔** `coldStartPending`，被**第一个组装
     prompt 的 agent** 抢先消费（子代理、标题生成等），用户真正的新对话拿到的是空。
-  - 改为**按会话幂等**：`runtime.coldStart = { pending, injected, lastSessionId }`，
+  - 改为**按会话幂等**：`runtime.coldStart = { pending: Map, injected: Set, lastSessionId }`，
     以 `session|handoffEpoch` 为键；`noteColdStart()` 在「新 session id 的首个
-    `session/event`」与「`agent/created`」两处布防（同键复用、已被注入过的直接跳过），
+    `session/event`」与「`agent/created`」两处布防（同键复用、已被注入过的直接跳过、
+    过期 5 分钟未消费自动丢弃、最多 8 条 pending 有界淘汰），
     `promptState(assemblyContext)` 用宿主传给 `systemPrompt.context` 的
     `assemblyContext.agent.id` 与当前 session id 做匹配，注入后写入 `injected` 集合并
-    有界淘汰（64）。**兄弟 agent 先装配不会再吞掉用户的注入。**
+    有界淘汰（64）。**兄弟 agent 先装配不会再吞掉用户的注入**——这是单槽位实现仍会
+    踩的坑：标题生成器或子代理随后布防会覆盖并且消费掉用户的那一条。
   - `handoff.json` 标记新增 `tailTurns`：交接蒸馏时把最后 5 轮（role + 文本，每条
     ≤400 字，内存环形缓冲 12 条、跨会话自动清空）写进标记；
     `[Previous Context Tail]` 优先回放这些**原话**（`- user: …` / `- assistant: …`），
@@ -78,8 +80,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `test/v156.autoSession.test.js` 重写为「该功能已移除」契约（配置无该键、旧 profile
   迁移剥离、路由/能力面不暴露、客户端无轮询器）；
   `test/v160.coldStart.test.js` 重写为按会话注入契约（无标记不布防、摘要+尾部各一次、
-  兄弟 agent 先装配不吞注入、两个会话各注入一次、双关不遗留 pending、tailTurns 优先）。
-  全量 **476/476**（77 个测试文件）。
+  兄弟 agent 先装配不吞注入、两个会话各注入一次、**两条 pending 先布防后装配也各得其份**、
+  双关不遗留 pending、tailTurns 优先）。
+  全量 **477/477**（77 个测试文件）。
 
 ## [1.6.2] — 2026-11-11
 

@@ -114,7 +114,7 @@ test('summary ON: the new conversation gets detection + summary exactly once', a
     assert.match(text, /\[Cold-Start Summary\]/);
     assert.match(text, /v1\.6\.3 修复/);
     assert.match(text, /\[Previous Context Tail\]\n- user: 继续修 bug/, 'tail turns are replayed verbatim');
-    assert.equal(booted.runtime.coldStart.pending, null, 'pending is consumed');
+    assert.equal(booted.runtime.coldStart.pending.size, 0, 'pending is consumed');
     const second = booted.runtime.promptState();
     assert.doesNotMatch(second, /\[Cold-Start Detected/, 'never injected twice in one conversation');
   } finally {
@@ -172,6 +172,30 @@ test('two different conversations each inject once (per-conversation, not per-pr
   }
 });
 
+test('two conversations armed before either assembles each get their own block', async () => {
+  const booted = await boot({
+    prepare: async (runtime, dir) => {
+      const event = await runtime.memory.remember({ content: 'handoff body', tags: ['topic:alpha'], eventTime: T0 });
+      await runtime.memory.maintain({ reason: 'cold-start-test' });
+      writeMarker(dir, { summaryEventId: event?.eventId ?? null });
+    },
+  });
+  try {
+    // The user's conversation and a helper agent are both created before either
+    // assembles — the single-slot version overwrote the first entry here.
+    booted.runtime.noteColdStart({ sessionId: 'sess-main' });
+    booted.runtime.noteColdStart({ agentId: 'helper-1' });
+    assert.match(booted.runtime.promptState({ agent: { id: 'helper-1' } }), /\[Cold-Start Summary\]/);
+    // The user's entry survived the helper's arm+consume.
+    booted.runtime.memory.observeSessionTurn('sess-main', 'still here');
+    assert.match(booted.runtime.promptState(), /\[Cold-Start Summary\]/);
+    assert.equal(booted.runtime.coldStart.pending.size, 0);
+  } finally {
+    booted.dispose();
+    fs.rmSync(booted.dir, { recursive: true, force: true });
+  }
+});
+
 test('both OFF: no historical block, but the static wake-up policy still exists', async () => {
   const booted = await boot({
     context: { coldStartInjectSummary: false, coldStartInjectRecentTurns: false },
@@ -186,7 +210,7 @@ test('both OFF: no historical block, but the static wake-up policy still exists'
     const text = booted.runtime.promptState({ agent: { id: 'main-off' } });
     assert.doesNotMatch(text, /\[Cold-Start/);
     assert.doesNotMatch(text, /\[Previous Context Tail\]/);
-    assert.equal(booted.runtime.coldStart.pending, null, 'a disabled injection is still consumed');
+    assert.equal(booted.runtime.coldStart.pending.size, 0, 'a disabled injection is still consumed');
     const policy = booted.sections.find((section) => section.name === 'memory:policy');
     assert.ok(policy, 'memory:policy section is registered');
     assert.match(policy.text(), /状态唤醒/);
