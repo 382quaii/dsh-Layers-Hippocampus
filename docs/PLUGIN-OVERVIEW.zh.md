@@ -1,7 +1,7 @@
 # dsh-layers-hippocampus · 功能 / 实现 / 版本演进
 
-> 版本基线：**v1.6.3（2026-11-13 补丁：配置 schema 迁移 + `strictStartup` 启动安全降级）**
-> 验证状态：**475 / 475 测试通过**（77 个测试文件 · 50 个源码文件 · 零运行时依赖）
+> 版本基线：**v1.6.3（2026-11-13 补丁：配置 schema 迁移 + `strictStartup` 启动安全降级 + 设置页简洁模式 + 交接冷启动按会话注入）**
+> 验证状态：**476 / 476 测试通过**（77 个测试文件 · 50 个源码文件 · 零运行时依赖）
 > 数据位置（本机当前）：`D:\Users\86135\memory`（本地 JSONL，可迁移）
 > 本文与 `README.md`、`docs/ARCHITECTURE.zh.md`、`CHANGELOG.md`、`docs/RELEASE-1.6.3.md` 配套。
 
@@ -164,13 +164,13 @@ DeepSeek Harness（DSH）的**本地优先长期记忆 Host 插件**。它不把
 | **1.6.0** | 冷启动防呆（状态唤醒）、`coldStartInjectSummary` / `coldStartInjectRecentTurns` 两个注入开关、泛型 `customDecayRate` / `customHalfLifeDays`、`persona` section order=100、跨插件 `ctx.provide('hippocampus')` 服务 |
 | **1.6.1** | **检索上限剪枝**：`salience × 3.9` 硬上界 + 降序早停（pinned 绕过），结果带 `pruned` 观测；段记 Token 审计（无 P0 泄漏）；**版本全面解冻**，恢复语义化发布 |
 | **1.6.2** | 冷归档保留期修复（`archiveAfterDays=90` / `retentionDays=365` / `coldAccessWindowDays=90`）；多档保留策略 `off`/`salience`/`all` + `distillPrune`（经 Tombstone 清理已蒸馏 raw）；冷归档默认 **Brotli 11**（`.jsonl.br`）；索引层 `templates.json` + `contentRef` 高频引用去重；L3 `semantic.maxEntries=100` LRU 熔断；`CAPABILITIES.version` 对齐 1.6.2 |
-| **1.6.3** | **配置 schema 版本与迁移机制**（`CONFIG_SCHEMA_VERSION=3`，先迁移后严格校验，迁移只补值不覆盖、必告警）；**`strictStartup` 启动安全降级**（默认 `true`；显式 `false` 时越界值回退安全默认并降级启动，类型错误/未知键仍 fail-fast）；启动状态进入 `CAPABILITIES.startup` 与 `panel.startup`/`panel.configVersion`/`panel.configWarnings` |
+| **1.6.3** | **配置 schema 版本与迁移机制**（`CONFIG_SCHEMA_VERSION=3`，先迁移后严格校验，迁移只补值不覆盖、必告警）；**`strictStartup` 启动安全降级**（默认 `true`；显式 `false` 时越界值回退安全默认并降级启动，类型错误/未知键仍 fail-fast）；启动状态进入 `CAPABILITIES.startup` 与 `panel.startup`/`panel.configVersion`/`panel.configWarnings`；**设置页简洁模式**（纯显示层，只留身份 / 上下文窗口 / 存储位置迁移 / raw 三项）；**交接冷启动按会话幂等注入**（`session\|handoffEpoch` 键，兄弟 agent 先装配不吞注入；`handoff.json` 带 `tailTurns` 回放最后 5 轮原话；`coldStartInjectRecentTurns` 默认改开）；**移除 `context.autoNewSession*`**（交接继续同一对话，不再弹出第二个空会话） |
 
 ---
 
 ## 6. 测试与质量
 
-- **475 / 475 通过**，77 个测试文件；进程内 `node --test`（`test/run.mjs`），30 秒看门狗，时间一律注入 `FakeClock`。
+- **476 / 476 通过**，77 个测试文件；进程内 `node --test`（`test/run.mjs`），30 秒看门狗，时间一律注入 `FakeClock`。
 - 覆盖维度：身份幂等、索引重建一致性、召回排序与置信度、raw 四字段与游标扫描、哈希恢复、两阶段删除与墓碑、标签树生命周期与重放一致性、多空间降级、配置 fail-fast、UI 源码契约、崩溃恢复（200ms checkpoint 窗口）、事件循环让出。
 - 运维脚本：`scripts/bench-protocol.mjs`（基准协议）、`scripts/repair-handoff.mjs`（交接修复）。
 

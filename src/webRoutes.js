@@ -85,11 +85,10 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   'features.multiSpace',
   'features.crossSpaceTransfer',
   'features.crossSpaceRecall',
-  // v1.5.6: client half may open a fresh conversation when a handoff turns active.
-  'context.autoNewSession',
-  'context.autoNewSessionPoll',
-  'context.autoNewSessionIntervalSeconds',
-  // v1.6.0 cold-start injection switches (independent; default summary on, turns off).
+  // v1.6.3: `context.autoNewSession*` was REMOVED (a handoff continues the same
+  // conversation; opening a second one wasted the user's context). The keys are no
+  // longer editable — a stale client sending them gets the normal unknown-key error.
+  // v1.6.0 cold-start injection switches (independent; both default on since 1.6.3).
   'context.coldStartInjectSummary',
   'context.coldStartInjectRecentTurns',
   // v1.5.6 L2 multi-merge tunables (offline maintain phase).

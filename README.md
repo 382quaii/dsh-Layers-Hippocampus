@@ -77,8 +77,12 @@
 - 交接状态机 `active → consumed | failed`，带超时看门狗：**任何异常都降级为可继续的标记**，
   绝不会把会话卡死。
 - 新会话首轮可注入 `[Cold-Start Detected]` 与两段可独立开关的历史块
-  （`context.coldStartInjectSummary` 默认开、`context.coldStartInjectRecentTurns` 默认关）；
+  （`context.coldStartInjectSummary` 默认开、`context.coldStartInjectRecentTurns` 默认开）；
+  **注入按会话幂等**（键为 `session|交接批次`），兄弟 agent 先装配不会吞掉用户新对话的注入；
+  「前几轮原话」取自交接标记里的 `tailTurns`（最后 ≤5 轮原话），摘要之外还能接上具体语境。
   静态「状态唤醒」策略常驻，两个开关都关时也不会退化成客服腔。
+- 交接**不会**自动弹出新对话：交接发生在对话中间，宿主在标记后继续同一对话；是否需要另开
+  新对话由用户自己决定（v1.5.6 的 `context.autoNewSession*` 已在 1.6.3 移除）。
 
 ### 打破线性增长：压缩 / 编码 / 语义三层
 
@@ -217,7 +221,7 @@ node scripts/wait-for-routes.mjs
 ### 6. 验证
 
 ```bash
-npm test        # 进程内全量用例（475 个）
+npm test        # 进程内全量用例（476 个）
 npm run check   # 语法检查 + 全量测试
 ```
 

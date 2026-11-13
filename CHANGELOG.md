@@ -42,6 +42,32 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   - 校验同步收敛：只检查可见数字键，隐藏项的越界值不会阻断保存，Cron 非空检查也跳过。
   - 模式偏好存浏览器 `localStorage`（键 `hippocampus:settings-mode`），不进插件配置、
     不影响引擎行为；读写失败一律退回专业模式。
+- **Removed — 交接时“自动开启新会话”（`context.autoNewSession*`）**：交接就发生在对话
+  中间，宿主会在标记后**继续同一个对话**；客户端再调 `uiWorkspace.startSession()` 只会
+  额外弹出一个空对话，在“追加到原对话”的用法下毫无意义还打断体验。因此彻底移除：
+  - 配置层：`autoNewSession` / `autoNewSessionPoll` / `autoNewSessionIntervalSeconds`
+    三个键从 `DEFAULT_CONFIG`、校验、resolved 与 HTTP 可编辑白名单中删除。
+  - `migrateConfig` 会**静默剥离**旧 profile 残留的这三个键并 warn（否则老用户会撞上
+    未知键阻断启动）。
+  - 可观测面：`CAPABILITIES.autoNewSession` 与 `handoffView().autoNewSession` 删除。
+  - 客户端：三个设置控件、`startAutoNewSession()` 轮询器与其 `ctx.effect` 注册全部删除；
+    设置页不再渲染任何“自动开新会话”开关。
+- **Fixed — 新对话拿不到交接摘要与前几轮原话**（2026-11-13 用户报告）：
+  - 根因：冷启动注入是一个**进程级一次性布尔** `coldStartPending`，被**第一个组装
+    prompt 的 agent** 抢先消费（子代理、标题生成等），用户真正的新对话拿到的是空。
+  - 改为**按会话幂等**：`runtime.coldStart = { pending, injected, lastSessionId }`，
+    以 `session|handoffEpoch` 为键；`noteColdStart()` 在「新 session id 的首个
+    `session/event`」与「`agent/created`」两处布防（同键复用、已被注入过的直接跳过），
+    `promptState(assemblyContext)` 用宿主传给 `systemPrompt.context` 的
+    `assemblyContext.agent.id` 与当前 session id 做匹配，注入后写入 `injected` 集合并
+    有界淘汰（64）。**兄弟 agent 先装配不会再吞掉用户的注入。**
+  - `handoff.json` 标记新增 `tailTurns`：交接蒸馏时把最后 5 轮（role + 文本，每条
+    ≤400 字，内存环形缓冲 12 条、跨会话自动清空）写进标记；
+    `[Previous Context Tail]` 优先回放这些**原话**（`- user: …` / `- assistant: …`），
+    没有 tailTurns 时才回退到最近业务事件。
+  - `context.coldStartInjectRecentTurns` 默认由 `false` 改为 **`true`**：只给摘要会让
+    新对话接不上具体语境。
+  - 即使两个开关全关，匹配到的 pending 也会被消费掉，不会遗留到下一次无关会话。
 - **Tests**：`test/v163.migration.test.js`（9 例）锁定本次教训——旧配置（仅
   `retentionDays: 30`）可启动且 `archiveAfterDays` 派生为 29；显式冲突在
   `strictStartup: true` 下阻断、在 `false` 下降级启动；降级不吞类型错误与未知键；
@@ -49,7 +75,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   迁移步骤，`test/status.test.js` 的 panel 形状契约同步新增三个字段。
   `test/v163.ui.test.js`（5 例）锁定简洁模式契约：`Section` 的 `hidden` 短路、
   14 个专业模式卡片全部带 `hidden: simpleMode`、raw 只剩三项、保存与校验按白名单收敛。
-  全量 **475/475**（77 个测试文件）。
+  `test/v156.autoSession.test.js` 重写为「该功能已移除」契约（配置无该键、旧 profile
+  迁移剥离、路由/能力面不暴露、客户端无轮询器）；
+  `test/v160.coldStart.test.js` 重写为按会话注入契约（无标记不布防、摘要+尾部各一次、
+  兄弟 agent 先装配不吞注入、两个会话各注入一次、双关不遗留 pending、tailTurns 优先）。
+  全量 **476/476**（77 个测试文件）。
 
 ## [1.6.2] — 2026-11-11
 

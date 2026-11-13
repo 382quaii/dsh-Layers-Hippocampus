@@ -398,8 +398,24 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
    * made the model look like it was rereading the same page.
    */
   runtime.injection = { sessionId: null, ids: new Set(), tags: new Set(), handoffAt: null };
-  // v1.6.0: set on agent/created(startup), consumed by the FIRST prompt assembly.
-  runtime.coldStartPending = false;
+  /**
+   * v1.6.3 cold-start state (replaces the v1.6.0 boolean `coldStartPending`).
+   *
+   * The boolean was consumed by the FIRST prompt assembly of the whole process, so
+   * any other agent that assembled a prompt first (a delegated sub-agent, a title
+   * generator, a background fibre) swallowed the injection and the user's brand-new
+   * conversation started blind — exactly the reported bug.
+   *
+   * Now a *pending injection* is armed per conversation start (a new session id from
+   * `session/event`, or `agent/created(source=startup)`) and is keyed by
+   * `session|handoffEpoch`. `injected` records what has already been delivered, so:
+   *   - one conversation is injected at most once per handoff epoch;
+   *   - a different agent cannot consume someone else's injection silently: the new
+   *     conversation arms its own pending entry on its first captured turn.
+   */
+  runtime.coldStart = { pending: null, injected: new Set(), lastSessionId: null };
+  const COLD_START_INJECTED_LIMIT = 64;
+  const COLD_START_PENDING_TTL_MS = 5 * 60_000;
   runtime.lastHintTags = [];
   runtime.resetInjection = (sessionId = runtime.injection.sessionId) => {
     runtime.injection = { sessionId, ids: new Set(), tags: new Set(), handoffAt: null };
@@ -455,20 +471,78 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
   };
 
   /**
-   * v1.6.0: one-shot cold-start block for a brand-new conversation.
+   * v1.6.3: arm a cold-start injection for the conversation that is about to run.
    *
-   * Two independent switches (user request 2026-11-06):
-   *  - `context.coldStartInjectSummary`   → `[Cold-Start Summary]` (handoff summary
-   *    event, else the top L3 semantic summaries);
-   *  - `context.coldStartInjectRecentTurns` → `[Previous Context Tail]` (last ≤5
-   *    episodes, 200 chars each).
-   * Both off → an empty string, and the static anti-customer-service policy still
-   * keeps the model from the "how may I help you" opener.
+   * Two independent hosts signal "a conversation started": `agent/created` (a new
+   * agent, `source: startup`) and the first `session/event` of a session id we have
+   * not seen. Either one arms the SAME per-conversation pending entry, so a host that
+   * does not deliver one of them still gets the behaviour (and the second signal for
+   * the same conversation is a no-op, not a second injection).
+   *
+   * Nothing is armed when there is nothing to inject: no handoff summary and no L3
+   * summaries means a brand-new install, where a cold-start block would be noise.
    */
-  runtime.coldStartText = () => {
-    if (runtime.phase !== 'ready' || runtime.coldStartPending !== true) return '';
+  runtime.noteColdStart = ({ sessionId = null, agentId = null, source = 'session' } = {}) => {
+    if (runtime.phase !== 'ready') return null;
+    const handoff = memory.handoffState();
+    const hasSummaryEvent = typeof handoff?.summaryEventId === 'string' && handoff.summaryEventId.length > 0;
+    if (!hasSummaryEvent) return null;
+    const epoch = `${handoff.at ?? 0}:${handoff.summaryEventId}`;
+    const key = `${sessionId ?? agentId ?? 'unknown'}|${epoch}`;
+    if (runtime.coldStart.injected.has(key)) return null;
+    const pending = runtime.coldStart.pending;
+    // Same conversation re-armed (created + first turn): keep the FIRST arming time
+    // and merge the identifiers instead of restarting the TTL.
+    if (pending && pending.key === key) {
+      pending.sessionId = pending.sessionId ?? sessionId;
+      pending.agentId = pending.agentId ?? agentId;
+      return pending;
+    }
+    runtime.coldStart.pending = {
+      key,
+      sessionId,
+      agentId,
+      source,
+      at: memory.clock.now(),
+      epoch,
+      summaryEventId: handoff.summaryEventId,
+    };
+    return runtime.coldStart.pending;
+  };
+
+  /** True when `pending` belongs to the conversation currently assembling. */
+  const coldStartMatches = (pending, sessionId, agentId) => {
+    if (!pending) return false;
+    if (pending.sessionId && sessionId && pending.sessionId === sessionId) return true;
+    if (pending.agentId && agentId && pending.agentId === agentId) return true;
+    // Neither side known (older host without session/agent identity): the pending
+    // entry is still this process's ONLY armed injection, so let it through once.
+    return !pending.sessionId && !pending.agentId && !sessionId && !agentId;
+  };
+
+  /**
+   * v1.6.0 / v1.6.3: one-shot cold-start block for a conversation that just started
+   * after a handoff.
+   *
+   * Two independent switches:
+   *  - `context.coldStartInjectSummary`     → `[Cold-Start Summary]` (the handoff
+   *    summary event; falls back to the top L3 semantic summaries);
+   *  - `context.coldStartInjectRecentTurns` → `[Previous Context Tail]` (the last ≤5
+   *    turns captured at handoff time, else the newest episodes).
+   * Both off → empty string; the static anti-customer-service policy still ships in
+   * `memory:policy`, so the model never falls back to a canned opener.
+   */
+  runtime.coldStartText = ({ sessionId = null, agentId = null } = {}) => {
+    if (runtime.phase !== 'ready') return '';
+    const pending = runtime.coldStart.pending;
+    if (!coldStartMatches(pending, sessionId, agentId)) return '';
     const contextConfig = runtime.config?.context ?? {};
-    if (contextConfig.coldStartInjectSummary !== true && contextConfig.coldStartInjectRecentTurns !== true) return '';
+    const wantSummary = contextConfig.coldStartInjectSummary === true;
+    const wantTurns = contextConfig.coldStartInjectRecentTurns === true;
+    // Consume on the FIRST matching assembly, even when both switches are off: the
+    // pending entry must not linger and fire later on an unrelated conversation.
+    runtime.coldStart.pending = null;
+    if (!wantSummary && !wantTurns) return '';
     try {
       const view = memory.indexManager.snapshot();
       const allEvents = Array.isArray(view?.events) ? [...view.events] : [];
@@ -483,11 +557,15 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       const spaces = memory.spaces.status();
       const activeSpace = spaces?.current ?? 'default';
       const lines = ['', `[Cold-Start Detected: Active Space=${activeSpace}, Recent Topic=${latestTopic}]`];
-      if (contextConfig.coldStartInjectSummary === true) {
+      const handoff = memory.handoffState();
+      if (wantSummary) {
         let summaryText = '';
-        const handoff = memory.handoffState();
         if (handoff?.summaryEventId) {
-          const summaryEvent = events.find((event) => event.eventId === handoff.summaryEventId);
+          // The summary event carries a business tag (`folded_summary`), but be
+          // defensive: search ALL events so a bookkeeping-tag rewrite cannot hide it.
+          const summaryEvent =
+            allEvents.find((event) => event.eventId === handoff.summaryEventId) ??
+            events.find((event) => event.eventId === handoff.summaryEventId);
           if (summaryEvent?.content) summaryText = String(summaryEvent.content);
         }
         if (!summaryText) {
@@ -502,20 +580,34 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
           lines.push('[Cold-Start Summary]', summaryText.replace(/\s+/g, ' ').trim().slice(0, 800));
         }
       }
-      if (contextConfig.coldStartInjectRecentTurns === true && events.length > 0) {
-        const recent = events
-          .slice(0, 5)
-          .map((event) => `- ${String(event.content ?? '').replace(/\s+/g, ' ').trim().slice(0, 200)}`)
-          .filter((line) => line.length > 2);
+      if (wantTurns) {
+        // Prefer the turns captured AT the handoff (verbatim roles, exactly "the last
+        // few things said"); episodes are distilled text and lose the dialogue shape.
+        const tail = Array.isArray(handoff?.tailTurns) ? handoff.tailTurns : [];
+        const recent = tail.length > 0
+          ? tail
+              .slice(-5)
+              .map((turn) => `- ${turn.role === 'assistant' ? 'assistant' : 'user'}: ${String(turn.text ?? '').replace(/\s+/g, ' ').trim().slice(0, 200)}`)
+              .filter((line) => line.length > 10)
+          : events
+              .slice(0, 5)
+              .map((event) => `- ${String(event.content ?? '').replace(/\s+/g, ' ').trim().slice(0, 200)}`)
+              .filter((line) => line.length > 2);
         if (recent.length > 0) lines.push('[Previous Context Tail]', ...recent);
       }
-      return lines.join('\n');
+      const text = lines.join('\n');
+      runtime.coldStart.injected.add(pending.key);
+      if (runtime.coldStart.injected.size > COLD_START_INJECTED_LIMIT) {
+        const oldest = runtime.coldStart.injected.values().next().value;
+        runtime.coldStart.injected.delete(oldest);
+      }
+      return text;
     } catch {
       return '';
     }
   };
 
-  runtime.promptState = () => {
+  runtime.promptState = (assemblyContext = null) => {
     // Opportunistic mode tracking: prompt assembly is inside the agent turn, so the
     // current preset is readable here even when no change event ever fired.
     runtime.syncAgentPreset();
@@ -577,9 +669,12 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
             .join('\n')
         : '';
       // v1.6.0 cold-start block: volatile tail (after the cacheable prefix), injected
-      // exactly once on the first assembly of a brand-new conversation.
-      const coldStart = runtime.coldStartText();
-      if (runtime.coldStartPending === true) runtime.coldStartPending = false;
+      // at most once per conversation (v1.6.3: keyed by session|handoff-epoch, so a
+      // sibling agent assembling first can no longer swallow the user's injection).
+      const coldStart = runtime.coldStartText({
+        sessionId: usage?.sessionId ?? null,
+        agentId: assemblyContext?.agent?.id ?? null,
+      });
       return (
         composePrompt({ rules: PROMPT_STATE_RULES, activeTask: activeTaskBlock, blocks, hints }) +
         marker +
@@ -929,8 +1024,8 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     // but no spacesDelete, so the client hides the delete button instead of sending an
     // action the old server would misread as CREATE ("空间已存在").
     spacesDelete: runtime.multiSpaceAvailable() && typeof memory.spaces?.deleteSpace === 'function',
-    // v1.5.6: the client half may open a fresh conversation on an active handoff.
-    autoNewSession: runtime.config.context.autoNewSession === true,
+    // v1.6.3: `autoNewSession` was REMOVED — a handoff continues the same conversation,
+    // so there is no client-side "open another one" capability to advertise.
     // v1.6.3: how the config was loaded — a degraded boot must be visible, not silent.
     startup: runtime.config.startup ?? { strict: true, degraded: false, migrated: false, fromVersion: null },
     configVersion: runtime.config.configVersion ?? null,
@@ -949,7 +1044,7 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     })(),
   });
 
-  /** v1.5.6: handoff observability for the client-side auto-new-session controller. */
+  /** v1.5.6: handoff observability (the client shows the marker + summary link). */
   runtime.handoffView = () => {
     const handoff = memory.handoffState();
     return {
@@ -957,7 +1052,6 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       at: handoff?.at ?? null,
       summaryEventId: handoff?.summaryEventId ?? null,
       agentPreset: runtime.agentPreset ?? null,
-      autoNewSession: runtime.config.context.autoNewSession === true,
     };
   };
 
@@ -1331,9 +1425,13 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       runtime.agentPresetSessionId = sessionId ?? null;
     },
     onAgentCreated: async (payload) => {
-      // v1.6.0: a brand-new conversation needs one cold-start injection on its first
-      // prompt assembly (summary and/or previous turns, each behind its own flag).
-      if (payload?.source === 'startup') runtime.coldStartPending = true;
+      // v1.6.3: arm a cold-start injection for the new agent. The host reports
+      // `source: 'startup'` for a user-created conversation, and there is no separate
+      // "user pressed +" signal, so we do NOT gate on source here: the real gate is
+      // "a handoff summary exists and this conversation has not seen it yet"
+      // (inside noteColdStart). A delegated sub-agent also lands here — it merely
+      // arms its OWN entry, and the user's conversation arms its own on first turn.
+      runtime.noteColdStart({ agentId: payload?.agent?.id ?? null, source: 'agent-created' });
       // Track the mode this session actually runs in (a session may be created with
       // a preset without emitting a change event).
       try {
@@ -1622,6 +1720,15 @@ export async function apply(ctx, rawConfig = {}) {
     // raw store's own gating/budgets still decide what lands on disk.
     const captureListener = (session, event) => {
       if (!runtime.memory || runtime.phase !== 'ready') return;
+      // v1.6.3: a NEW conversation id is the reliable "the user started a conversation"
+      // signal on every host (a user-created and a resumed session both arrive here).
+      // Arming on the first captured turn also beats any sibling agent assembling a
+      // prompt, because this conversation's assembly happens after its own turn.
+      const sessionId = typeof session?.id === 'string' && session.id.length > 0 ? session.id : null;
+      if (sessionId && sessionId !== runtime.coldStart.lastSessionId) {
+        runtime.coldStart.lastSessionId = sessionId;
+        runtime.noteColdStart({ sessionId, source: 'session-switch' });
+      }
       // v1.5.6: remember the latest USER turn as the relevance input for
       // `[Memory Hints]`. This is the only place the current input is available:
       // prompt assembly receives no message text.
@@ -2208,11 +2315,13 @@ export async function apply(ctx, rawConfig = {}) {
         }),
       );
       // On-demand: this function runs at assemble time and reads the live window.
+      // v1.6.3: the assembly context carries `agent`, which lets the cold-start
+      // injection be matched to the conversation that is actually assembling.
       disposers.push(
         ctx.systemPrompt.context({
           name: 'memory-state',
           order: 220,
-          text: () => runtime.promptState(),
+          text: (assemblyContext) => runtime.promptState(assemblyContext),
         }),
       );
       if (config.enableReflection) {

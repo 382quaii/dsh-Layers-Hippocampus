@@ -198,19 +198,18 @@ export const DEFAULT_CONFIG = Object.freeze({
     threshold: 0.85,
     target: 0.7,
     injectPrompt: true,
-    // v1.5.6: when a handoff becomes active the CLIENT half asks the Host client
-    // service `uiWorkspace.startSession()` to open a fresh conversation (opt-out).
-    autoNewSession: true,
-    // v1.5.6: how the client half decides a new conversation is due. `interval`
-    // polls /stats every `autoNewSessionIntervalSeconds`; `once` checks only once
-    // per page load (no recurring traffic).
-    autoNewSessionPoll: 'interval',
-    autoNewSessionIntervalSeconds: 15,
+    // v1.6.3 REMOVED: `autoNewSession` / `autoNewSessionPoll` /
+    // `autoNewSessionIntervalSeconds`. Handing off is an in-conversation event; the
+    // host now CONTINUES the same conversation after the marker instead of opening a
+    // second one, so a client-side "start a fresh session" controller only spawned a
+    // useless empty conversation. Legacy keys are stripped by `migrateConfig`.
     // v1.6.0 cold-start injection switches (user request 2026-11-06):
-    //  - summary: inject the previous handoff/L3 summary so the first turn inherits context
-    //  - recentTurns: inject the last few verbatim-ish episodes (costs more start tokens)
+    //  - summary: inject the previous handoff summary so the first turn inherits context
+    //  - recentTurns: inject the last few turns of the handed-off conversation
+    //  - recentTurns: inject the last few turns of the handed-off conversation
+    //    (v1.6.3 default ON: a new conversation must not start "blind")
     coldStartInjectSummary: true,
-    coldStartInjectRecentTurns: false,
+    coldStartInjectRecentTurns: true,
     // REMOVED in v1.5.3: `minInjectConfidence`. It never demonstrably saved tokens
     // (0.6 vs 0 produced byte-identical payloads) and every hit-shaping pass is a
     // permanent token tax; keeping a misleading knob is worse than having none.
@@ -566,6 +565,24 @@ export function migrateConfig(raw, { logger = console } = {}) {
     }
   }
 
+  // v1.6.3: the client-side "open a new conversation on handoff" controller is gone
+  // (a handoff now continues the SAME conversation). Strip the three legacy keys so a
+  // profile written by an older HA does not keep advertising a knob that no longer
+  // exists — otherwise the settings page would render a switch that does nothing.
+  const REMOVED_CONTEXT_KEYS = ['autoNewSession', 'autoNewSessionPoll', 'autoNewSessionIntervalSeconds'];
+  if (isPlainObject(input.context)) {
+    const legacy = REMOVED_CONTEXT_KEYS.filter((key) => input.context[key] !== undefined);
+    if (legacy.length > 0) {
+      const contextGroup = { ...input.context };
+      for (const key of legacy) delete contextGroup[key];
+      input.context = contextGroup;
+      warn(
+        `config.context.${legacy.join('/')} removed in 1.6.3 (a handoff continues the same conversation); the key(s) were dropped.`,
+      );
+      migrated = true;
+    }
+  }
+
   // `strictStartup` did not exist before 1.6.3; default it explicitly so the
   // resolved config always states the behaviour it will use.
   if (input.strictStartup === undefined) {
@@ -744,22 +761,6 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
   }
   const contextInjectPrompt =
     contextIn.injectPrompt === undefined ? defaults.context.injectPrompt : requireBoolean(contextIn.injectPrompt, 'context.injectPrompt');
-  const contextAutoNewSession = requireBoolean(
-    contextIn.autoNewSession === undefined ? defaults.context.autoNewSession : contextIn.autoNewSession,
-    'context.autoNewSession',
-  );
-  const contextAutoNewSessionPoll = requireEnum(
-    contextIn.autoNewSessionPoll === undefined ? defaults.context.autoNewSessionPoll : contextIn.autoNewSessionPoll,
-    'context.autoNewSessionPoll',
-    ['interval', 'once'],
-  );
-  const contextAutoNewSessionIntervalSeconds = requireInteger(
-    contextIn.autoNewSessionIntervalSeconds === undefined
-      ? defaults.context.autoNewSessionIntervalSeconds
-      : contextIn.autoNewSessionIntervalSeconds,
-    'context.autoNewSessionIntervalSeconds',
-    { min: 5, max: 3600 },
-  );
   const contextColdStartInjectSummary = requireBoolean(
     contextIn.coldStartInjectSummary === undefined
       ? defaults.context.coldStartInjectSummary
@@ -1315,10 +1316,7 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
       threshold: contextThreshold,
       target: contextTarget,
       injectPrompt: contextInjectPrompt,
-      autoNewSession: contextAutoNewSession,
-      autoNewSessionPoll: contextAutoNewSessionPoll,
-      autoNewSessionIntervalSeconds: contextAutoNewSessionIntervalSeconds,
-      // v1.6.0 cold-start injection switches (independent booleans).
+      // v1.6.3 cold-start injection switches (independent booleans).
       coldStartInjectSummary: contextColdStartInjectSummary,
       coldStartInjectRecentTurns: contextColdStartInjectRecentTurns,
       // v1.5.0 routing knobs below; v1.5.3 removed minInjectConfidence entirely.

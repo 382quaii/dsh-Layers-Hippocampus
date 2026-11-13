@@ -2644,11 +2644,8 @@
             autoSpaceFollow: Boolean((config.context && config.context.autoSpaceFollow) ?? false),
             autoRolloverEnabled: (config.context && config.context.autoRolloverEnabled) !== false,
             autoRolloverThreshold: Number((config.context && config.context.autoRolloverThreshold) ?? 0.85),
-            autoNewSession: (config.context && config.context.autoNewSession) !== false,
-            autoNewSessionPoll: (config.context && config.context.autoNewSessionPoll) === 'once' ? 'once' : 'interval',
-            autoNewSessionIntervalSeconds: Number((config.context && config.context.autoNewSessionIntervalSeconds) ?? 15),
             coldStartInjectSummary: (config.context && config.context.coldStartInjectSummary) !== false,
-            coldStartInjectRecentTurns: (config.context && config.context.coldStartInjectRecentTurns) === true,
+            coldStartInjectRecentTurns: (config.context && config.context.coldStartInjectRecentTurns) !== false,
             nativeTokenLimit: Number((config.context && config.context.nativeTokenLimit) ?? 8000),
             // Security red line (v1.5.1): default TRUE, only an explicit operator
             // choice may turn the engine-level consent gate off.
@@ -3025,9 +3022,6 @@
             'context.injectPrompt': Boolean(draft.context.injectPrompt),
             'context.autoSpaceFollow': Boolean(draft.context.autoSpaceFollow),
             'context.autoRolloverEnabled': Boolean(draft.context.autoRolloverEnabled),
-            'context.autoNewSession': Boolean(draft.context.autoNewSession),
-            'context.autoNewSessionPoll': draft.context.autoNewSessionPoll === 'once' ? 'once' : 'interval',
-            'context.autoNewSessionIntervalSeconds': Number(draft.context.autoNewSessionIntervalSeconds),
             'context.coldStartInjectSummary': Boolean(draft.context.coldStartInjectSummary),
             'context.coldStartInjectRecentTurns': Boolean(draft.context.coldStartInjectRecentTurns),
             'context.autoRolloverThreshold': Number(draft.context.autoRolloverThreshold),
@@ -3645,13 +3639,6 @@
               disabled,
             }),
             h(Toggle, {
-              label: '自动开启新会话（context.autoNewSession）',
-              hint: '交接标记生效后，客户端调用宿主 uiWorkspace.startSession() 打开一个新会话（工作模式与摘要自动带入）；关闭则只提示、由你手动新建。',
-              checked: draft.context.autoNewSession,
-              onChange: (value) => edit('context.autoNewSession', value),
-              disabled,
-            }),
-            h(Toggle, {
               label: '上下文总结注入（context.coldStartInjectSummary）',
               hint: '开启后，新对话将自动载入之前的记忆摘要（交接摘要优先，其次 L3 语义），让 AI 无缝接续；想彻底空白开局可关闭。',
               checked: draft.context.coldStartInjectSummary,
@@ -3660,32 +3647,10 @@
             }),
             h(Toggle, {
               label: '前几轮原话注入（context.coldStartInjectRecentTurns）',
-              hint: '开启后，新对话会强行带上之前最后 5 条记忆片段，适合极速上下文顶替；这会增加初始 Token 消耗。',
+              hint: '开启后，新对话会带上交接时刻最后 5 轮原话（推荐：只有摘要会让 AI 接不上具体语境）；这会增加初始 Token 消耗。',
               checked: draft.context.coldStartInjectRecentTurns,
               onChange: (value) => edit('context.coldStartInjectRecentTurns', value),
               disabled,
-            }),
-            h(Select, {
-              label: '新会话检测方式（context.autoNewSessionPoll）',
-              hint: '按间隔轮询：客户端每 N 秒拉一次 /stats；只检查一次：页面加载后仅检查一次，之后不再产生请求（可能错过之后才出现的交接标记）。',
-              value: draft.context.autoNewSessionPoll,
-              options: [
-                { value: 'interval', label: '按间隔轮询 /stats' },
-                { value: 'once', label: '只检查一次' },
-              ],
-              onChange: (value) => edit('context.autoNewSessionPoll', value),
-              disabled,
-            }),
-            h(Slider, {
-              label: '轮询间隔秒数（context.autoNewSessionIntervalSeconds）',
-              hint: '仅“按间隔轮询”生效；默认 15 秒，范围 5–3600 秒。调大→更省请求、交接后开新会话更慢。',
-              value: draft.context.autoNewSessionIntervalSeconds,
-              min: 5,
-              max: 3600,
-              step: 5,
-              suffix: ' 秒',
-              onChange: (value) => edit('context.autoNewSessionIntervalSeconds', value),
-              disabled: disabled || draft.context.autoNewSessionPoll === 'once',
             }),
             h(Slider, {
               label: '交接触发比例（context.autoRolloverThreshold）',
@@ -4040,77 +4005,13 @@
         );
       }
       /**
-       * v1.5.6: open a fresh conversation once an active handoff appears.
-       *
-       * The CLIENT half is the only place that can switch the visible session:
-       * `ctx.get('uiWorkspace').startSession()` is the Host's own new-conversation
-       * action (same path the "+" button uses). Guarded by (a) the config flag the
-       * Host reports, (b) one fire per handoff marker via sessionStorage, and (c) a
-       * hard capability check so an old Host/clients without the service do nothing.
+       * v1.6.3: the client-side "open a new conversation on handoff" controller is
+       * GONE. A handoff happens mid-conversation and the host continues that same
+       * conversation, so switching the visible session right after a handoff only
+       * threw the user into a second empty conversation. The handoff marker is now
+       * surfaced in the status bar, and the cold-start block is injected by the Host
+       * half into whichever conversation the user opens next.
        */
-      function startAutoNewSession(ctx) {
-        if (!ctx || typeof ctx.get !== 'function') return () => {};
-        let stopped = false;
-        let fired = false;
-        let timer = null;
-        let scheduled = false;
-        // Decide the poll mode ONCE from the first stats response: `once` clears the
-        // timer after the initial check; `interval` replaces the default 15 s timer
-        // with the configured seconds (5–3600).
-        const configure = (body) => {
-          if (scheduled) return;
-          scheduled = true;
-          const contextConfig = (body && body.config && body.config.context) || {};
-          const poll = contextConfig.autoNewSessionPoll === 'once' ? 'once' : 'interval';
-          if (timer) {
-            clearInterval(timer);
-            timer = null;
-          }
-          if (poll === 'once') return;
-          const seconds = Math.max(5, Math.min(3600, Number(contextConfig.autoNewSessionIntervalSeconds) || 15));
-          timer = setInterval(check, seconds * 1000);
-        };
-        const keyFor = (handoff) => `hippocampus-auto-session:${handoff.at || handoff.summaryEventId || 'unknown'}`;
-        const check = async () => {
-          if (stopped || fired) return;
-          try {
-            const { body } = await getJson(API.stats);
-            configure(body);
-            const handoff = body && body.handoff;
-            if (!handoff || handoff.active !== true || handoff.autoNewSession !== true) return;
-            const key = keyFor(handoff);
-            try {
-              if (window.sessionStorage && window.sessionStorage.getItem(key)) {
-                fired = true;
-                return;
-              }
-            } catch (ignored) {
-              // sessionStorage can be unavailable; the in-memory guard still holds.
-            }
-            const workspace = ctx.get('uiWorkspace');
-            if (!workspace || typeof workspace.startSession !== 'function') return;
-            fired = true;
-            try {
-              if (window.sessionStorage) window.sessionStorage.setItem(key, '1');
-            } catch (ignored) {
-              // storage quota/privacy: the in-memory `fired` flag prevents a loop.
-            }
-            workspace.startSession(undefined, handoff.agentPreset ? { agentPreset: handoff.agentPreset } : undefined);
-          } catch (ignored) {
-            // A missing route / offline Host must never throw out of the poll.
-          }
-        };
-        (function boot() {
-          // Start with the default interval so the FIRST stats request happens now;
-          // configure() then replaces or clears it.
-          timer = setInterval(check, 15000);
-          check();
-        })();
-        return () => {
-          stopped = true;
-          if (timer) clearInterval(timer);
-        };
-      }
 
       return {
         inject: ['slots'],
@@ -4130,12 +4031,6 @@
         spaceCreateAvailable,
         describeSpaceError,
         apply(ctx) {
-          try {
-            if (ctx && typeof ctx.effect === 'function') ctx.effect(() => startAutoNewSession(ctx));
-            else startAutoNewSession(ctx);
-          } catch (error) {
-            report('auto-new-session', error);
-          }
           let slots = null;
           try {
             slots = ctx && ctx.slots;

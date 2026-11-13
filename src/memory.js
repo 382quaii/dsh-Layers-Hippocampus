@@ -169,6 +169,15 @@ export const SESSION_TRACK_LIMIT = 16;
  * proceed. Configurable per call for tests.
  */
 export const HANDOFF_TIMEOUT_MS = 5000;
+/**
+ * v1.6.3 handoff tail: how many verbatim-ish turns travel with the marker, and how
+ * long each one may be. The marker is written to state/handoff.json AND re-injected
+ * into the next conversation's prompt, so both bounds are prompt-budget decisions,
+ * not storage decisions (raw keeps the full text).
+ */
+export const HANDOFF_TAIL_TURNS = 5;
+export const RECENT_TURN_LIMIT = 12;
+export const RECENT_TURN_MAX_CHARS = 400;
 export const HANDOFF_STATES = Object.freeze({ ACTIVE: 'active', FAILED: 'failed', CONSUMED: 'consumed' });
 /** Any summary whose text starts with this is a handoff summary, never evidence. */
 export const HANDOFF_TEXT_PREFIX = '交接摘要';
@@ -495,6 +504,15 @@ export class Memory {
      */
     this._sessionTokens = new Map();
     this._currentSessionId = null;
+    /**
+     * v1.6.3: the last few surface turns of the CURRENT conversation, in order.
+     *
+     * A handoff used to record only the distilled summary, so a brand-new conversation
+     * could not see "what was actually just said". This ring buffer is in-memory (the
+     * raw log remains the durable truth) and is copied into the handoff marker so the
+     * cold-start block can replay the tail verbatim-ish.
+     */
+    this._recentTurns = [];
     /** Tags whose oversized hint has already been shown: the next recall is "insist". */
     this._oversizedHintTags = new Set();
     this._handoffInFlight = false;
@@ -1472,6 +1490,9 @@ export class Memory {
       // deliberately INDEPENDENT of the raw-retention gates below — the handoff must
       // still work when the black box is disabled or sampled.
       this.observeSessionTurn(session?.id ?? session?.sessionId ?? null, turn.text);
+      // v1.6.3: keep the verbatim-ish tail so the handoff marker can carry "the last
+      // few things said" into the next conversation (see _distillHandoffTail).
+      this._recordRecentTurn(turn.role, turn.text);
       this._maybeAutoHandoff();
     }
     const raw = this.config?.raw ?? {};
@@ -1580,6 +1601,12 @@ export class Memory {
     const isSameKeyRestart =
       previousTokens !== null && tokens < previousTokens / 2 && previousTokens > this.context.nativeTokenLimit / 2;
     this._currentSessionId = key;
+    if (isNewSession) {
+      // v1.6.3: the tail belongs to ONE conversation; a new session id must not inherit
+      // the previous conversation's last turns (they are replayed by the handoff marker
+      // instead, exactly once).
+      this._recentTurns = [];
+    }
     if (isNewSession || isSameKeyRestart) {
       // CORE ANTI-DEADLOCK: the in-flight guard belongs to the OLD session only.
       this._handoffInFlight = false;
@@ -1591,9 +1618,34 @@ export class Memory {
     return this.sessionUsage();
   }
 
+  /**
+   * Remember ONE surface turn for the handoff tail (v1.6.3).
+   *
+   * Bounded and process-local by design: the raw log stays the durable source of
+   * truth, and this buffer only exists to hand "what was just said" to the next
+   * conversation. Text is normalised and truncated so a pasted file cannot bloat the
+   * marker that is written to state/handoff.json.
+   */
+  _recordRecentTurn(role, text) {
+    const clean = String(text ?? '').replace(/\s+/g, ' ').trim();
+    if (clean.length === 0) return;
+    this._recentTurns.push({
+      role: role === 'assistant' ? 'assistant' : 'user',
+      text: clean.slice(0, RECENT_TURN_MAX_CHARS),
+    });
+    if (this._recentTurns.length > RECENT_TURN_LIMIT) {
+      this._recentTurns = this._recentTurns.slice(-RECENT_TURN_LIMIT);
+    }
+  }
+
+  /** The last `count` remembered turns (oldest first) for the handoff marker. */
+  recentTurns(count = HANDOFF_TAIL_TURNS) {
+    const limit = Math.max(0, Math.min(RECENT_TURN_LIMIT, Number(count) || 0));
+    return this._recentTurns.slice(-limit).map((turn) => ({ role: turn.role, text: turn.text }));
+  }
+
   /** Add ONE turn's estimated tokens to its session (surface messages only). */
-  observeSessionTurn(sessionId, text) {
-    this.assertOpen();
+  observeSessionTurn(sessionId, text) {    this.assertOpen();
     const key = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : DEFAULT_SESSION_KEY;
     const previous = this._sessionTokens.get(key) ?? 0;
     const tokens = previous + Math.max(1, Math.ceil(String(text ?? '').length / 4));
@@ -1785,6 +1837,9 @@ export class Memory {
       summaryEventId: distilled?.eventId ?? null,
       summaryStatus: distilled?.status ?? null,
       summaryError: failure,
+      // v1.6.3: carry the last few turns verbatim so the next conversation can pick up
+      // "what was actually just said" instead of only the compressed summary.
+      tailTurns: this.recentTurns(HANDOFF_TAIL_TURNS),
       // v1.5.6: carry the working mode (Host agent preset) across the handoff so the
       // next conversation starts in the SAME mode instead of the profile default.
       agentPreset: this._handoffPreset(),

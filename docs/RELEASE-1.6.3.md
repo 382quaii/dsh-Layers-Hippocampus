@@ -1,9 +1,9 @@
 # Release 1.6.3 — 发布准备（本地）
 
-> 版本：**1.6.3**（2026-11-13：配置 schema 迁移 + `strictStartup` 启动安全降级 + 设置页简洁模式；`CAPABILITIES.version` 与测试断言同步）。
+> 版本：**1.6.3**（2026-11-13：配置 schema 迁移 + `strictStartup` 启动安全降级 + 设置页简洁模式 + 交接冷启动按会话注入；`CAPABILITIES.version` 与测试断言同步）。
 
 > 状态：**代码与文档已就绪；仓库推送 / npm 发布 / 市场 PR 需要你的 GitHub 与 npm 凭据，代理与网络，本会话未执行。**
-> 基线：`dsh-memory` 工作区，全量 **475/475 测试通过**（77 个测试文件；另有 `dsh-orchestrator` 31/31）。
+> 基线：`dsh-memory` 工作区，全量 **476/476 测试通过**（77 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；插件市场仍无条目（未发布 npm）。
 
 ## 本版内容
@@ -37,11 +37,19 @@
   POST 的 patch 被过滤为 9 个可见键，文件里其余配置保持原值。校验同步收敛，
   隐藏项的越界值不阻断保存。模式偏好只存浏览器 `localStorage`（`hippocampus:settings-mode`），
   默认专业模式，读写失败自动退回专业模式。
+- **交接冷启动修复（用户 2026-11-13 报告）**：
+  - 移除 `context.autoNewSession*`：交接继续同一对话，客户端不再弹出第二个空会话；
+    旧 profile 残留键由 `migrateConfig` 剥离并 warn；`CAPABILITIES` / `handoffView` 不再暴露该字段。
+  - 注入从「进程级一次性布尔」改为「按会话幂等」（`session|交接批次` 键）：子代理先装配
+    不会吞掉用户新对话的注入。
+  - `handoff.json` 新增 `tailTurns`（最后 ≤5 轮原话），`[Previous Context Tail]` 优先回放原话；
+    `context.coldStartInjectRecentTurns` 默认改为 `true`。
 - **测试**：新增 `test/v163.migration.test.js`（9 例）——旧配置启动 + `archiveAfterDays=29`；
   显式冲突在 strict 下阻断、非 strict 下降级；降级不吞类型错误/未知键；1.6.2 生产 profile
   原始形状可解析。`test/helpers.js` 夹具改走同一迁移步骤；`test/status.test.js` 的 panel
   形状契约同步新增三字段。新增 `test/v163.ui.test.js`（5 例）锁简洁模式契约。
-  全量 **475/475**。
+  `test/v156.autoSession.test.js` 改写为「移除」契约、`test/v160.coldStart.test.js` 改写为
+  「按会话注入」契约。全量 **476/476**。
 
 完整历史见 [CHANGELOG.md](../CHANGELOG.md) 的 `[1.6.3]` / `[1.6.2]` / `[1.6.1]` 段。
 
@@ -55,7 +63,7 @@
 
 ```powershell
 cd C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory
-node test/run.mjs                # 期望 475/475
+node test/run.mjs                # 期望 476/476
 cd ..\dsh-orchestrator
 node test/run.mjs                # 期望 31/31
 cd ..\dsh-memory

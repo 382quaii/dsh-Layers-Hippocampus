@@ -1,63 +1,66 @@
 /**
- * v1.5.6 — automatic new conversation on handoff.
+ * v1.5.6 feature, REMOVED in v1.6.3 — "automatically open a new conversation on
+ * handoff".
  *
- * Verified Host surface: the CLIENT service `uiWorkspace.startSession()` is the
- * same action the "+" button uses, so a client-half plugin can open a fresh
- * conversation; `ctx.agents.create/resume` also exists host-side. This suite locks
- * the memory-plugin contract: config flag (default true), handoff payload, and the
- * client controller source (one fire per marker, capability-guarded).
+ * Why it was removed (user report 2026-11-13): a handoff fires mid-conversation and
+ * the host CONTINUES that same conversation, so the client-side controller opened a
+ * dangling second conversation right after the marker — useless in the "append to the
+ * existing conversation" flow and actively harmful to the experience.
+ *
+ * This suite now locks the REMOVAL, so the feature cannot silently grow back (and a
+ * stale profile that still carries the three keys keeps booting instead of failing on
+ * an unknown key).
  */
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 import { apply, getRuntime } from '../index.js';
-import { resolveConfig } from '../src/config.js';
+import { migrateConfig, resolveConfig } from '../src/config.js';
 import { EDITABLE_CONFIG_KEYS } from '../src/webRoutes.js';
 import { fakeCtx, tempDir } from './helpers.js';
 
-test('context.autoNewSession defaults true and is fail-fast/editable', () => {
-  assert.equal(resolveConfig({}).context.autoNewSession, true);
-  assert.equal(resolveConfig({ context: { autoNewSession: false } }).context.autoNewSession, false);
-  assert.throws(
-    () => resolveConfig({ context: { autoNewSession: 'yes' } }),
-    (error) => error.code === 'MEM_E_CONFIG_INVALID_TYPE',
-  );
-  assert.ok(EDITABLE_CONFIG_KEYS.includes('context.autoNewSession'));
+const REMOVED = ['autoNewSession', 'autoNewSessionPoll', 'autoNewSessionIntervalSeconds'];
+
+test('the three auto-new-session keys are gone from the resolved config', () => {
+  const resolved = resolveConfig({});
+  for (const key of REMOVED) {
+    assert.equal(Object.prototype.hasOwnProperty.call(resolved.context, key), false, `${key} must not be resolved`);
+  }
 });
 
-test('poll mode and interval are validated and editable', () => {
-  const defaults = resolveConfig({});
-  assert.equal(defaults.context.autoNewSessionPoll, 'interval');
-  assert.equal(defaults.context.autoNewSessionIntervalSeconds, 15);
-  assert.equal(resolveConfig({ context: { autoNewSessionPoll: 'once' } }).context.autoNewSessionPoll, 'once');
-  assert.throws(
-    () => resolveConfig({ context: { autoNewSessionPoll: 'sometimes' } }),
-    (error) => error.code === 'MEM_E_CONFIG_UNKNOWN_ENUM',
+test('a legacy profile carrying the keys is migrated, not rejected', () => {
+  const warnings = [];
+  const legacy = { context: { autoNewSession: true, autoNewSessionPoll: 'once', autoNewSessionIntervalSeconds: 30 } };
+  const migration = migrateConfig(legacy, { logger: { warn: (line) => warnings.push(String(line)) } });
+  assert.equal(migration.migrated, true);
+  for (const key of REMOVED) {
+    assert.equal(Object.prototype.hasOwnProperty.call(migration.input.context, key), false);
+  }
+  assert.ok(
+    warnings.some((line) => line.includes('autoNewSession')),
+    'the migration must say what it dropped',
   );
-  assert.throws(
-    () => resolveConfig({ context: { autoNewSessionIntervalSeconds: 1 } }),
-    (error) => error.code === 'MEM_E_CONFIG_OUT_OF_RANGE',
-  );
-  assert.throws(
-    () => resolveConfig({ context: { autoNewSessionIntervalSeconds: 7200 } }),
-    (error) => error.code === 'MEM_E_CONFIG_OUT_OF_RANGE',
-  );
-  assert.ok(EDITABLE_CONFIG_KEYS.includes('context.autoNewSessionPoll'));
-  assert.ok(EDITABLE_CONFIG_KEYS.includes('context.autoNewSessionIntervalSeconds'));
+  // And the whole pipeline still resolves (no MEM_E_CONFIG_UNKNOWN_KEY).
+  const resolved = resolveConfig(legacy, { env: {} });
+  assert.equal(resolved.context.coldStartInjectSummary, true);
+  // Explicit values for the KEPT keys survive untouched.
+  assert.equal(resolveConfig({ context: { coldStartInjectRecentTurns: false } }, { env: {} }).context.coldStartInjectRecentTurns, false);
 });
 
-test('stats expose the handoff view + capability the client controller reads', async () => {
-  const dir = tempDir('auto-session');
+test('neither route keys nor capabilities advertise autoNewSession', async () => {
+  for (const key of REMOVED) {
+    assert.equal(EDITABLE_CONFIG_KEYS.includes(`context.${key}`), false, `${key} must not be editable over HTTP`);
+  }
+  const dir = tempDir('auto-session-removed');
   const fixture = fakeCtx();
   try {
     await apply(fixture.ctx, { dataDir: dir, maintenanceCron: '0 */6 * * *', autoMaintainOnBoot: false });
     const runtime = getRuntime(fixture.ctx);
     await runtime.ready;
     const payload = await runtime.uiPayload();
-    assert.equal(payload.capabilities.autoNewSession, true);
-    assert.equal(typeof payload.handoff, 'object');
-    assert.equal(payload.handoff.autoNewSession, true);
+    assert.equal('autoNewSession' in payload.capabilities, false);
+    assert.equal('autoNewSession' in payload.handoff, false);
     assert.equal(payload.handoff.active, false, 'no handoff yet');
   } finally {
     fixture.dispose();
@@ -65,23 +68,16 @@ test('stats expose the handoff view + capability the client controller reads', a
   }
 });
 
-test('client controller uses uiWorkspace.startSession with a one-fire guard', () => {
+test('the client half no longer polls or opens conversations', () => {
   const source = fs.readFileSync(new URL('../ui/client.js', import.meta.url), 'utf8');
-  assert.ok(source.includes("ctx.get('uiWorkspace')"), 'client service lookup');
-  assert.ok(source.includes('workspace.startSession('), 'opens the Host new-conversation action');
-  assert.ok(source.includes('handoff.autoNewSession !== true'), 'respects the config flag from stats');
-  assert.ok(source.includes('hippocampus-auto-session:'), 'one fire per handoff marker');
-  assert.ok(source.includes('function startAutoNewSession(ctx)'));
-  assert.ok(source.includes('ctx.effect(() => startAutoNewSession(ctx))'), 'lifecycle-owned poll');
-});
-
-test('client scheduling honors the poll config (once vs interval)', () => {
-  const source = fs.readFileSync(new URL('../ui/client.js', import.meta.url), 'utf8');
-  assert.ok(source.includes('autoNewSessionPoll'), 'reads the poll mode from stats config');
-  assert.ok(source.includes('autoNewSessionIntervalSeconds'), 'reads the interval from stats config');
-  assert.ok(source.includes('const configure = (body)'), 'configures the timer from the first response');
-  assert.ok(source.includes("poll === 'once'"), 'once mode clears the recurring timer');
-  assert.ok(source.includes('setInterval(check, seconds * 1000)'), 'interval mode uses the configured seconds');
-  assert.ok(source.includes('context.autoNewSessionPoll'), 'settings UI binds the poll select');
-  assert.ok(source.includes('context.autoNewSessionIntervalSeconds'), 'settings UI binds the interval slider');
+  for (const needle of [...REMOVED, 'startAutoNewSession', 'uiWorkspace']) {
+    assert.equal(source.includes(needle), false, `ui/client.js must not reference ${needle}`);
+  }
+  // Cold-start injection switches remain, and "previous turns" now defaults ON.
+  assert.ok(source.includes('context.coldStartInjectSummary'));
+  assert.ok(source.includes('context.coldStartInjectRecentTurns'));
+  assert.ok(
+    source.includes('(config.context && config.context.coldStartInjectRecentTurns) !== false'),
+    'recent-turn injection defaults on',
+  );
 });

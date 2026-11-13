@@ -27,7 +27,7 @@
 | L3 语义块 | recall 时 top-2 semantic | id=`summaryId`，同上排除 | 低 |
 | `[Active Task]` | handoff 摘要或最新 `task:` 事件 | `active:${eventId}` 一次性（`index.js` promptState 内） | 低（P3 跨面重复） |
 | `[Memory Hints]` | 每轮词法匹配的标签，最多 5 个 | `injection.tags` 只放 freshTags（`index.js` promptState） | 低 |
-| 冷启动块 | `coldStartPending` 且新会话首轮 | 消费即清除；每会话一次 | 低 |
+| 冷启动块 | `runtime.coldStart.pending` 命中当前会话（1.6.3：键 `session\|交接批次`） | 注入后写入 `injected`（64 条有界），每会话每批次一次 | 低 |
 | `[Persona & Traits]` | 每轮 assemble | 按 L3 内容变化，无会话去重（设计如此） | 中（P3 可缓存） |
 | `memory:policy` | 静态 | 常量文本 | 无 |
 
