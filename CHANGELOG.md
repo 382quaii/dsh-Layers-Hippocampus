@@ -75,6 +75,33 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   - **`panel.startup` / `panel.configVersion` / `panel.configWarnings` 与 `capabilities.startup`
     对齐**：此前 `toMemoryOptions()` 没有把迁移结果传给引擎，panel 报的是“未迁移”默认值，
     而 capabilities 报的是真相——同一个进程两处说法不一致，现由 `toMemoryOptions` 一并透传。
+- **Fixed — 复习队列只报不消费（积压到 337 条）**：`maintain()` 里
+  `ReviewSchedule.tick()` 的结果只被写进报告，**从来没有人推进它**，于是新装用户的
+  `state/reviews.json` 里每条都是 `lastAt: null`、`dueAt` 停在初始间隔，队列只增不减
+  （现场：`total 346 / due 337`）。两个后果：复习面板永远是“全到期”，且 recall 拿不到
+  强化锚点——衰减曲线相当于“写下之后从未被碰过”。
+  - 现在 `maintain()` 会真正消费到期行：`_consumeDueReviews()` 取出到期 id，
+    **分批**（默认 30–50 条，`review.consumeBatchSize = 40`）调用批量 `reinforce()`
+    （权重 1，日志即锚点，不改任何字段），再用 `ReviewSchedule.advanceMany()` 一次性
+    推进 `lastAt` / `step` / `dueAt`。
+  - **性能防线**：每批之间 `await new Promise(setImmediate)` 让出事件循环，HTTP 路由与
+    prompt 组装不会被一个巨大积压卡住；单次维护总量上限 `review.consumeMaxPerRun = 200`，
+    再多就跨多次维护轮次排空（报告里的 `remaining` 说明还剩多少）。
+  - **一次文件写/批**：新增的 `advanceMany()` 把“逐条 advance = 每条一次读+一次原子写”
+    变成“整批一次”，337 条积压不再是 337 次 fsync。
+  - 开关：`review.autoConsume`（默认 `true`）可关；`review.enabled: false` 时不会消费。
+    失败的批次不中断维护（`lastAt` 保持 null，下一轮自然重试），错误写进
+    `report.reviewConsumeError`。三条新键均进入 HTTP 可编辑白名单。
+- **Fixed — 1.6.2 遗留的两个启动/保留缺陷（随 1.6.3 一并锁定）**：
+  - **旧 profile 启动阻断**：旧配置只写 `raw.retentionDays: 30`、没有 `archiveAfterDays`，
+    而 1.6.2 的新默认值是 90，硬校验 `archiveAfterDays < retentionDays` 直接抛错，
+    `apply()` 失败 → 插件整体不注册 → `/api/hippocampus/*` 全部 404，设置页永远停在
+    “正在启动…”。现在 `migrateConfig()` 在**未显式配置**且冲突时自适应派生
+    `Math.max(1, retentionDays - 1)`（30 → 29）并告警；**显式**写下越界值仍然 fail-fast。
+  - **`.jsonl.br` 冷归档永不清理**：`prune()` 原先只删明文分片，Brotli/Gzip/Zstd 归档
+    变成“保留期之外的永久副本”，等于变相突破 `retentionDays`。现在 `prune()` 按
+    `cutoffMonth` 整月删除过期归档，并同步从 `state/raw-archive.json` 抹掉记录
+    （返回 `removedArchives`）。
 - **Tests**：`test/v163.migration.test.js`（9 例）锁定本次教训——旧配置（仅
   `retentionDays: 30`）可启动且 `archiveAfterDays` 派生为 29；显式冲突在
   `strictStartup: true` 下阻断、在 `false` 下降级启动；降级不吞类型错误与未知键；
@@ -82,12 +109,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   迁移步骤，`test/status.test.js` 的 panel 形状契约同步新增三个字段。
   `test/v163.ui.test.js`（5 例）锁定简洁模式契约：`Section` 的 `hidden` 短路、
   14 个专业模式卡片全部带 `hidden: simpleMode`、raw 只剩三项、保存与校验按白名单收敛。
+  `test/v163.reviewQueue.test.js`（5 例）锁定复习消费契约：到期行被消费且 `step`/`lastAt`
+  前进、强化记录数 == 消费数、超出单轮预算的积压跨轮次排空、`autoConsume:false` 不动队列、
+  整批只写一次 `reviews.json`。
   `test/v156.autoSession.test.js` 重写为「该功能已移除」契约（配置无该键、旧 profile
   迁移剥离、路由/能力面不暴露、客户端无轮询器）；
   `test/v160.coldStart.test.js` 重写为按会话注入契约（无标记不布防、摘要+尾部各一次、
   兄弟 agent 先装配不吞注入、两个会话各注入一次、**两条 pending 先布防后装配也各得其份**、
   双关不遗留 pending、tailTurns 优先、stats 暴露 coldStart 状态）。
-  全量 **478/478**（77 个测试文件）。
+  全量 **483/483**（78 个测试文件）。
 
 ## [1.6.2] — 2026-11-11
 

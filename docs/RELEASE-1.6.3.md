@@ -1,9 +1,9 @@
 # Release 1.6.3 — 发布准备（本地）
 
-> 版本：**1.6.3**（2026-11-13：配置 schema 迁移 + `strictStartup` 启动安全降级 + 设置页简洁模式 + 交接冷启动按会话注入；`CAPABILITIES.version` 与测试断言同步）。
+> 版本：**1.6.3**（2026-11-13：配置 schema 迁移 + `strictStartup` 启动安全降级 + 设置页简洁模式 + 交接冷启动按会话注入 + 复习队列消费 + 面板/引擎状态对齐；`CAPABILITIES.version` 与测试断言同步）。
 
 > 状态：**代码与文档已就绪；仓库推送 / npm 发布 / 市场 PR 需要你的 GitHub 与 npm 凭据，代理与网络，本会话未执行。**
-> 基线：`dsh-memory` 工作区，全量 **478/478 测试通过**（77 个测试文件；另有 `dsh-orchestrator` 31/31）。
+> 基线：`dsh-memory` 工作区，全量 **483/483 测试通过**（78 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；插件市场仍无条目（未发布 npm）。
 
 ## 本版内容
@@ -44,12 +44,27 @@
     不会吞掉用户新对话的注入。
   - `handoff.json` 新增 `tailTurns`（最后 ≤5 轮原话），`[Previous Context Tail]` 优先回放原话；
     `context.coldStartInjectRecentTurns` 默认改为 `true`。
+  - 可观测：`/stats` 新增 `coldStart{ pending[], injected, lastSessionId }`。
+- **复习队列真正被消费（现场 337 条到期从未推进）**：`tick()` 的结果此前只进维护报告，
+  `state/reviews.json` 里每条都是 `lastAt: null`、队列只增不减（现场 `total 346 / due 337`）。
+  现在 `maintain()` 调 `_consumeDueReviews()`：到期 id 分批（`review.consumeBatchSize=40`）
+  批量 `reinforce()`（权重 1，强化日志即衰减锚点），**批间 `setImmediate` 让出事件循环**，
+  单轮上限 `review.consumeMaxPerRun=200`（报告 `remaining`，跨轮次排空），并用新增的
+  `ReviewSchedule.advanceMany()` 做到**每批一次** `reviews.json` 写入。`review.autoConsume:false`
+  可关，批次失败不中断维护（`lastAt` 保持 null，下轮重试）。
+- **面板与引擎状态对齐**：`toMemoryOptions()` 补齐 `configVersion` / `startup` / `warnings`
+  透传，`panel.startup` 不再报“未迁移”而 `capabilities.startup` 报真相。
+- **1.6.2 遗留缺陷一并锁定**：旧 profile（仅 `retentionDays: 30`）自适应派生
+  `archiveAfterDays=29` 可启动；`prune()` 现在会整月删除过期的 `.jsonl.br/.zst/.gz` 归档
+  并从 `state/raw-archive.json` 抹掉记录，不再变相突破保留期。
 - **测试**：新增 `test/v163.migration.test.js`（9 例）——旧配置启动 + `archiveAfterDays=29`；
   显式冲突在 strict 下阻断、非 strict 下降级；降级不吞类型错误/未知键；1.6.2 生产 profile
   原始形状可解析。`test/helpers.js` 夹具改走同一迁移步骤；`test/status.test.js` 的 panel
   形状契约同步新增三字段。新增 `test/v163.ui.test.js`（5 例）锁简洁模式契约。
   `test/v156.autoSession.test.js` 改写为「移除」契约、`test/v160.coldStart.test.js` 改写为
-  「按会话注入」契约。全量 **478/478**。
+  「按会话注入」契约。新增 `test/v163.reviewQueue.test.js`（5 例）锁复习消费契约：
+  到期被消费且 `step`/`lastAt` 前进、强化数 == 消费数、超预算积压跨轮次排空、
+  `autoConsume:false` 不动队列、整批只写一次文件。全量 **483/483**（78 个测试文件）。
 
 完整历史见 [CHANGELOG.md](../CHANGELOG.md) 的 `[1.6.3]` / `[1.6.2]` / `[1.6.1]` 段。
 
@@ -63,7 +78,7 @@
 
 ```powershell
 cd C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory
-node test/run.mjs                # 期望 478/478
+node test/run.mjs                # 期望 483/483
 cd ..\dsh-orchestrator
 node test/run.mjs                # 期望 31/31
 cd ..\dsh-memory
@@ -78,10 +93,11 @@ npm pack --dry-run               # 预检实际发布内容（含/不含不该�
 cd C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory
 git add -A
 git status --short                 # 最后确认没有 node_modules / state / 测试临时目录
-git commit -m "release: v1.6.3 — config schema migration and strictStartup degraded boot"
+git commit -m "release: v1.6.3 — config schema migration, strictStartup degraded boot, review queue consumption, per-conversation cold-start injection"
 
-# 历史 tag 已存在（v1.5.5 / v1.5.7 / v1.6.0 / v1.6.1 / v1.6.2）；本次新增 v1.6.3
-git tag -a v1.6.3 -m "v1.6.3: configVersion=3 migration-first loading; strictStartup degraded boot; startup surfaced in panel"
+# 历史 tag 已存在（v1.5.5 / v1.5.7 / v1.6.0 / v1.6.1 / v1.6.2）。
+# 本轮修复已多次并入同一版本，本地 v1.6.3 tag 已存在 => 用 -f 覆盖到当前 HEAD。
+git tag -f -a v1.6.3 -m "v1.6.3: configVersion=3 migration-first loading; strictStartup degraded boot; settings simple mode; per-conversation cold-start injection; review queue consumption"
 git push origin main --follow-tags
 ```
 

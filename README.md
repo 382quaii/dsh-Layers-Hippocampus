@@ -221,7 +221,7 @@ node scripts/wait-for-routes.mjs
 ### 6. 验证
 
 ```bash
-npm test        # 进程内全量用例（478 个）
+npm test        # 进程内全量用例（483 个）
 npm run check   # 语法检查 + 全量测试
 ```
 

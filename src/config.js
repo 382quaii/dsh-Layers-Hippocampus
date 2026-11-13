@@ -272,7 +272,20 @@ export const DEFAULT_CONFIG = Object.freeze({
   // Two-phase delete: forget parks the event for this long before the pipeline runs.
   delete: Object.freeze({ graceHours: 24 }),
   // Spaced repetition schedule (days between reviews).
-  review: Object.freeze({ enabled: true, intervals: [1, 2, 4, 7, 15, 30] }),
+  // v1.6.3: `autoConsume` makes maintenance actually CONSUME the due queue instead
+  // of only reporting it. Without it a fresh install accumulated hundreds of
+  // "due" rows that nobody ever cleared (every `lastAt` stayed null), so the queue
+  // grew monotonically and pinned decay anchors at creation time forever.
+  review: Object.freeze({
+    enabled: true,
+    intervals: [1, 2, 4, 7, 15, 30],
+    autoConsume: true,
+    // Bounded work per maintenance pass: batch size is the setImmediate yield point,
+    // maxPerRun is the total budget (a huge backlog drains over several passes
+    // instead of blocking one).
+    consumeBatchSize: 40,
+    consumeMaxPerRun: 200,
+  }),
   migration: Object.freeze({ timeoutMs: 600_000 }),
   // L1.5 lifecycle knobs are user-facing on purpose (charter v3.0): no silent
   // hard-coded half-lives. leafDecayFloor 0 keeps the strict forget-driven mode.
@@ -980,6 +993,20 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
     reviewIn.intervals === undefined ? defaults.review.intervals : reviewIn.intervals,
     'review.intervals',
   );
+  const reviewAutoConsume = requireBoolean(
+    reviewIn.autoConsume === undefined ? defaults.review.autoConsume : reviewIn.autoConsume,
+    'review.autoConsume',
+  );
+  const reviewConsumeBatchSize = requireInteger(
+    reviewIn.consumeBatchSize === undefined ? defaults.review.consumeBatchSize : reviewIn.consumeBatchSize,
+    'review.consumeBatchSize',
+    { min: 1, max: 500 },
+  );
+  const reviewConsumeMaxPerRun = requireInteger(
+    reviewIn.consumeMaxPerRun === undefined ? defaults.review.consumeMaxPerRun : reviewIn.consumeMaxPerRun,
+    'review.consumeMaxPerRun',
+    { min: 1, max: 10_000 },
+  );
 
   // ---- migration -----------------------------------------------------------
   const migrationIn = input.migration ?? {};
@@ -1352,7 +1379,13 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
       maxResultTokens: rawMaxResultTokens,
     },
     delete: { graceHours: deleteGraceHours },
-    review: { enabled: reviewEnabled, intervals: reviewIntervals },
+    review: {
+      enabled: reviewEnabled,
+      intervals: reviewIntervals,
+      autoConsume: reviewAutoConsume,
+      consumeBatchSize: reviewConsumeBatchSize,
+      consumeMaxPerRun: reviewConsumeMaxPerRun,
+    },
     migration: { timeoutMs: migrationTimeoutMs },
     tagTree: tagTreeConfig,
     identity: { eventTimePolicy },
@@ -1379,7 +1412,14 @@ export function toMemoryOptions(config) {
   policy.activeSet = { ...(policy.activeSet ?? {}), cap: config.activeSet.cap };
   // Two-phase delete + review schedule are policy values with config names.
   policy.delete = { ...(policy.delete ?? {}), graceHours: config.delete.graceHours };
-  policy.review = { ...(policy.review ?? {}), enabled: config.review.enabled, intervals: config.review.intervals };
+  policy.review = {
+    ...(policy.review ?? {}),
+    enabled: config.review.enabled,
+    intervals: config.review.intervals,
+    autoConsume: config.review.autoConsume,
+    consumeBatchSize: config.review.consumeBatchSize,
+    consumeMaxPerRun: config.review.consumeMaxPerRun,
+  };
   return {
     dataDir: config.dataDir,
     policy,

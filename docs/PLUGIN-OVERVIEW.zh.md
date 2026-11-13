@@ -1,7 +1,7 @@
 # dsh-layers-hippocampus · 功能 / 实现 / 版本演进
 
 > 版本基线：**v1.6.3（2026-11-13 补丁：配置 schema 迁移 + `strictStartup` 启动安全降级 + 设置页简洁模式 + 交接冷启动按会话注入）**
-> 验证状态：**478 / 478 测试通过**（77 个测试文件 · 50 个源码文件 · 零运行时依赖）
+> 验证状态：**483 / 483 测试通过**（78 个测试文件 · 50 个源码文件 · 零运行时依赖）
 > 数据位置（本机当前）：`D:\Users\86135\memory`（本地 JSONL，可迁移）
 > 本文与 `README.md`、`docs/ARCHITECTURE.zh.md`、`CHANGELOG.md`、`docs/RELEASE-1.6.3.md` 配套。
 
@@ -170,7 +170,7 @@ DeepSeek Harness（DSH）的**本地优先长期记忆 Host 插件**。它不把
 
 ## 6. 测试与质量
 
-- **478 / 478 通过**，77 个测试文件；进程内 `node --test`（`test/run.mjs`），30 秒看门狗，时间一律注入 `FakeClock`。
+- **483 / 483 通过**，78 个测试文件；进程内 `node --test`（`test/run.mjs`），30 秒看门狗，时间一律注入 `FakeClock`。
 - 覆盖维度：身份幂等、索引重建一致性、召回排序与置信度、raw 四字段与游标扫描、哈希恢复、两阶段删除与墓碑、标签树生命周期与重放一致性、多空间降级、配置 fail-fast、UI 源码契约、崩溃恢复（200ms checkpoint 窗口）、事件循环让出。
 - 运维脚本：`scripts/bench-protocol.mjs`（基准协议）、`scripts/repair-handoff.mjs`（交接修复）。
 

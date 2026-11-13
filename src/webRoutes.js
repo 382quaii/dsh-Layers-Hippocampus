@@ -135,6 +135,12 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   'raw.captureRatio',
   'delete.graceHours',
   'review.enabled',
+  // v1.6.3: maintenance CONSUMES due review rows (it used to only report them, so
+  // the queue grew forever). Batching is bounded on purpose; an operator with a huge
+  // backlog can shrink `consumeMaxPerRun` to spread the drain over more passes.
+  'review.autoConsume',
+  'review.consumeBatchSize',
+  'review.consumeMaxPerRun',
   // L1.5 tag-tree lifecycle. Rebuildable derived state, so a change is applied by
   // the next maintenance pass, never by rewriting anything on the request path.
   'tagTree.midHalfLifeMultiplier',

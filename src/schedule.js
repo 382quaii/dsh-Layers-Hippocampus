@@ -115,6 +115,34 @@ export class ReviewSchedule {
     return { eventId, step: entry.step, dueAt: entry.dueAt };
   }
 
+  /**
+   * Advance MANY events in one load + one atomic write (v1.6.3).
+   *
+   * `advance()` re-reads and rewrites `state/reviews.json` per event, which is fine
+   * for a single manual reinforce but pathological for the backfill consumer: a
+   * 337-item backlog would mean 337 file reads and 337 fsync-style rewrites inside
+   * ONE maintenance pass. This is the batched form — same semantics, one write.
+   */
+  advanceMany(eventIds, { now = this.clock.now() } = {}) {
+    const ids = Array.isArray(eventIds) ? eventIds.filter((id) => typeof id === 'string' && id.length > 0) : [];
+    if (ids.length === 0) return [];
+    const state = this.load();
+    const intervals = this.intervals();
+    const advanced = [];
+    let changed = false;
+    for (const eventId of ids) {
+      const entry = state.items[eventId];
+      if (!entry) continue;
+      entry.step = Math.min((entry.step ?? 0) + 1, intervals.length - 1);
+      entry.lastAt = now;
+      entry.dueAt = now + intervals[entry.step] * DAY_MS;
+      advanced.push({ eventId, step: entry.step, dueAt: entry.dueAt });
+      changed = true;
+    }
+    if (changed) this.save(state);
+    return advanced;
+  }
+
   /** Read-only view for admin / panel. */
   status({ now = this.clock.now() } = {}) {
     const state = this.load();

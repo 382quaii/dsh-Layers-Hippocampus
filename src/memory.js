@@ -1047,8 +1047,14 @@ export class Memory {
     return makeRestore({ eventId, target, reason, logTime });
   }
 
-  /** Reinforce existing episodes. The reinforcement log IS the anchor (no field). */
-  async reinforce({ eventIds, weight = 1, eventTime }) {
+  /**
+   * Reinforce existing episodes. The reinforcement log IS the anchor (no field).
+   *
+   * `advanceReviews:false` is for the maintenance backfill consumer, which batches the
+   * schedule advance itself (`ReviewSchedule.advanceMany`) to keep one file write per
+   * batch instead of one per event.
+   */
+  async reinforce({ eventIds, weight = 1, eventTime, advanceReviews = true }) {
     this.assertOpen();
     const ids = this.normaliseIds(eventIds);
     const snapshot = await this.logStore.snapshot();
@@ -1067,12 +1073,76 @@ export class Memory {
     await this.logStore.append(records);
     await this.indexManager.applyRecords(records);
     // A reinforcement IS a review: advance the spaced-repetition step.
-    for (const target of ids) this.reviews.advance(target, { now: this.clock.now() });
+    if (advanceReviews) for (const target of ids) this.reviews.advance(target, { now: this.clock.now() });
     this._markBriefingDirty();
     return {
       reinforced: ids,
       reinforcementEventIds: records.map((record) => record.event_id),
       anchor: records.reduce((max, record) => Math.max(max, record.log_time), 0),
+    };
+  }
+
+  /**
+   * Consume the due review queue (v1.6.3).
+   *
+   * Why this exists: `ReviewSchedule.tick()` was only ever REPORTED in maintenance —
+   * nothing advanced the due rows, so on a fresh install every entry stayed at
+   * `lastAt: null` and the queue grew monotonically (337 due on the reporter's
+   * machine). Two consequences, both bad:
+   *   1. a permanently "due" list makes the spaced-repetition panel useless;
+   *   2. recall never got the reinforcement anchor, so the decay curve was computed
+   *      as if the memory had never been touched since it was written.
+   *
+   * A due item is by definition "scheduled for review now", so maintenance treats it
+   * as reviewed: one batched `reinforce` (the log is the anchor — no field is
+   * mutated) plus one batched schedule advance.
+   *
+   * Bounded on purpose: at most `consumeMaxPerRun` items per pass, `consumeBatchSize`
+   * per chunk, and `setImmediate` between chunks so the event loop (HTTP routes,
+   * prompt assembly) keeps running while a large backlog drains.
+   */
+  async _consumeDueReviews({ now = this.clock.now() } = {}) {
+    // `config.review` arrives through `toMemoryOptions().config`; fall back to the
+    // resolved policy when a bare `Memory.open({policy})` fixture is used.
+    const policy = this.config?.review ?? this.policy?.review ?? {};
+    if (policy.enabled === false) return { enabled: false, reason: 'review-disabled' };
+    if (policy.autoConsume === false) return { enabled: false, reason: 'auto-consume-disabled' };
+    const batchSize = Math.max(1, Number(policy.consumeBatchSize) || 40);
+    const maxPerRun = Math.max(1, Number(policy.consumeMaxPerRun) || 200);
+    const view = this.reviews.tick({ events: this.indexManager.snapshot()?.events ?? [], now });
+    const dueIds = (view.due ?? []).map((row) => row.eventId).filter(Boolean).slice(0, maxPerRun);
+    if (dueIds.length === 0) {
+      return { enabled: true, consumed: 0, batches: 0, dueBefore: Array.isArray(view.due) ? view.due.length : 0, remaining: 0 };
+    }
+    const consumed = [];
+    let batches = 0;
+    for (let offset = 0; offset < dueIds.length; offset += batchSize) {
+      const chunk = dueIds.slice(offset, offset + batchSize);
+      try {
+        await this.reinforce({ eventIds: chunk, weight: 1, eventTime: now, advanceReviews: false });
+        this.reviews.advanceMany(chunk, { now });
+        consumed.push(...chunk);
+      } catch (error) {
+        // A failed chunk must not abort the pass: the next maintenance retries the
+        // same rows, because their `lastAt` stays null until they succeed.
+        return {
+          enabled: true,
+          consumed: consumed.length,
+          batches,
+          dueBefore: view.due.length,
+          remaining: dueIds.length - consumed.length,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+      batches += 1;
+      if (offset + batchSize < dueIds.length) await new Promise((resolve) => setImmediate(resolve));
+    }
+    return {
+      enabled: true,
+      consumed: consumed.length,
+      batches,
+      dueBefore: view.due.length,
+      remaining: Math.max(0, view.due.length - consumed.length),
     };
   }
 
@@ -2163,6 +2233,13 @@ export class Memory {
     } catch (error) {
       report.reviewsError = error instanceof Error ? error.message : String(error);
     }
+    // v1.6.3: actually CONSUME the due queue (batched + setImmediate) instead of only
+    // reporting it. Kept in its own try so a backlog problem can never fail the pass.
+    try {
+      report.reviewConsume = await this._consumeDueReviews({ now: this.clock.now() });
+    } catch (error) {
+      report.reviewConsumeError = error instanceof Error ? error.message : String(error);
+    }
     // L1.5 tag tree: a projection of the NOW-converged index (pending deletes may
     // have forced a nested rebuild above). Published to state/tag-tree.json with the
     // ghost metadata and the persisted prune queue, so a failure here is a side
@@ -2642,7 +2719,7 @@ export class Memory {
         tagTree: this.tagTree.status({ indexGeneration: index.generation ?? null }),
         // v1.4.0 surfaces: raw shards, review queue, pending deletes.
         raw: { ...this.raw.stats(), mode: this.config?.raw?.mode ?? 'salience' },
-        reviews: this.reviews.status({ now }),
+        reviews: { ...this.reviews.status({ now }), autoConsume: this.config?.review?.autoConsume !== false },
         pendingDeletes: this.pendingDeletes.status(now),
         // v1.5.5: offline Dream circuit + last fallback, visible so a broken LLM is
         // never a silent degradation.
