@@ -23,7 +23,10 @@ test('a legacy profile (retentionDays 30, no archiveAfterDays) still boots', () 
   });
   assert.equal(legacy.raw.retentionDays, 30);
   assert.equal(legacy.raw.archiveAfterDays, 29, 'derived to stay strictly below retention');
-  assert.equal(legacy.raw.archiveAfterDaysDerived, true);
+  // v1.6.3: the derivation now happens in migrateConfig (before validation), so the
+  // evidence of that decision is the migration block rather than the legacy flag.
+  assert.equal(legacy.startup.migrated, true);
+  assert.ok(legacy.warnings.some((warning) => warning.includes('archiveAfterDays')));
   assert.ok(legacy.raw.archiveAfterDays < legacy.raw.retentionDays);
 });
 

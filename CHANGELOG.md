@@ -4,6 +4,41 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.3] — 2026-11-13
+
+**配置加载器加固：把 1.6.2 的“旧配置启动阻断”事故固化为引擎能力——先迁移、再严格校验、
+必要时安全降级，绝不让 DSH 客户端卡在“正在启动…”。**
+
+- **Added — 配置 schema 版本与迁移机制**：`src/config.js` 新增
+  `CONFIG_SCHEMA_VERSION = 3`；配置对象可携带 `configVersion`。加载顺序变为
+  **`migrateConfig()` → 严格校验**：迁移阶段只做“补值 + 告警”，从不抛错，也绝不覆盖
+  用户显式写下的值。缺少 `configVersion` 的旧配置被视为 legacy（`fromVersion: 0`）并
+  升级到当前版本。
+  - 首次落地的迁移规则：`raw.archiveAfterDays` 缺失且
+    `raw.retentionDays <= 新默认值(90)` 时，派生为 `Math.max(1, retentionDays - 1)`
+    （即 30 → 29），从而满足 `archiveAfterDays < retentionDays` 的硬约束。
+  - 每条迁移都写入 `console.warn`（前缀 `hippocampus/config-migration:`）并携带在
+    `config.warnings` 里，`apply()` 再经 `ctx.logger.warn` 输出一次——**迁移永不被静默**。
+  - 空配置 `{}` 视为“使用默认值”，不算 legacy，因此内部调用不会产生噪声告警。
+- **Added — `strictStartup`（默认 `true`）启动安全网**：显式设为 `false` 时，若严格校验
+  抛出 `MEM_E_CONFIG_OUT_OF_RANGE`，引擎会丢弃该越界键、回退到安全值并继续启动，同时
+  置 `config.startup.degraded = true`、记录 `degradedReason{code,key,message}`、
+  输出 `hippocampus/config-degraded:` 警告，并在 `apply()` 里额外 warn
+  `STARTED DEGRADED (strictStartup=false)`。
+  - 降级**只**覆盖越界值：`MEM_E_CONFIG_INVALID_TYPE` / `MEM_E_CONFIG_UNKNOWN_KEY`
+    仍然 fail-fast（拼写错误不该被宽容）。
+  - `strictStartup` 自身必须是布尔值。
+- **Added — 启动状态进入可观测面**：`CAPABILITIES.startup` / `CAPABILITIES.configVersion`
+  与 `memory_admin action=status` 的 `panel.startup` / `panel.configVersion` /
+  `panel.configWarnings`。设置页与运维方可以直接看到“这份配置来自哪个 schema 版本、
+  是否迁移过、是否降级启动”。
+- **Tests**：`test/v163.migration.test.js`（9 例）锁定本次教训——旧配置（仅
+  `retentionDays: 30`）可启动且 `archiveAfterDays` 派生为 29；显式冲突在
+  `strictStartup: true` 下阻断、在 `false` 下降级启动；降级不吞类型错误与未知键；
+  以及 1.6.2 生产 profile 的原始形状可被完整解析。`test/helpers.js` 的夹具改走同一
+  迁移步骤，`test/status.test.js` 的 panel 形状契约同步新增三个字段。
+  全量 **470/470**。
+
 ## [1.6.2] — 2026-11-11
 
 **补丁版：修复冷数据归档与保留期的时间冲突，并把“打破日志线性增长”的三层机制并入正式记录。**

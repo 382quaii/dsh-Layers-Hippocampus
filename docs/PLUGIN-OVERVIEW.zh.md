@@ -1,9 +1,9 @@
 # dsh-layers-hippocampus · 功能 / 实现 / 版本演进
 
-> 版本基线：**v1.6.2（2026-11-11 补丁：冷归档保留期修复 + 三层打破线性增长）**
-> 验证状态：**456 / 456 测试通过**（64 个测试文件 · 50 个源码文件 · 零运行时依赖）
+> 版本基线：**v1.6.3（2026-11-13 补丁：配置 schema 迁移 + `strictStartup` 启动安全降级）**
+> 验证状态：**470 / 470 测试通过**（76 个测试文件 · 50 个源码文件 · 零运行时依赖）
 > 数据位置（本机当前）：`D:\Users\86135\memory`（本地 JSONL，可迁移）
-> 本文与 `README.md`、`docs/ARCHITECTURE.zh.md`、`CHANGELOG.md`、`docs/RELEASE-1.6.2.md` 配套。
+> 本文与 `README.md`、`docs/ARCHITECTURE.zh.md`、`CHANGELOG.md`、`docs/RELEASE-1.6.3.md` 配套。
 
 ---
 
@@ -164,12 +164,13 @@ DeepSeek Harness（DSH）的**本地优先长期记忆 Host 插件**。它不把
 | **1.6.0** | 冷启动防呆（状态唤醒）、`coldStartInjectSummary` / `coldStartInjectRecentTurns` 两个注入开关、泛型 `customDecayRate` / `customHalfLifeDays`、`persona` section order=100、跨插件 `ctx.provide('hippocampus')` 服务 |
 | **1.6.1** | **检索上限剪枝**：`salience × 3.9` 硬上界 + 降序早停（pinned 绕过），结果带 `pruned` 观测；段记 Token 审计（无 P0 泄漏）；**版本全面解冻**，恢复语义化发布 |
 | **1.6.2** | 冷归档保留期修复（`archiveAfterDays=90` / `retentionDays=365` / `coldAccessWindowDays=90`）；多档保留策略 `off`/`salience`/`all` + `distillPrune`（经 Tombstone 清理已蒸馏 raw）；冷归档默认 **Brotli 11**（`.jsonl.br`）；索引层 `templates.json` + `contentRef` 高频引用去重；L3 `semantic.maxEntries=100` LRU 熔断；`CAPABILITIES.version` 对齐 1.6.2 |
+| **1.6.3** | **配置 schema 版本与迁移机制**（`CONFIG_SCHEMA_VERSION=3`，先迁移后严格校验，迁移只补值不覆盖、必告警）；**`strictStartup` 启动安全降级**（默认 `true`；显式 `false` 时越界值回退安全默认并降级启动，类型错误/未知键仍 fail-fast）；启动状态进入 `CAPABILITIES.startup` 与 `panel.startup`/`panel.configVersion`/`panel.configWarnings` |
 
 ---
 
 ## 6. 测试与质量
 
-- **399 / 399 通过**，64 个测试文件；进程内 `node --test`（`test/run.mjs`），30 秒看门狗，时间一律注入 `FakeClock`。
+- **470 / 470 通过**，76 个测试文件；进程内 `node --test`（`test/run.mjs`），30 秒看门狗，时间一律注入 `FakeClock`。
 - 覆盖维度：身份幂等、索引重建一致性、召回排序与置信度、raw 四字段与游标扫描、哈希恢复、两阶段删除与墓碑、标签树生命周期与重放一致性、多空间降级、配置 fail-fast、UI 源码契约、崩溃恢复（200ms checkpoint 窗口）、事件循环让出。
 - 运维脚本：`scripts/bench-protocol.mjs`（基准协议）、`scripts/repair-handoff.mjs`（交接修复）。
 
@@ -178,7 +179,7 @@ DeepSeek Harness（DSH）的**本地优先长期记忆 Host 插件**。它不把
 ## 7. 已知边界与风险（诚实清单）
 
 1. **多空间依赖外部能力**：无 `dsh-orchestrator` 时只有单空间与 8 个工具，这是显式降级，不是 bug；
-2. **版本节奏**：1.5.7 的临时冻结已于 2026-11-07 全面解除，恢复语义化版本（当前 1.6.2）；
+2. **版本节奏**：1.5.7 的临时冻结已于 2026-11-07 全面解除，恢复语义化版本（当前 1.6.3）；
 3. **保存窗口**：日志 append 是 durable 的，但 manifest checkpoint 有 200ms 延迟；崩溃后依赖 `unflushedBytes` + 重建兜底；
 4. **raw 尾扫偏置**：单分片超过 `maxScanTurns`（默认 5000）时一次只看最新 N 条，更早历史需调大预算或按时间窗分页；
 5. **置信度阈值**：在高度同质的数据上不触发（A/B 已验证为 0 收益），不适合当作默认的“省 token”手段；

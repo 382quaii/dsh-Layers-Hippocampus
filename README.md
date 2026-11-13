@@ -7,7 +7,7 @@
 
 | | |
 | --- | --- |
-| 版本 | **1.6.2** |
+| 版本 | **1.6.3** |
 | 包名 | `dsh-layers-hippocampus` |
 | 仓库 | <https://github.com/382quaii/dsh-Layers-Hippocampus> |
 | 许可证 | MIT |
@@ -146,7 +146,7 @@ raw 层提供三档，覆盖从“只留关键”到“全留”：
 pnpm add dsh-layers-hippocampus
 
 # 或从 GitHub 指定 tag
-pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.2"
+pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.3"
 ```
 
 ### 2. 挂到 profile
@@ -174,15 +174,38 @@ node scripts/wait-for-routes.mjs
       config:
         dataDir: "C:/Users/<you>/.dsh/memory"  # 可选；默认 <DSH_HOME>/memory
         raw:
-          mode: salience        # off | salience | all
-          retentionDays: 90     # 必须 > archiveAfterDays
-          archiveAfterDays: 7   # 超过该天数的分片按月归档
+          mode: salience          # off | salience | all
+          retentionDays: 365      # 必须 > archiveAfterDays
+          archiveAfterDays: 90    # 超过该天数的分片按月归档
+          coldAccessWindowDays: 90  # 近 N 天零访问才允许归档
+          compressionEngine: brotli # brotli(11) | gzip(9) | zstd
 ```
 
-### 4. 验证
+### 4. 配置版本与启动安全
+
+配置对象带 `configVersion`（当前 **3**）。加载顺序是 **迁移 → 严格校验**：
+
+- **迁移**：缺少 `configVersion` 的旧配置视为 legacy，先补齐版本号与新增默认值
+  （例如 `archiveAfterDays` 缺失且 `retentionDays` 不大于新默认 90 时，派生为
+  `retentionDays - 1`），每条迁移都会 `console.warn` 并记录在 `config.warnings` 里。
+  迁移只补值、不覆盖你显式写下的键，也从不抛错。
+- **严格校验**：迁移之后仍按类型/取值范围/未知键严格检查。
+- **安全降级**：`strictStartup: false`（默认 `true`）时，若严格校验发现取值越界，
+  引擎回退到安全值并继续启动，同时把 `startup.degraded` 置为 `true`、记录
+  `degradedReason` 并输出 `hippocampus/config-degraded:` 警告。
+  类型错误与未知键**不会**被降级吞掉。
+
+启动结果可在 `memory_admin action=status` 的 `panel.startup` / `panel.configVersion` /
+`panel.configWarnings` 里看到——插件绝不会静默地以与你写的不一样的配置运行。
+
+> 2026-11-13 的生产事故正是这一层缺失造成的：新默认值与旧 profile 冲突，`apply()`
+> 抛错导致插件整体不加载，UI 只能看到 HTTP 404。1.6.3 起该路径由
+> `test/v163.migration.test.js` 锁定。
+
+### 5. 验证
 
 ```bash
-npm test        # 进程内全量用例（456 个）
+npm test        # 进程内全量用例（470 个）
 npm run check   # 语法检查 + 全量测试
 ```
 

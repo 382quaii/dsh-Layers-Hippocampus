@@ -9,6 +9,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DAY_MS, FakeClock } from '../src/clock.js';
+// v1.6.3: fixtures go through the SAME migration step the host uses, so a config
+// that would be migrated (or degraded) in production is migrated here too. The
+// logger is silenced so per-test warnings never flood the runner's stderr.
+import { CONFIG_SCHEMA_VERSION, migrateConfig } from '../src/config.js';
 import { Memory } from '../src/memory.js';
 // v1.5.6 physical split: the multi-space engine lives in the sibling package; the
 // suite injects it through the same adapter seam the Host service uses.
@@ -66,7 +70,22 @@ export async function makeMemory({ dir = tempDir(), start = T0, policy = SMALL_P
   // v1.5.6: L2 multi-merge is exercised by its own suite. Fixtures disable it by
   // default so a test that floods ONE tag keeps exact index counts; a test that
   // wants the merge passes `config.l2Merge` explicitly.
-  const resolvedConfig = { ...config, l2Merge: { enabled: false, ...(config.l2Merge ?? {}) } };
+  // v1.6.3: run the migration step so fixtures see the same config shape the host
+  // resolves (configVersion / startup / derived archiveAfterDays). Strict validation
+  // and degradation are covered by v163.migration.test.js against resolveConfig.
+  const migration = migrateConfig(config, { logger: { warn() {} } });
+  const resolvedConfig = {
+    ...migration.input,
+    l2Merge: { enabled: false, ...(config.l2Merge ?? {}) },
+    configVersion: migration.input.configVersion ?? CONFIG_SCHEMA_VERSION,
+    startup: {
+      strict: migration.input.strictStartup !== false,
+      degraded: false,
+      migrated: migration.migrated,
+      fromVersion: migration.fromVersion,
+    },
+    warnings: migration.warnings,
+  };
   // v1.5.6 physical split: multi-space lives in dsh-orchestrator; the engine tests
   // inject its router/transfer through the same adapter seam the Host uses.
   const buildSpaces = (owner) =>

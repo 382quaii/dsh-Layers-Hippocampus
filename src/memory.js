@@ -2592,6 +2592,12 @@ export class Memory {
         // v1.5.5: offline Dream circuit + last fallback, visible so a broken LLM is
         // never a silent degradation.
         dream: this.dreamStatus(),
+        // v1.6.3: config-load outcome (migration / degraded startup) is part of the
+        // status surface, because "started with different values than you wrote" is
+        // exactly the kind of thing the 1.6.2 incident showed must never be silent.
+        startup: this.config?.startup ?? { strict: true, degraded: false, migrated: false, fromVersion: null },
+        configVersion: this.config?.configVersion ?? null,
+        configWarnings: Array.isArray(this.config?.warnings) ? this.config.warnings.slice(0, 10) : [],
         // v1.5.6: pre-ingest tagging health (applied anchors / anchorless misses).
         autoTag: { ...this._autoTag },
         // v1.5.6: L2 multi-merge bookkeeping (merged sources / groups).

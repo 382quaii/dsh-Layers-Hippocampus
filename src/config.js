@@ -70,7 +70,19 @@ export const TOOL_SUFFIXES = Object.freeze([
 export const CORE_TOOL_SUFFIXES = Object.freeze(['remember', 'recall', 'admin']);
 
 /** Every accepted top-level key (nested groups are validated separately). */
+/**
+ * Schema version of the CONFIG OBJECT itself (not of the plugin).
+ *
+ * v1.6.3: introduced after the 1.6.2 incident — a profile written for an older
+ * schema (no `archiveAfterDays`) was validated against NEW defaults and threw
+ * MEM_E_CONFIG_OUT_OF_RANGE before the plugin could even register its routes.
+ * From now on the loader MIGRATES first and validates second.
+ */
+export const CONFIG_SCHEMA_VERSION = 3;
+
 export const CONFIG_KEYS = Object.freeze([
+  'configVersion',
+  'strictStartup',
   'dataDir',
   'migrateFrom',
   'maintenanceCron',
@@ -129,6 +141,12 @@ export function defaultDataDir(env = process.env) {
 export const DEFAULT_CONFIG = Object.freeze({
   dataDir: null, // resolved below: <DSH_HOME>/memory
   migrateFrom: null,
+  // v1.6.3: schema version of the config object itself (see CONFIG_SCHEMA_VERSION).
+  configVersion: CONFIG_SCHEMA_VERSION,
+  // v1.6.3 startup safety net. `true` (default) = fail fast on a bad value;
+  // `false` = degrade to the safe default and keep the plugin registered, because
+  // a boot abort leaves every /api/hippocampus/* route missing (1.6.2 incident).
+  strictStartup: true,
   maintenanceCron: '0 */6 * * *',
   toolPrefix: 'memory',
   briefing: true,
@@ -487,13 +505,156 @@ export function multiSpaceActive(config, hasOrchestrator) {
 }
 
 /**
+ * Migrate a config object from any older schema to the current one.
+ *
+ * This runs BEFORE `normaliseRaw`/strict validation on purpose: it is the only
+ * place allowed to invent values, and every invention is reported (warn + the
+ * returned `warnings` array). It never throws — an unknown/missing version is
+ * treated as "oldest", because refusing to boot is exactly the bug we are fixing.
+ *
+ * @param {object} raw caller/config-file values
+ * @param {{logger?: object}} [opts]
+ * @returns {{input: object, warnings: string[], migrated: boolean, fromVersion: number}}
+ */
+export function migrateConfig(raw, { logger = console } = {}) {
+  if (!isPlainObject(raw)) return { input: raw, warnings: [], migrated: false, fromVersion: CONFIG_SCHEMA_VERSION };
+  const warnings = [];
+  const input = { ...raw };
+  // An EMPTY config carries no legacy shape: it is simply "use the defaults".
+  // Treating it as current keeps `resolveConfig({})` silent instead of warning on
+  // every internal call that has nothing to migrate.
+  const isEmpty = Object.keys(raw).length === 0;
+  const fromVersion = isEmpty
+    ? CONFIG_SCHEMA_VERSION
+    : Number.isInteger(raw.configVersion)
+      ? raw.configVersion
+      : 0;
+  let migrated = false;
+
+  const warn = (message) => {
+    warnings.push(message);
+    try {
+      logger?.warn?.(`hippocampus/config-migration: ${message}`);
+    } catch {
+      /* a broken logger must never block a boot */
+    }
+  };
+
+  if (fromVersion < CONFIG_SCHEMA_VERSION) {
+    input.configVersion = CONFIG_SCHEMA_VERSION;
+    if (fromVersion === 0) {
+      warn(`config.configVersion was missing; treated as legacy schema and migrated to ${CONFIG_SCHEMA_VERSION}`);
+    } else {
+      warn(`config.configVersion ${fromVersion} -> ${CONFIG_SCHEMA_VERSION}`);
+    }
+    migrated = true;
+  }
+
+  // The exact 1.6.2 breakage: `retentionDays` pinned by an old profile, while
+  // `archiveAfterDays` did not exist yet and its new default (90) exceeded it.
+  const rawGroup = isPlainObject(input.raw) ? { ...input.raw } : null;
+  if (rawGroup && rawGroup.archiveAfterDays === undefined) {
+    const retention = Number.isInteger(rawGroup.retentionDays) ? rawGroup.retentionDays : null;
+    if (retention !== null && retention <= DEFAULT_CONFIG.raw.archiveAfterDays) {
+      const derived = Math.max(1, retention - 1);
+      rawGroup.archiveAfterDays = derived;
+      input.raw = rawGroup;
+      warn(
+        `config.raw.archiveAfterDays was missing and retentionDays=${retention} is not above the new default ${DEFAULT_CONFIG.raw.archiveAfterDays}; derived archiveAfterDays=${derived}. Set raw.archiveAfterDays explicitly to silence this.`,
+      );
+      migrated = true;
+    }
+  }
+
+  // `strictStartup` did not exist before 1.6.3; default it explicitly so the
+  // resolved config always states the behaviour it will use.
+  if (input.strictStartup === undefined) {
+    input.strictStartup = DEFAULT_CONFIG.strictStartup;
+  }
+
+  return { input, warnings, migrated, fromVersion };
+}
+
+/**
  * Validate and resolve. Throws `MemoryError` with a `MEM_E_CONFIG_*` code; never
  * clamps, never defaults a bad value.
+ *
+ * v1.6.3 startup safety net: when `strictStartup: false`, an out-of-range value
+ * degrades to the safe default instead of aborting activation (the 1.6.2 incident
+ * left the whole plugin unregistered, so the UI polled 404 forever). The strict
+ * path remains the default and the ONLY path when `strictStartup` is unset/true.
  *
  * @param {object} [raw] caller/config-file values
  * @param {{env?: object}} [opts]
  */
 export function resolveConfig(raw = {}, { env = process.env } = {}) {
+  const migration = migrateConfig(raw);
+  const input = migration.input;
+  const strictStartup = input?.strictStartup !== false;
+
+  try {
+    return attachConfigMeta(buildResolvedConfig(input, { env }), migration);
+  } catch (error) {
+    if (strictStartup || error?.code !== ErrorCodes.CONFIG_OUT_OF_RANGE) throw error;
+    // Degraded boot: drop the offending key (details.key is the dotted path) and
+    // retry once. Everything else — invalid types, unknown keys — still throws.
+    const offendingKey = error?.details?.key;
+    const relaxed = dropDottedKey(input, offendingKey);
+    const fallback = attachConfigMeta(buildResolvedConfig(relaxed, { env }), migration);
+    fallback.startup = {
+      ...fallback.startup,
+      degraded: true,
+      degradedReason: {
+        code: error.code,
+        key: offendingKey ?? null,
+        message: error.message,
+      },
+    };
+    fallback.warnings = [
+      ...fallback.warnings,
+      `strictStartup=false: ${error.message} — fell back to the safe default and continued starting.`,
+    ];
+    try {
+      console.warn(`hippocampus/config-degraded: ${error.message} — started anyway (strictStartup=false)`);
+    } catch {
+      /* ignore */
+    }
+    return fallback;
+  }
+}
+
+/** Copy the dotted key out of the input so the next pass validates cleanly. */
+function dropDottedKey(input, dotted) {
+  if (!dotted || typeof dotted !== 'string') return input;
+  const parts = dotted.split('.');
+  const clone = { ...input };
+  let cursor = clone;
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    const key = parts[index];
+    if (!isPlainObject(cursor[key])) return clone;
+    cursor[key] = { ...cursor[key] };
+    cursor = cursor[key];
+  }
+  delete cursor[parts[parts.length - 1]];
+  return clone;
+}
+
+/** Stable, non-frozen observability block for migrations/degradation. */
+function attachConfigMeta(config, migration) {
+  return {
+    ...config,
+    configVersion: CONFIG_SCHEMA_VERSION,
+    startup: {
+      strict: config.strictStartup !== false,
+      degraded: false,
+      migrated: migration.migrated,
+      fromVersion: migration.fromVersion,
+    },
+    warnings: [...migration.warnings],
+  };
+}
+
+function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
   const input = normaliseRaw(raw);
 
   for (const group of ['retrieval', 'context', 'index', 'temp', 'decay', 'activeSet', 'raw', 'delete', 'review', 'migration', 'identity', 'tools', 'dream', 'tagging', 'features', 'l2Merge']) {
@@ -512,6 +673,12 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
   const maintenanceCron = requireString(
     input.maintenanceCron === undefined ? defaults.maintenanceCron : input.maintenanceCron,
     'maintenanceCron',
+  );
+  // v1.6.3: validated like any other boolean; the degradation path lives in
+  // resolveConfig() and reads the RAW value before validation on purpose.
+  const strictStartup = requireBoolean(
+    input.strictStartup === undefined ? defaults.strictStartup : input.strictStartup,
+    'strictStartup',
   );
   // Parse + prove it can fire. The error carries MEM_E_CONFIG_INVALID_CRON.
   validateCron(maintenanceCron);
@@ -1121,6 +1288,8 @@ export function resolveConfig(raw = {}, { env = process.env } = {}) {
   const resolved = {
     dataDir,
     migrateFrom,
+    configVersion: CONFIG_SCHEMA_VERSION,
+    strictStartup,
     maintenanceCron,
     toolPrefix,
     briefing: requireBoolean(input.briefing === undefined ? defaults.briefing : input.briefing, 'briefing'),

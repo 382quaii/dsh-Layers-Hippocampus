@@ -61,7 +61,7 @@ export { resolveConfig, DEFAULT_CONFIG };
  * of letting a raw 404 reach the user.
  */
 export const CAPABILITIES = Object.freeze({
-  version: '1.6.2',
+  version: '1.6.3',
   spaces: true,
   memories: true,
   transferConsent: true,
@@ -931,6 +931,9 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     spacesDelete: runtime.multiSpaceAvailable() && typeof memory.spaces?.deleteSpace === 'function',
     // v1.5.6: the client half may open a fresh conversation on an active handoff.
     autoNewSession: runtime.config.context.autoNewSession === true,
+    // v1.6.3: how the config was loaded — a degraded boot must be visible, not silent.
+    startup: runtime.config.startup ?? { strict: true, degraded: false, migrated: false, fromVersion: null },
+    configVersion: runtime.config.configVersion ?? null,
     // v1.6.1: cold-archive compression engines available in THIS Node runtime.
     compression: (() => {
       const probe = probeCompression();
@@ -1503,9 +1506,19 @@ export async function discoverLegacyDataDir({ existsSync, dataDir }) {
  * @param {object} [rawConfig] plugin config from cordis.patch.yml / Config panel
  */
 export async function apply(ctx, rawConfig = {}) {
-  // Fail-fast: an invalid config must abort activation, never fall back to defaults.
+  // v1.6.3: migrate-then-validate. `resolveConfig` migrates older config schemas
+  // BEFORE strict validation, and with `strictStartup: false` degrades an
+  // out-of-range value instead of aborting activation — a boot abort is what left
+  // the whole plugin unregistered in 1.6.2 (UI polled /stats → 404 forever).
   const config = resolveConfig(rawConfig);
   const options = toMemoryOptions(config);
+  const startupWarnings = Array.isArray(config.warnings) ? config.warnings : [];
+  for (const warning of startupWarnings) ctx?.logger?.warn?.(`hippocampus/config: ${warning}`);
+  if (config.startup?.degraded) {
+    ctx?.logger?.warn?.(
+      `hippocampus/config: STARTED DEGRADED (strictStartup=false) — ${config.startup.degradedReason?.message ?? 'config value out of range'}`,
+    );
+  }
 
   const runtime = createRuntime({ ctx, config, options, raw: rawConfig });
   // Internal handle, kept OFF the context: `ctx.memory` is a provided service name

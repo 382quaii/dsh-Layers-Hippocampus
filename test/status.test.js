@@ -32,6 +32,12 @@ const PANEL_KEYS = [
   'autoTag',
   // v1.5.6: L2 multi-merge bookkeeping.
   'l2Merge',
+  // v1.6.3: the config-load outcome must be observable from the panel. The 1.6.2
+  // incident was a boot-time misconfiguration that only showed up as HTTP 404, so
+  // "which schema version did we load, did we migrate, did we degrade" is contract.
+  'startup',
+  'configVersion',
+  'configWarnings',
 ].sort();
 
 test('the status panel has the full documented shape', async () => {
@@ -91,6 +97,12 @@ test('the status panel has the full documented shape', async () => {
     assert.equal(panel.generations.indexGeneration, 1);
     assert.equal(panel.tokens.cumulativeSavedTokens, 0);
     assert.equal(panel.tagTree.available, false, 'no tag tree exists before the first maintenance pass');
+    // v1.6.3: a clean boot reports its schema version and an empty warning list.
+    assert.equal(panel.configVersion, 3);
+    assert.deepEqual(Object.keys(panel.startup).sort(), ['degraded', 'fromVersion', 'migrated', 'strict']);
+    assert.equal(panel.startup.degraded, false);
+    assert.equal(panel.startup.strict, true);
+    assert.ok(Array.isArray(panel.configWarnings));
   } finally {
     cleanup();
   }
