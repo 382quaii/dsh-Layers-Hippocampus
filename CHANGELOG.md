@@ -8,6 +8,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 **补丁版：修复冷数据归档与保留期的时间冲突，并把“打破日志线性增长”的三层机制并入正式记录。**
 
+- **Fixed — 设置页卡在“正在启动…”并报 `MEM_E_NETWORK: HTTP 404`**（2026-11-13）：
+  1.6.2 的强校验 `archiveAfterDays < retentionDays` 与**旧 profile**（`raw.retentionDays: 30`、
+     从未写过 `archiveAfterDays`）冲突，`apply()` 抛 `MEM_E_CONFIG_OUT_OF_RANGE`，插件根本没加载，
+     所有 `/api/hippocampus/*` 路由缺失 → UI 永远 404。现在：
+  - `archiveAfterDays` **未被显式配置**时按 `retentionDays - 1` 派生，并置
+    `raw.archiveAfterDaysDerived: true`（旧 profile 可直接启动）；
+  - **显式**给出越界的 `archiveAfterDays` 仍然 fail-fast（配置错误不该被静默原谅）。
+- **Fixed — 归档文件不受 retention 约束**：`prune()` 原来只删 `.jsonl` 明文分片，`.jsonl.br`
+  归档会永久堆积，等于变相突破保留期。现在整月归档的末日晚于 cutoff 才保留，否则连
+  `state/raw-archive.json` 记录一起删除，返回 `removedArchives`。
+
 - **修复冷数据归档时间冲突**：冷归档阈值与 TTL 保留期原本互相挤压（`archiveAfterDays` 与
   `retentionDays` 同为 30/90 量级，冷分片常在归档前就被 TTL 删除）。现在默认值上调为
   `archiveAfterDays: 90`、`retentionDays: 365`，并保留 fail-fast 校验
