@@ -2501,6 +2501,8 @@
       }
 
       function Section(props) {
+        // v1.6.3 简洁模式：`hidden` 的卡片整块不渲染（不卸载数据、不写回默认值）。
+        if (props.hidden === true) return null;
         return h(
           'div',
           { style: cardStyle },
@@ -2508,6 +2510,46 @@
           props.hint ? h('div', { style: { ...labelStyle, marginBottom: 6 } }, props.hint) : null,
           props.children,
         );
+      }
+
+      /**
+       * v1.6.3 — 设置页有两种视图：专业模式（全部卡片）与简洁模式（四块）。
+       *
+       * 简洁模式是**纯显示层**：隐藏的卡片既不渲染也不参与保存，POST 只携带可见键，
+       * 因此文件里未显示的配置保持原值（新装即默认值，专业模式调过的不会被覆盖）。
+       * 选择只存在浏览器 localStorage，不进插件配置，也不影响引擎行为。
+       */
+      const SETTINGS_MODE_KEY = 'hippocampus:settings-mode';
+      /** 简洁模式下提交的键：只覆盖四块可见卡片里的设置。 */
+      const SIMPLE_PATCH_KEYS = [
+        'identity.eventTimePolicy',
+        'context.maxTokens',
+        'context.maxInjectTokens',
+        'context.threshold',
+        'context.target',
+        'context.injectPrompt',
+        'raw.mode',
+        'raw.maxTotalMb',
+        'raw.compressionEngine',
+      ];
+      /** 简洁模式仍要做范围校验的数字项（与 SIMPLE_PATCH_KEYS 对齐）。 */
+      const SIMPLE_NUMBER_KEYS = ['context.maxTokens', 'context.maxInjectTokens', 'context.threshold', 'context.target', 'rawMaxTotalMb'];
+
+      function readSettingsMode() {
+        try {
+          return window.localStorage.getItem(SETTINGS_MODE_KEY) === 'simple' ? 'simple' : 'pro';
+        } catch (ignored) {
+          // Private mode / 禁用的 storage：退回专业模式，不抛错。
+          return 'pro';
+        }
+      }
+
+      function writeSettingsMode(mode) {
+        try {
+          window.localStorage.setItem(SETTINGS_MODE_KEY, mode === 'simple' ? 'simple' : 'pro');
+        } catch (ignored) {
+          // 写不进去就只在本次会话生效；显隐是纯客户端偏好，不值得阻断。
+        }
       }
 
       const EVENT_TIME_OPTIONS = [
@@ -2875,6 +2917,9 @@
         const [draft, setDraft] = React.useState(null);
         const [status, setStatus] = React.useState(null);
         const [saving, setSaving] = React.useState(false);
+        // v1.6.3: 简洁模式 / 专业模式（纯客户端偏好，存 localStorage）。
+        const [settingsMode, setSettingsMode] = React.useState(readSettingsMode);
+        const simpleMode = settingsMode === 'simple';
         // v1.5.4 escape hatch: reset a wedged rollover/handoff state from the UI.
         const [escapeStatus, setEscapeStatus] = React.useState(null);
         const [escapeBusy, setEscapeBusy] = React.useState(false);
@@ -2936,13 +2981,15 @@
 
         /** Client pre-check mirrors the server ranges; the server stays the authority. */
         const validateDraft = () => {
-          for (const rule of NUMBER_RULES) {
+          // v1.6.3 简洁模式：只校验可见项，隐藏项不提交也不阻止保存。
+          const rules = simpleMode ? NUMBER_RULES.filter((rule) => SIMPLE_NUMBER_KEYS.includes(rule.key)) : NUMBER_RULES;
+          for (const rule of rules) {
             const value = readPath(draft, rule.key);
             const number = Number(value);
             if (!Number.isFinite(number)) return `${rule.label} 必须是数字`;
             if (number < rule.min || number > rule.max) return `${rule.label} 必须在 ${rule.min} – ${rule.max} 之间（当前 ${number}）`;
           }
-          if (!String(draft.maintenanceCron || '').trim()) return 'Cron 表达式不能为空';
+          if (!simpleMode && !String(draft.maintenanceCron || '').trim()) return 'Cron 表达式不能为空';
           return null;
         };
 
@@ -3027,11 +3074,15 @@
             'tagTree.leafDecayFloor': Number(draft.tagTree.leafDecayFloor),
             'identity.eventTimePolicy': draft.eventTimePolicy,
           };
+          // v1.6.3: 简洁模式只提交可见键，隐藏项在文件里保持原值（不重置为默认值）。
+          const payloadPatch = simpleMode
+            ? Object.fromEntries(Object.entries(patch).filter(([key]) => SIMPLE_PATCH_KEYS.includes(key)))
+            : patch;
           try {
             const { body } = await getJson(API.config, {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ patch }),
+              body: JSON.stringify({ patch: payloadPatch }),
             });
             if (body && body.ok === true) {
               setDraft(draftFromConfig(body.config));
@@ -3082,6 +3133,52 @@
           { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 12, maxWidth: 720 } },
           h('div', { style: { fontSize: 16, fontWeight: 600 } }, '海马体记忆'),
           h('div', { style: labelStyle }, '保存后立即作用于运行时（fail-fast 校验，越界会被拒绝），并在可持久化时写回 Loader 配置。'),
+          // v1.6.3: 视图切换。简洁模式只显示四块，隐藏项不参与保存、文件里保持原值。
+          h(
+            'div',
+            { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+            h(
+              'button',
+              {
+                type: 'button',
+                style: {
+                  ...smallButtonStyle,
+                  ...(simpleMode
+                    ? { borderColor: palette.accent, color: palette.accent, fontWeight: 600 }
+                    : {}),
+                },
+                onClick: () => {
+                  writeSettingsMode('simple');
+                  setSettingsMode('simple');
+                },
+              },
+              '简洁模式',
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                style: {
+                  ...smallButtonStyle,
+                  ...(!simpleMode
+                    ? { borderColor: palette.accent, color: palette.accent, fontWeight: 600 }
+                    : {}),
+                },
+                onClick: () => {
+                  writeSettingsMode('pro');
+                  setSettingsMode('pro');
+                },
+              },
+              '专业模式',
+            ),
+            h(
+              'span',
+              { style: { ...labelStyle, marginBottom: 0 } },
+              simpleMode
+                ? '只显示身份、上下文窗口、存储位置迁移与原始回合留存三项；其余配置保持文件中的现有值，不会被改写。'
+                : '显示全部配置项。',
+            ),
+          ),
           shellState !== 'ready'
             ? h(
                 'div',
@@ -3115,7 +3212,7 @@
             : null,
           h(
             Section,
-            { title: '行为' },
+            { title: '行为', hidden: simpleMode },
             h(Toggle, {
               label: '空闲时自动整理（Dream）',
               hint: `连续 ${draft.dreamIdleMinutes} 分钟没有记忆工具调用后跑一次维护（与 Cron 共用同一入口）。`,
@@ -3159,6 +3256,7 @@
             {
               title: '工具 schema 裁剪（tools.disabled）',
               hint: '每个工具定义都会在每轮提示中占用固定 schema token。裁剪低频工具可降低底座税；核心工具 remember / recall / admin 不可关闭。保存后写回配置，下次宿主启动（或重载插件）时真正跳过注册。',
+              hidden: simpleMode,
             },
             h(
               'div',
@@ -3188,6 +3286,7 @@
             {
               title: '入库自动打标（Pre-Ingest Tagging）',
               hint: '模型手传 tags 优先；未传 tags 时由引擎从内容形态提取 1–2 个锚点（错误类型 / errno / 代码块语言 / HTTP 状态 / 文件路径 / 任务语句）。raw 保持纯净，锚点直接进 L1.5 索引；提取不到只记 MEM_E_AUTO_TAG_MISS 警告，不阻断写入。',
+              hidden: simpleMode,
             },
             h(Toggle, {
               label: '启用引擎侧自动打标（tagging.autoTag）',
@@ -3211,6 +3310,7 @@
             {
               title: '可选能力（微内核边界）',
               hint: '关闭多空间后，本体退化为严格单空间核心：targetSpaceId 只能是 default，空间工具与 /spaces、/transfer 路由返回 MEM_E_FEATURE_DISABLED。跨空间迁移必须同时启用多空间。保存后立即生效；工具注册在下次宿主启动/重载时真正移除。',
+              hidden: simpleMode,
             },
             h(Toggle, {
               label: '启用多空间路由（features.multiSpace）',
@@ -3233,14 +3333,17 @@
               disabled: disabled || !draft.features.multiSpace,
             }),
           ),
-          h(OrchestratorInstallCard, {
-            installed: Boolean(state.payload && state.payload.capabilities && state.payload.capabilities.spaces === true),
-          }),
+          simpleMode
+            ? null
+            : h(OrchestratorInstallCard, {
+                installed: Boolean(state.payload && state.payload.capabilities && state.payload.capabilities.spaces === true),
+              }),
           h(
             Section,
             {
               title: '离线 Dream（LLM 蒸馏）',
               hint: 'Dream 在空闲/补偿时蒸馏同标签经验；失败会本地降级并记 MEM_E_DREAM_LLM_FALLBACK。Endpoint / Model / API Key 只从 profile 配置或 DSH_DREAM_LLM_* 环境变量注入，绝不会下发到浏览器，也不能在此页填写。',
+              hidden: simpleMode,
             },
             h(Toggle, {
               label: '启用 LLM 提炼（dream.useLlm）',
@@ -3345,6 +3448,7 @@
             {
               title: 'L2 多合一蒸馏',
               hint: '维护时把同一标签下的重复经验合并成一条：pinned 只与 pinned 合并、普通只与普通合并，永不混组；全局大标签只保留为 meta.global_tags，不写入倒排索引。原始记录标记为已合并（state/l2-merge.json），仍可追溯。',
+              hidden: simpleMode,
             },
             h(Toggle, {
               label: '启用 L2 合并（l2Merge.enabled）',
@@ -3382,7 +3486,7 @@
           ),
           h(
             Section,
-            { title: '调度' },
+            { title: '调度', hidden: simpleMode },
             h(TextInput, {
               label: '维护 Cron（5 段）',
               hint: '例：0 */6 * * *（每 6 小时）。非法表达式会被后端拒绝。',
@@ -3402,7 +3506,7 @@
           ),
           h(
             Section,
-            { title: '检索', hint: '默认 topK 不得超过检索上限。' },
+            { title: '检索', hint: '默认 topK 不得超过检索上限。', hidden: simpleMode },
             h(Field, {
               label: '默认 topK（retrieval.topK）',
               value: draft.retrievalTopK,
@@ -3476,6 +3580,7 @@
             {
               title: '空间与会话交接（纯物理层）',
               hint: '空间切换在面板顶部 SpaceSelector（全局，本页也会跟随）；本区只调路由相关开关与会话窗口记账。业务记忆迁移走面板勾选 + 移动到…（二次授权）。',
+              hidden: simpleMode,
             },
             // The same status bar as the panel, fed by the stats payload's
             // panel.session — the operator sees the handoff countdown while tuning
@@ -3626,7 +3731,10 @@
           h(StorageMigratorUI, { config: serverConfig, disabled }),
           h(
             Section,
-            { title: '原始回合留存（raw）', hint: '只做取证，不参与索引；高价值/代码/报错/工具输出才会留，且有日/总量/保留期上限。' },
+            {
+              title: '原始回合留存（raw）',
+              hint: '只做取证，不参与索引；高价值/代码/报错/工具输出才会留，且有日/总量/保留期上限。',
+            },
             h(Select, {
               label: 'raw.mode',
               hint: 'salience：只留高价值轮次；all：全留（仍受上限）；off：关闭 deep_raw。',
@@ -3639,15 +3747,17 @@
               onChange: (value) => edit('rawMode', value),
               disabled,
             }),
-            h(Field, {
-              label: 'raw 最小显著度',
-              value: draft.rawMinSalience,
-              min: 0,
-              max: 1,
-              step: 0.05,
-              onChange: (value) => edit('rawMinSalience', value),
-              disabled,
-            }),
+            simpleMode
+              ? null
+              : h(Field, {
+                  label: 'raw 最小显著度',
+                  value: draft.rawMinSalience,
+                  min: 0,
+                  max: 1,
+                  step: 0.05,
+                  onChange: (value) => edit('rawMinSalience', value),
+                  disabled,
+                }),
             h(Field, {
               label: 'raw 总量上限（MB）',
               value: draft.rawMaxTotalMb,
@@ -3658,27 +3768,31 @@
               onChange: (value) => edit('rawMaxTotalMb', value),
               disabled,
             }),
-            h(Field, {
-              label: 'raw 保留期（天）',
-              value: draft.rawRetentionDays,
-              min: 1,
-              max: 365,
-              step: 1,
-              suffix: '天',
-              onChange: (value) => edit('rawRetentionDays', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '冷压缩阈值（raw.archiveAfterDays，天）',
-              hint: '超过该天数的日分片会被按月合并为 .jsonl.gz（默认 7，必须小于保留期）。只有近 30 天零访问、且不含 pinned / status:handoff / 高频标签的分片才会被压缩；deep_raw 仍可流式读取。',
-              value: draft.rawArchiveAfterDays,
-              min: 1,
-              max: 3650,
-              step: 1,
-              suffix: '天',
-              onChange: (value) => edit('rawArchiveAfterDays', value),
-              disabled,
-            }),
+            simpleMode
+              ? null
+              : h(Field, {
+                  label: 'raw 保留期（天）',
+                  value: draft.rawRetentionDays,
+                  min: 1,
+                  max: 365,
+                  step: 1,
+                  suffix: '天',
+                  onChange: (value) => edit('rawRetentionDays', value),
+                  disabled,
+                }),
+            simpleMode
+              ? null
+              : h(Field, {
+                  label: '冷压缩阈值（raw.archiveAfterDays，天）',
+                  hint: '超过该天数的日分片会被按月合并为 .jsonl.gz（默认 7，必须小于保留期）。只有近 30 天零访问、且不含 pinned / status:handoff / 高频标签的分片才会被压缩；deep_raw 仍可流式读取。',
+                  value: draft.rawArchiveAfterDays,
+                  min: 1,
+                  max: 3650,
+                  step: 1,
+                  suffix: '天',
+                  onChange: (value) => edit('rawArchiveAfterDays', value),
+                  disabled,
+                }),
             h(Select, {
               label: '冷压缩引擎（raw.compressionEngine）',
               hint:
@@ -3695,45 +3809,49 @@
               onChange: (value) => edit('rawCompressionEngine', value),
               disabled,
             }),
-            h(
-              'div',
-              { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', margin: '4px 0 10px' } },
-              h(
-                'button',
-                {
-                  type: 'button',
-                  style: smallButtonStyle,
+            simpleMode
+              ? null
+              : h(
+                  'div',
+                  { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', margin: '4px 0 10px' } },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      style: smallButtonStyle,
+                      disabled,
+                      onClick: () =>
+                        edit(
+                          'rawCompressionEngine',
+                          draft.rawCompressionEngine === 'brotli' ? 'gzip' : 'brotli',
+                        ),
+                    },
+                    draft.rawCompressionEngine === 'brotli' ? '切回 Gzip（兼容模式）' : '启用 Brotli 11 级（极限压缩）',
+                  ),
+                  h(
+                    'span',
+                    { style: { ...labelStyle, marginBottom: 0 } },
+                    draft.rawCompressionEngine === 'brotli'
+                      ? 'Brotli 11 级已选中：点击“保存全部”后，新归档使用 .jsonl.br。'
+                      : '当前未使用极限压缩：点击“保存全部”后切换，下个月归档生效。',
+                  ),
+                ),
+            simpleMode
+              ? null
+              : h(Field, {
+                  label: 'deep_raw 扫描回合上限（raw.maxScanTurns）',
+                  hint: 'deep_raw 从最新记录倒序最多扫描的回合数（默认 5000，下次 deep_raw 即生效）。调大可回溯更久但更慢；超出上限会 truncated=true 并在 notes 说明。',
+                  value: draft.rawMaxScanTurns,
+                  min: 500,
+                  max: 50000,
+                  step: 500,
+                  onChange: (value) => edit('rawMaxScanTurns', value),
                   disabled,
-                  onClick: () =>
-                    edit(
-                      'rawCompressionEngine',
-                      draft.rawCompressionEngine === 'brotli' ? 'gzip' : 'brotli',
-                    ),
-                },
-                draft.rawCompressionEngine === 'brotli' ? '切回 Gzip（兼容模式）' : '启用 Brotli 11 级（极限压缩）',
-              ),
-              h(
-                'span',
-                { style: { ...labelStyle, marginBottom: 0 } },
-                draft.rawCompressionEngine === 'brotli'
-                  ? 'Brotli 11 级已选中：点击“保存全部”后，新归档使用 .jsonl.br。'
-                  : '当前未使用极限压缩：点击“保存全部”后切换，下个月归档生效。',
-              ),
-            ),
-            h(Field, {
-              label: 'deep_raw 扫描回合上限（raw.maxScanTurns）',
-              hint: 'deep_raw 从最新记录倒序最多扫描的回合数（默认 5000，下次 deep_raw 即生效）。调大可回溯更久但更慢；超出上限会 truncated=true 并在 notes 说明。',
-              value: draft.rawMaxScanTurns,
-              min: 500,
-              max: 50000,
-              step: 500,
-              onChange: (value) => edit('rawMaxScanTurns', value),
-              disabled,
-            }),
+                }),
           ),
           h(
             Section,
-            { title: '删除与复习', hint: '两阶段删除先挂起，宽限期内 restore 可取消；复习排期由引擎推进。' },
+            { title: '删除与复习', hint: '两阶段删除先挂起，宽限期内 restore 可取消；复习排期由引擎推进。', hidden: simpleMode },
             h(Field, {
               label: '删除宽限期（小时）',
               hint: '0 = 立即执行（旧行为）；默认 24 小时。',
@@ -3755,7 +3873,7 @@
           ),
           h(
             Section,
-            { title: '存储与图谱', hint: '存储预算只影响左上角环形图的阈值，不会删除任何数据。' },
+            { title: '存储与图谱', hint: '存储预算只影响左上角环形图的阈值，不会删除任何数据。', hidden: simpleMode },
             h(Field, {
               label: '存储预算上限（MB）',
               hint: '普通用户 50MB；重度用户可调至 200MB+。软上限：超限只在环形图标红，不删档。',
@@ -3783,6 +3901,7 @@
             {
               title: '标签树（L1.5 幽灵宽限）',
               hint: '层级标签的生死节奏：root 永生、leaf 引用归零即死、mid 在宽限期内变"幽灵"（recall 只给元数据、引导 deep_raw），过期未复活才消亡。四个值都在下一次维护生效。',
+              hidden: simpleMode,
             },
             h(Slider, {
               label: 'mid 半衰期倍率（tagTree.midHalfLifeMultiplier）',
@@ -3828,7 +3947,7 @@
           ),
           h(
             Section,
-            { title: '老化与活跃集合', hint: '这两个值同时是策略参数：写入 config 即进入 policy，下一次维护生效。' },
+            { title: '老化与活跃集合', hint: '这两个值同时是策略参数：写入 config 即进入 policy，下一次维护生效。', hidden: simpleMode },
             h(Field, {
               label: '记忆半衰期（decay.halfLifeDays）',
               hint: '默认 30 天。调大能记住更久。',
@@ -3853,7 +3972,7 @@
           ),
           h(
             Section,
-            { title: 'L2.5 趋势隔离' },
+            { title: 'L2.5 趋势隔离', hidden: simpleMode },
             h(Field, {
               label: '隔离期（天）',
               value: draft.temp.ttlDays,

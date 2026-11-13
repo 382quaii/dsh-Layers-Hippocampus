@@ -1,9 +1,9 @@
 # Release 1.6.3 — 发布准备（本地）
 
-> 版本：**1.6.3**（2026-11-13：配置 schema 迁移 + `strictStartup` 启动安全降级；`CAPABILITIES.version` 与测试断言同步）。
+> 版本：**1.6.3**（2026-11-13：配置 schema 迁移 + `strictStartup` 启动安全降级 + 设置页简洁模式；`CAPABILITIES.version` 与测试断言同步）。
 
 > 状态：**代码与文档已就绪；仓库推送 / npm 发布 / 市场 PR 需要你的 GitHub 与 npm 凭据，代理与网络，本会话未执行。**
-> 基线：`dsh-memory` 工作区，全量 **470/470 测试通过**（76 个测试文件；另有 `dsh-orchestrator` 31/31）。
+> 基线：`dsh-memory` 工作区，全量 **475/475 测试通过**（77 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；插件市场仍无条目（未发布 npm）。
 
 ## 本版内容
@@ -31,10 +31,17 @@
 - **启动状态可观测**：`CAPABILITIES.startup` / `CAPABILITIES.configVersion`；
   `memory_admin action=status` 的 `panel.startup` / `panel.configVersion` / `panel.configWarnings`。
   设置页与运维方可以直接看到“这份配置从哪个 schema 版本来、是否迁移过、是否降级启动”。
+- **设置页「简洁模式」**（纯显示层）：顶部切换“简洁模式 / 专业模式”。简洁模式只渲染
+  **身份 / 上下文窗口 / 系统级存储位置迁移 / 原始回合留存（raw）**四块；raw 卡内收敛为
+  `raw.mode`、`raw.maxTotalMb`、`raw.compressionEngine` 三项。隐藏项不渲染、不参与保存——
+  POST 的 patch 被过滤为 9 个可见键，文件里其余配置保持原值。校验同步收敛，
+  隐藏项的越界值不阻断保存。模式偏好只存浏览器 `localStorage`（`hippocampus:settings-mode`），
+  默认专业模式，读写失败自动退回专业模式。
 - **测试**：新增 `test/v163.migration.test.js`（9 例）——旧配置启动 + `archiveAfterDays=29`；
   显式冲突在 strict 下阻断、非 strict 下降级；降级不吞类型错误/未知键；1.6.2 生产 profile
   原始形状可解析。`test/helpers.js` 夹具改走同一迁移步骤；`test/status.test.js` 的 panel
-  形状契约同步新增三字段。全量 **470/470**。
+  形状契约同步新增三字段。新增 `test/v163.ui.test.js`（5 例）锁简洁模式契约。
+  全量 **475/475**。
 
 完整历史见 [CHANGELOG.md](../CHANGELOG.md) 的 `[1.6.3]` / `[1.6.2]` / `[1.6.1]` 段。
 
@@ -48,7 +55,7 @@
 
 ```powershell
 cd C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory
-node test/run.mjs                # 期望 470/470
+node test/run.mjs                # 期望 475/475
 cd ..\dsh-orchestrator
 node test/run.mjs                # 期望 31/31
 cd ..\dsh-memory

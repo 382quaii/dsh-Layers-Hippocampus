@@ -32,12 +32,24 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   与 `memory_admin action=status` 的 `panel.startup` / `panel.configVersion` /
   `panel.configWarnings`。设置页与运维方可以直接看到“这份配置来自哪个 schema 版本、
   是否迁移过、是否降级启动”。
+- **Added — 设置页「简洁模式」（纯显示层）**：设置页顶部新增“简洁模式 / 专业模式”切换。
+  简洁模式只渲染四块——**身份、上下文窗口、系统级存储位置迁移、原始回合留存（raw）**；
+  raw 卡内再收敛为三项（`raw.mode`、`raw.maxTotalMb`、`raw.compressionEngine`），
+  最小显著度 / 保留期 / 冷压缩阈值 / deep_raw 扫描上限全部隐藏。
+  - 隐藏是**纯 UI 行为，不碰配置值**：保存时 patch 被过滤为
+    `SIMPLE_PATCH_KEYS`（9 个可见键），文件里未显示的项保持原值；新装即默认值，
+    专业模式下调过的不会被简洁模式覆盖。
+  - 校验同步收敛：只检查可见数字键，隐藏项的越界值不会阻断保存，Cron 非空检查也跳过。
+  - 模式偏好存浏览器 `localStorage`（键 `hippocampus:settings-mode`），不进插件配置、
+    不影响引擎行为；读写失败一律退回专业模式。
 - **Tests**：`test/v163.migration.test.js`（9 例）锁定本次教训——旧配置（仅
   `retentionDays: 30`）可启动且 `archiveAfterDays` 派生为 29；显式冲突在
   `strictStartup: true` 下阻断、在 `false` 下降级启动；降级不吞类型错误与未知键；
   以及 1.6.2 生产 profile 的原始形状可被完整解析。`test/helpers.js` 的夹具改走同一
   迁移步骤，`test/status.test.js` 的 panel 形状契约同步新增三个字段。
-  全量 **470/470**。
+  `test/v163.ui.test.js`（5 例）锁定简洁模式契约：`Section` 的 `hidden` 短路、
+  14 个专业模式卡片全部带 `hidden: simpleMode`、raw 只剩三项、保存与校验按白名单收敛。
+  全量 **475/475**（77 个测试文件）。
 
 ## [1.6.2] — 2026-11-11
 
