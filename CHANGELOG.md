@@ -70,6 +70,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   - `context.coldStartInjectRecentTurns` 默认由 `false` 改为 **`true`**：只给摘要会让
     新对话接不上具体语境。
   - 即使两个开关全关，匹配到的 pending 也会被消费掉，不会遗留到下一次无关会话。
+  - **可观测**：`/stats` 新增 `coldStart{ pending[], injected, lastSessionId }`（`runtime.coldStartView()`），
+    运维方不必读 prompt 就能区分“已布防未装配”与“已注入”。
+  - **`panel.startup` / `panel.configVersion` / `panel.configWarnings` 与 `capabilities.startup`
+    对齐**：此前 `toMemoryOptions()` 没有把迁移结果传给引擎，panel 报的是“未迁移”默认值，
+    而 capabilities 报的是真相——同一个进程两处说法不一致，现由 `toMemoryOptions` 一并透传。
 - **Tests**：`test/v163.migration.test.js`（9 例）锁定本次教训——旧配置（仅
   `retentionDays: 30`）可启动且 `archiveAfterDays` 派生为 29；显式冲突在
   `strictStartup: true` 下阻断、在 `false` 下降级启动；降级不吞类型错误与未知键；
@@ -81,8 +86,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   迁移剥离、路由/能力面不暴露、客户端无轮询器）；
   `test/v160.coldStart.test.js` 重写为按会话注入契约（无标记不布防、摘要+尾部各一次、
   兄弟 agent 先装配不吞注入、两个会话各注入一次、**两条 pending 先布防后装配也各得其份**、
-  双关不遗留 pending、tailTurns 优先）。
-  全量 **477/477**（77 个测试文件）。
+  双关不遗留 pending、tailTurns 优先、stats 暴露 coldStart 状态）。
+  全量 **478/478**（77 个测试文件）。
 
 ## [1.6.2] — 2026-11-11
 

@@ -196,6 +196,34 @@ test('two conversations armed before either assembles each get their own block',
   }
 });
 
+test('the stats payload exposes the armed/injected cold-start state', async () => {
+  const booted = await boot({
+    prepare: async (runtime, dir) => {
+      const event = await runtime.memory.remember({ content: 'handoff body', tags: ['topic:alpha'], eventTime: T0 });
+      await runtime.memory.maintain({ reason: 'cold-start-test' });
+      writeMarker(dir, { summaryEventId: event?.eventId ?? null });
+    },
+  });
+  try {
+    booted.runtime.noteColdStart({ sessionId: 'sess-view' });
+    const before = await booted.runtime.uiPayload();
+    assert.ok(Array.isArray(before.coldStart.pending), 'coldStart.pending is a list');
+    assert.equal(before.coldStart.pending.length, 1);
+    assert.equal(before.coldStart.pending[0].sessionId, 'sess-view');
+    assert.equal(before.coldStart.pending[0].source, 'session');
+    assert.equal(before.coldStart.injected, 0);
+    booted.runtime.memory.observeSessionTurn('sess-view', 'go');
+    booted.runtime.promptState();
+    const after = await booted.runtime.uiPayload();
+    assert.equal(after.coldStart.pending.length, 0, 'consumed entries leave the pending list');
+    assert.equal(after.coldStart.injected, 1);
+    assert.equal(after.coldStart.lastSessionId, null, 'lastSessionId tracks captured turns, not assemblies');
+  } finally {
+    booted.dispose();
+    fs.rmSync(booted.dir, { recursive: true, force: true });
+  }
+});
+
 test('both OFF: no historical block, but the static wake-up policy still exists', async () => {
   const booted = await boot({
     context: { coldStartInjectSummary: false, coldStartInjectRecentTurns: false },

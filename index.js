@@ -985,6 +985,9 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
         dreamQueue: memory.dreamQueue(),
         dreamTimer: runtime.dreamTimer?.status() ?? null,
         handoff: runtime.handoffView(),
+        // v1.6.3: cold-start injection observability. Without it the only way to tell
+        // "armed but never assembled" from "already injected" is to read the prompt.
+        coldStart: runtime.coldStartView?.() ?? null,
         panel: { ...status.panel, migration: runtime.migrationStatus() },
         briefing: memory.briefing(),
         config: uiConfig(runtime.config),
@@ -1037,6 +1040,25 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       : [];
 
   /**
+   * v1.6.3: cold-start injection observability for /stats.
+   *
+   * `pending` = armed but not yet assembled (a conversation that has not run its
+   * first turn), `injected` = delivered keys (bounded), `lastSessionId` = the most
+   * recent conversation this process captured a turn for.
+   */
+  runtime.coldStartView = () => ({
+    pending: [...runtime.coldStart.pending.values()].map((entry) => ({
+      key: entry.key,
+      sessionId: entry.sessionId,
+      agentId: entry.agentId,
+      source: entry.source,
+      at: entry.at,
+    })),
+    injected: runtime.coldStart.injected.size,
+    lastSessionId: runtime.coldStart.lastSessionId,
+  });
+
+  /**
    * True only when a multi-space adapter (dsh-orchestrator) is present AND the
    * profile has not turned the capability off. The core alone is single-space.
    */
@@ -1081,8 +1103,7 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     })(),
   });
 
-  /** v1.5.6: handoff observability (the client shows the marker + summary link). */
-  runtime.handoffView = () => {
+  /** v1.5.6: handoff observability (the client shows the marker + summary link). */  runtime.handoffView = () => {
     const handoff = memory.handoffState();
     return {
       active: handoff?.active === true,
