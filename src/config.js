@@ -1404,6 +1404,12 @@ export function toMemoryOptions(config) {
       features: config.features,
       // v1.5.6: L2 multi-merge tunables (offline maintain phase).
       l2Merge: config.l2Merge,
+      // v1.6.3: the engine's own `panel` is what /stats and memory_admin read, so the
+      // config-load outcome must reach it — otherwise `panel.startup` reported the
+      // "unknown" default while `capabilities.startup` reported the truth.
+      configVersion: config.configVersion,
+      startup: config.startup,
+      warnings: config.warnings,
     },
   };
 }
