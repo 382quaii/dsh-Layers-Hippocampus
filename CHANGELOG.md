@@ -4,50 +4,54 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.4] — 2026-11-14
+
+**修复 1M 上下文溢出（`CONTEXT_WINDOW_EXCEEDED`）：交接判定的分母、分子与状态机三处
+同时失效，外加单轮超大工具输出没有任何熔断。这是一次独立的安全发版——1.6.3 从未
+发布过，它的全部内容已并入本版。**
+
+- **Fixed — 分母错源：接入宿主真实模型窗口**。新增 `src/context/windowGuard.js` 的
+  `resolveWindow()`：**宿主适配器上报的窗口优先**（`llm.resolveModelInfo().context.contextWindow`，
+  也接受 `tokenMeter.contextPressure().contextWindow`），`context.nativeTokenLimit` 降级为
+  用户覆盖，只在宿主不可用时兜底。`panel.session.windowSource` 暴露本次用的是
+  `host` / `config` / `default`，事后可审计。此前本机 profile 写的 `8000` 被当成模型窗口，
+  模型真实窗口是 **1,048,576**。
+- **Fixed — 分子不再靠猜：`used + reserved` 公式**。判定改为
+  `used_tokens + reserved_completion_tokens >= window × threshold`。
+  已用优先取宿主 `tokenMeter` 的测量值（含系统提示、工具 schema、历史重放），
+  `Math.ceil(字符数 ÷ 4)` 的自估降为下限；`reserved` 取本次请求真实的 `maxTokens`
+  （默认 256,000）。事故数字 854,668 + 256,000 = 1,110,668 > 1,048,576 现在能直接判出来。
+- **Fixed — Fail-Fast 兜底**。新增 `agent/request` 中间件：拿到最终请求配置后重新判定，
+  **必定放不进窗口的请求在本地就被拦下**，抛 `MEM_E_CONTEXT_EXCEEDED`，details 里带
+  `usedTokens / reservedTokens / projectedTokens / window / windowSource / ratio`，
+  并明确写出 “Nothing was sent to the provider”。宿主缺少 `llm` / `tokenMeter` 服务时
+  **绝不阻断**（降级为原有行为）。
+- **Fixed — 交接状态机死锁（“80% 了却不交接”）**。`checkHandoff()` 里
+  `if (marker.active) return base;` 会让首次交接后的同一会话**永远**不再交接
+  （1.6.3 移除自动开新会话后，session id 不再变化，marker 就永久 active）。
+  改为 `rehandoffDecision()`：同会话压力再涨 ≥5 个百分点（`pressure-growth`）或投影
+  ≥95% 硬上限（`near-hard-limit`）时清掉旧 marker 重新蒸馏；不同会话仍走原有消费路径。
+- **Added — Live Compact：单轮超大工具输出熔断**。新增 `src/context/liveCompact.js`：
+  单个 `tool/result` 的文本超过 `context.liveCompact.thresholdChars`（默认 200,000 字符）时，
+  保留头 4,000 / 尾 2,000 字符，中间压成一行指针
+  （`[[hippocampus:live-compact: removed N chars … (seq=…, call=…, tool=…)]`），
+  原文仍可用 `deep_raw` 取回。走宿主 surface 协议
+  （`append('compaction/prune')` + `append('tool/result', { surfaceOp: { op: 'replace' } })`），
+  宿主自带 `toolResultPruner` 时优先委托给它。指针化按 code point 切，不会劈开代理对。
+- **Tests**：新增 `test/v164.windowGuard.test.js`（11 例）锁定本次修复：宿主窗口优先于配置覆盖、
+  引擎 `windowSource` 可审计、`used + reserved` 判定（含那组真实数字 854,668 + 256,000）、
+  `nativeState` 优先采用宿主测量值、`rehandoffDecision` 的四种判定、
+  超大工具结果的指针化（含代理对不被劈开、`surfaceOp replace` 的实际形状）、
+  同会话内 marker 仍 active 时 `checkHandoff` 会续交、以及
+  `guardRequest` 在「必超限」时抛 `MEM_E_CONTEXT_EXCEEDED` / 在「放得下」时放行 /
+  在没有宿主服务时绝不阻断（降级为原有行为）。
+  全量 **494/494**（79 个测试文件）。
+
 ## [1.6.3] — 2026-11-13
 
 **配置加载器加固：把 1.6.2 的“旧配置启动阻断”事故固化为引擎能力——先迁移、再严格校验、
 必要时安全降级，绝不让 DSH 客户端卡在“正在启动…”。**
 
-**并修复 2026-11-14 的 1M 上下文溢出事故：交接判定的分母、分子与状态机三处同时失效，
-外加单轮超大工具输出没有任何熔断。**
-
-- **Fixed — 1M 上下文溢出（`CONTEXT_WINDOW_EXCEEDED`）的三个根因**：
-  一次请求携带 854,668 prompt tokens + 预留 256,000 completion tokens = 1,110,668，
-  超过模型真实窗口 1,048,576，被 provider 拒绝——而本插件全程认为“才用了几千 token”。
-  1. **分母错源**：`context.nativeTokenLimit`（本机 profile 写的是 `8000`）被当成模型窗口。
-     新增 `src/context/windowGuard.js#resolveWindow()`，**宿主适配器上报的真实窗口优先**
-     （`llm.resolveModelInfo().context.contextWindow`，也接受
-     `tokenMeter.contextPressure().contextWindow`），配置值降级为“用户覆盖”，仅在宿主
-     无法上报时兜底；`panel.session.windowSource` 暴露 `host`/`config`/`default`，
-     分母来源从此可审计。
-  2. **分子是自估**：过去用 `Math.ceil(chars / 4)` 累加捕获到的 surface turn，系统提示、
-     工具 schema、历史重放全都不在内。现在优先使用宿主 `tokenMeter.contextPressure()` 的
-     `pressureTokens` / `projectedTokens`（取较大者），块表与自估值只作为下限。
-  3. **判定不含输出预留**：改为 `used + reserved >= window * threshold`（`requestPressure()`），
-     `reserved` 取本次请求真正的 `maxTokens`。**必定放不进窗口的请求现在本地 fail-fast**，
-     抛 `MEM_E_CONTEXT_EXCEEDED` 并附带 `usedTokens / reservedTokens / projectedTokens /
-     window / windowSource / handoff`，绝不发出去再被 API 拒绝（省掉一次必然失败的计费请求）。
-     该拦截注册在 `agent/request` 中间件链上：`await next()` 拿到最终路由
-     `{provider, model, maxTokens}` 之后、真正调用 provider 之前，抛错即阻断。
-- **Fixed — 交接状态机死锁**：`checkHandoff()` 里的 `if (marker.active) return base;` 会让
-  首次交接之后**整个会话再也不触发交接**——1.6.3 移除了 `autoNewSession`，同一对话不再
-  更换 session id，marker 于是永久 `active`。现在改为 `rehandoffDecision()`：同会话内
-  压力比上次交接时的 `ratio` 再涨 ≥5 个百分点，或投影已 ≥95% 硬上限，就**允许续交**
-  （先 `clearHandoff({reason:'rehandoff'})` 再重新蒸馏，保证新摘要描述当前尾部而不是
-  已经蒸馏过的旧尾部）；未达标则照常返回，并带 `rehandoff.reason` 说明为何没交。
-- **Added — Live Compact：单轮超大工具输出熔断（指针化）**：`src/context/liveCompact.js`。
-  单轮一个 `tool/result` 就能塞进几十万字符，等不到任何维护 tick。现在在请求发出前扫描
-  surface 上的 tool 结果：超过 `context.liveCompact.thresholdChars`（默认 200,000 字符）
-  的，**保留头 `headChars`(4000) 与尾 `tailChars`(2000)，中间替换为一行机器可检索的指针**
-  （`[[hippocampus:live-compact: removed N chars … seq=…, call=…, tool=…]]`），并通过宿主
-  自己的 surface 协议落地——`append('compaction/prune', …)` +
-  `append('tool/result', …, { surfaceOp: { op:'replace', startSeq, endSeq }, sourceEventSeqs })`，
-  原始文本仍在 raw 日志里，模型可用 `deep_raw` 按坐标取回。若宿主已提供
-  `toolResultPruner.pruneSession()`（ptc 预设自带，阈值 8192/4096/1024）则**优先委托它**，
-  本插件只在其缺席时动手；任何失败只记 warning，绝不阻断这一轮。
-  切分按 code point 进行，不会劈开代理对；`context.liveCompact.*` 五个键可调
-  （`enabled` / `thresholdChars` / `headChars` / `tailChars` / `maxNodesPerRequest`）。
 - **Added — 冷启动注入可观测性**：`/stats` 新增 `coldStart{ pending[], injected, lastSessionId }`，
   `panel.startup` / `panel.configVersion` / `panel.configWarnings` 与
   `CAPABILITIES.startup` 同源（此前 `toMemoryOptions()` 没把迁移结果传给引擎，panel 报
@@ -168,14 +172,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `test/v160.coldStart.test.js` 重写为按会话注入契约（无标记不布防、摘要+尾部各一次、
   兄弟 agent 先装配不吞注入、两个会话各注入一次、**两条 pending 先布防后装配也各得其份**、
   双关不遗留 pending、tailTurns 优先、stats 暴露 coldStart 状态）。
-  `test/v163.windowGuard.test.js`（11 例）锁定 1M 溢出的全部修复：宿主窗口优先于配置覆盖、
-  引擎 `windowSource` 可审计、`used + reserved` 判定（含那组真实数字 854,668 + 256,000）、
-  `nativeState` 优先采用宿主测量值、`rehandoffDecision` 的四种判定、
-  超大工具结果的指针化（含代理对不被劈开、`surfaceOp replace` 的实际形状）、
-  同会话内 marker 仍 active 时 `checkHandoff` 会续交、以及
-  `guardRequest` 在「必超限」时抛 `MEM_E_CONTEXT_EXCEEDED` / 在「放得下」时放行 /
-  在没有宿主服务时绝不阻断。
-  全量 **494/494**（79 个测试文件）。
+  全量 **483/483**（78 个测试文件）。
 
 ## [1.6.2] — 2026-11-11
 

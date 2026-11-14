@@ -7,7 +7,7 @@
 
 | | |
 | --- | --- |
-| 版本 | **1.6.3** |
+| 版本 | **1.6.4** |
 | 包名 | `dsh-layers-hippocampus` |
 | 仓库 | <https://github.com/382quaii/dsh-Layers-Hippocampus> |
 | 许可证 | MIT |
@@ -82,8 +82,8 @@
   「前几轮原话」取自交接标记里的 `tailTurns`（最后 ≤5 轮原话），摘要之外还能接上具体语境。
   静态「状态唤醒」策略常驻，两个开关都关时也不会退化成客服腔。
 - 交接**不会**自动弹出新对话：交接发生在对话中间，宿主在标记后继续同一对话；是否需要另开
-  新对话由用户自己决定（v1.5.6 的 `context.autoNewSession*` 已在 1.6.3 移除）。
-- **窗口分母来自宿主，而不是配置文件**（1.6.3）：真实上限取
+  新对话由用户自己决定（v1.5.6 的 `context.autoNewSession*` 已在 1.6.4 移除）。
+- **窗口分母来自宿主，而不是配置文件**（1.6.4）：真实上限取
   `llm.resolveModelInfo().context.contextWindow`（或 `tokenMeter.contextPressure().contextWindow`），
   `context.nativeTokenLimit` 降级为“用户覆盖”，只在宿主无法上报时兜底；
   `panel.session.windowSource` 会显示这次用的是 `host` / `config` / `default`。
@@ -164,7 +164,7 @@ raw 层提供三档，覆盖从“只留关键”到“全留”：
 pnpm add dsh-layers-hippocampus
 
 # 或从 GitHub 指定 tag
-pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.3"
+pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.4"
 ```
 
 ### 2. 挂到 profile
@@ -217,7 +217,7 @@ node scripts/wait-for-routes.mjs
 `panel.configWarnings` 里看到——插件绝不会静默地以与你写的不一样的配置运行。
 
 > 2026-11-13 的生产事故正是这一层缺失造成的：新默认值与旧 profile 冲突，`apply()`
-> 抛错导致插件整体不加载，UI 只能看到 HTTP 404。1.6.3 起该路径由
+> 抛错导致插件整体不加载，UI 只能看到 HTTP 404。该路径自 1.6.4 起由
 > `test/v163.migration.test.js` 锁定。
 
 ### 5. 设置页的两种视图

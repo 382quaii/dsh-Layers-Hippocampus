@@ -1,5 +1,5 @@
 /**
- * v1.6.3 — the 1M-overflow incident (2026-11-14).
+ * v1.6.4 — the 1M-overflow incident (2026-11-14).
  *
  * Three independent defects let a request of 854,668 prompt tokens + a 256,000-token
  * completion reservation reach the provider against a 1,048,576-token window:

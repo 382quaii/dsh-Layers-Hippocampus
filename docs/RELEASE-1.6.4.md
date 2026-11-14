@@ -1,6 +1,6 @@
-# Release 1.6.3 — 发布准备（本地）
+# Release 1.6.4 — 发布准备（本地）
 
-> 版本：**1.6.3**（2026-11-13：配置 schema 迁移 + `strictStartup` 启动安全降级 + 设置页简洁模式 + 交接冷启动按会话注入 + 复习队列消费 + 面板/引擎状态对齐；`CAPABILITIES.version` 与测试断言同步）。
+> 版本：**1.6.4**（2026-11-14：修复 1M 上下文溢出——接入宿主真实窗口、`used + reserved` 判定、Fail-Fast 拦截、同会话续交、Live Compact；并含 1.6.3 未曾发布的全部内容：配置 schema 迁移 + `strictStartup` 启动安全降级 + 设置页简洁模式 + 交接冷启动按会话注入 + 复习队列消费 + 面板/引擎状态对齐；`CAPABILITIES.version` 与测试断言同步）。
 
 > 状态：**代码与文档已就绪；仓库推送 / npm 发布 / 市场 PR 需要你的 GitHub 与 npm 凭据，代理与网络，本会话未执行。**
 > 基线：`dsh-memory` 工作区，全量 **494/494 测试通过**（79 个测试文件；另有 `dsh-orchestrator` 31/31）。
@@ -28,7 +28,7 @@
    本地 fail-fast 抛 `MEM_E_CONTEXT_EXCEEDED`**（附带 used/reserved/projected/window/
    windowSource/handoff），不再发出去白付一次计费。拦截点注册在 `agent/request` 中间件：
    `await next()` 拿到最终 `{provider, model, maxTokens}` 之后、真正调用 provider 之前。
-   同时 `checkHandoff()` 移除 `if (marker.active) return base;`——1.6.3 移除 autoNewSession 后
+   同时 `checkHandoff()` 移除 `if (marker.active) return base;`——移除 autoNewSession 后
    同一对话不再换 session id，marker 永久 active 会让首次交接后**整个会话再也不交接**。
    改为 `rehandoffDecision()`：同会话压力比上次交接再涨 ≥5 个点、或投影 ≥95% 硬上限时允许续交
    （先清 marker 再重新蒸馏，保证新摘要描述当前尾部）。
@@ -94,13 +94,17 @@
   `test/v156.autoSession.test.js` 改写为「移除」契约、`test/v160.coldStart.test.js` 改写为
   「按会话注入」契约。新增 `test/v163.reviewQueue.test.js`（5 例）锁复习消费契约：
   到期被消费且 `step`/`lastAt` 前进、强化数 == 消费数、超预算积压跨轮次排空、
-  `autoConsume:false` 不动队列、整批只写一次文件。全量 **494/494**（79 个测试文件）。
+  `autoConsume:false` 不动队列、整批只写一次文件。
+  新增 `test/v164.windowGuard.test.js`（11 例）锁 1M 溢出的全部修复：宿主窗口优先、
+  `used + reserved` 判定（含真实数字 854,668 + 256,000）、`rehandoffDecision` 四分支、
+  指针化（代理对不被劈开、`surfaceOp.replace` 形状）、`MEM_E_CONTEXT_EXCEEDED` 拦截、
+  无宿主服务时绝不阻断。全量 **494/494**（79 个测试文件）。
 
-完整历史见 [CHANGELOG.md](../CHANGELOG.md) 的 `[1.6.3]` / `[1.6.2]` / `[1.6.1]` 段。
+完整历史见 [CHANGELOG.md](../CHANGELOG.md) 的 `[1.6.4]` / `[1.6.3]` / `[1.6.2]` / `[1.6.1]` 段。
 
 ## 发布步骤（需要你执行）
 
-> 两个包：`dsh-layers-hippocampus@1.6.3`（已有 git remote）与
+> 两个包：`dsh-layers-hippocampus@1.6.4`（已有 git remote）与
 > `dsh-layers-orchestrator@0.1.0`（**目前不是 git 仓库**，需先 init/建远端）。
 > 全部命令在 PowerShell 下执行；`node`/`npm`/`pnpm` 用 DSH runtime 自带的绝对路径。
 
@@ -123,11 +127,12 @@ npm pack --dry-run               # 预检实际发布内容（含/不含不该�
 cd C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory
 git add -A
 git status --short                 # 最后确认没有 node_modules / state / 测试临时目录
-git commit -m "release: v1.6.3 — config schema migration, strictStartup degraded boot, review queue consumption, per-conversation cold-start injection"
+git commit -m "chore(release): v1.6.4 - fix 1M context overflow, add live compact and handoff rehandoff"
 
 # 历史 tag 已存在（v1.5.5 / v1.5.7 / v1.6.0 / v1.6.1 / v1.6.2）。
-# 本轮修复已多次并入同一版本，本地 v1.6.3 tag 已存在 => 用 -f 覆盖到当前 HEAD。
-git tag -f -a v1.6.3 -m "v1.6.3: configVersion=3 migration-first loading; strictStartup degraded boot; settings simple mode; per-conversation cold-start injection; review queue consumption"
+# 本地 v1.6.3 从未发布，本版把它全部内容并入 1.6.4 => 删掉旧 tag，重建 v1.6.4。
+git tag -d v1.6.3
+git tag -a v1.6.4 -m "v1.6.4: context window fix, live compact, rehandoff"
 git push origin main --follow-tags
 ```
 
@@ -168,7 +173,7 @@ npm view dsh-layers-orchestrator version
 ```powershell
 cd C:\Users\86135\.dsh\profiles\desktop
 # 编辑 package.json：
-#   "dsh-layers-hippocampus": "1.6.3"
+#   "dsh-layers-hippocampus": "1.6.4"
 #   "dsh-layers-orchestrator": "0.1.0"
 pnpm install
 # 重启 DSH
@@ -195,6 +200,12 @@ npm view dsh-layers-hippocampus dist-tags
 
 ## 未完成 / 已知边界
 
+- **1.6.4 的窗口守卫只阻断、不压缩**：它会拦下必定放不进窗口的请求（`MEM_E_CONTEXT_EXCEEDED`）
+  并把单轮超大工具结果指针化，但真正把上下文降下来仍靠宿主的 compaction（ptc 预设自带
+  `compaction-basic` + `tool-result-pruner`）或用户开新对话。宿主没有 `llm` / `tokenMeter`
+  服务时，窗口分母回落到 `context.nativeTokenLimit`（`windowSource: 'config'`）。
+- `v1.6.3` 从未发布（无 git push、无 npm publish），其全部内容已并入本版；
+  本地 `v1.6.3` tag 在发版时删除。
 - 本次发布会把 `dsh-orchestrator` 作为独立包首次发布（建仓 + npm）。
 - 纯本地低谷调度 Phase 1/2 已完成（峰谷窗口、`dream-queue.json`、唤醒定时器、睡过头补偿）；未接 `dsh-price-tip` / `peak-runner` / `notify-plugin`（不需要）。
 - 物理切割已完成：`src/spaces/*` 只剩 `singleSpace.js`；未安装 Orchestrator 时多空间能力显式消失（`MEM_E_FEATURE_DISABLED`）。
