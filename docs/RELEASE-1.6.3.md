@@ -3,14 +3,45 @@
 > 版本：**1.6.3**（2026-11-13：配置 schema 迁移 + `strictStartup` 启动安全降级 + 设置页简洁模式 + 交接冷启动按会话注入 + 复习队列消费 + 面板/引擎状态对齐；`CAPABILITIES.version` 与测试断言同步）。
 
 > 状态：**代码与文档已就绪；仓库推送 / npm 发布 / 市场 PR 需要你的 GitHub 与 npm 凭据，代理与网络，本会话未执行。**
-> 基线：`dsh-memory` 工作区，全量 **483/483 测试通过**（78 个测试文件；另有 `dsh-orchestrator` 31/31）。
+> 基线：`dsh-memory` 工作区，全量 **494/494 测试通过**（79 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；插件市场仍无条目（未发布 npm）。
 
 ## 本版内容
 
-**主线：把 2026-11-13 的“旧配置启动阻断”事故固化为引擎能力。**
+**主线一：把 2026-11-13 的“旧配置启动阻断”事故固化为引擎能力。**
+**主线二：修复 2026-11-14 的 1M 上下文溢出事故（分母 / 分子 / 状态机 / 单轮熔断四处）。**
 
-事故回顾：1.6.2 把 `raw.archiveAfterDays` 默认值提到 90，而某 profile 仍是 `raw.retentionDays: 30` 且从未写过
+事故回顾（主线二）：一次请求携带 **854,668 prompt tokens + 预留 256,000 completion tokens**
+= 1,110,668 > 模型真实窗口 **1,048,576**，被 provider 以 `CONTEXT_WINDOW_EXCEEDED` 拒绝；
+而本插件的所有压力判定都认为“才用了几千 token”。三个独立缺陷叠加：
+
+1. **分母错源**：`context.nativeTokenLimit`（profile 里写的是 `8000`）被当作模型窗口。
+   → 新增 `src/context/windowGuard.js#resolveWindow()`：**宿主适配器上报的真实窗口优先**
+   （`llm.resolveModelInfo().context.contextWindow`，或 `tokenMeter.contextPressure().contextWindow`），
+   配置值降级为“用户覆盖”，仅在宿主无法上报时兜底；`panel.session.windowSource`
+   暴露 `host|config|default`，分母来源可审计。
+2. **分子是自估**：`Math.ceil(chars / 4)` 累加捕获 turn，系统提示 / 工具 schema / 历史重放都不在内。
+   → 优先使用宿主 `tokenMeter.contextPressure()` 的 `pressureTokens` / `projectedTokens`（取较大者），
+   块表与自估值只当下限。
+3. **判定不含输出预留、状态机会死锁**：改为 `used + reserved >= window * threshold`
+   （`requestPressure()`），`reserved` 取本次请求真实的 `maxTokens`；**必定放不进窗口的请求
+   本地 fail-fast 抛 `MEM_E_CONTEXT_EXCEEDED`**（附带 used/reserved/projected/window/
+   windowSource/handoff），不再发出去白付一次计费。拦截点注册在 `agent/request` 中间件：
+   `await next()` 拿到最终 `{provider, model, maxTokens}` 之后、真正调用 provider 之前。
+   同时 `checkHandoff()` 移除 `if (marker.active) return base;`——1.6.3 移除 autoNewSession 后
+   同一对话不再换 session id，marker 永久 active 会让首次交接后**整个会话再也不交接**。
+   改为 `rehandoffDecision()`：同会话压力比上次交接再涨 ≥5 个点、或投影 ≥95% 硬上限时允许续交
+   （先清 marker 再重新蒸馏，保证新摘要描述当前尾部）。
+4. **单轮超大工具输出没有熔断**：新增 `src/context/liveCompact.js`。请求前扫描 surface 上的
+   `tool/result`，超过 `context.liveCompact.thresholdChars`（默认 200,000 字符）的
+   **保留头 4000 / 尾 2000 字符，中间替换为一行指针**
+   （`[[hippocampus:live-compact: removed N chars … seq=…, call=…, tool=…]]`），
+   通过宿主 surface 协议落地（`compaction/prune` + `tool/result` 的 `surfaceOp.replace`），
+   原文仍在 raw 日志、可用 `deep_raw` 按坐标取回。宿主若有 `toolResultPruner.pruneSession()`
+   （ptc 预设自带，8192/4096/1024）则**优先委托**；任何失败只 warning，绝不阻断这一轮。
+   切分按 code point，不会劈开代理对。
+
+事故回顾（主线一）：1.6.2 把 `raw.archiveAfterDays` 默认值提到 90，而某 profile 仍是 `raw.retentionDays: 30` 且从未写过
 `archiveAfterDays`。强校验 `archiveAfterDays < retentionDays` 在 `apply()` 内抛 `MEM_E_CONFIG_OUT_OF_RANGE`，
 插件整体不加载 → 所有 `/api/hippocampus/*` 路由缺失 → 设置卡片永远停在“正在启动… / HTTP 404”。
 
@@ -45,8 +76,7 @@
   - `handoff.json` 新增 `tailTurns`（最后 ≤5 轮原话），`[Previous Context Tail]` 优先回放原话；
     `context.coldStartInjectRecentTurns` 默认改为 `true`。
   - 可观测：`/stats` 新增 `coldStart{ pending[], injected, lastSessionId }`。
-- **复习队列真正被消费（现场 337 条到期从未推进）**：`tick()` 的结果此前只进维护报告，
-  `state/reviews.json` 里每条都是 `lastAt: null`、队列只增不减（现场 `total 346 / due 337`）。
+- **复习队列真正被消费（现场 337 条到期从未推进）**：`tick()` 的结果此前只进维护报告，  `state/reviews.json` 里每条都是 `lastAt: null`、队列只增不减（现场 `total 346 / due 337`）。
   现在 `maintain()` 调 `_consumeDueReviews()`：到期 id 分批（`review.consumeBatchSize=40`）
   批量 `reinforce()`（权重 1，强化日志即衰减锚点），**批间 `setImmediate` 让出事件循环**，
   单轮上限 `review.consumeMaxPerRun=200`（报告 `remaining`，跨轮次排空），并用新增的
@@ -64,7 +94,7 @@
   `test/v156.autoSession.test.js` 改写为「移除」契约、`test/v160.coldStart.test.js` 改写为
   「按会话注入」契约。新增 `test/v163.reviewQueue.test.js`（5 例）锁复习消费契约：
   到期被消费且 `step`/`lastAt` 前进、强化数 == 消费数、超预算积压跨轮次排空、
-  `autoConsume:false` 不动队列、整批只写一次文件。全量 **483/483**（78 个测试文件）。
+  `autoConsume:false` 不动队列、整批只写一次文件。全量 **494/494**（79 个测试文件）。
 
 完整历史见 [CHANGELOG.md](../CHANGELOG.md) 的 `[1.6.3]` / `[1.6.2]` / `[1.6.1]` 段。
 
@@ -78,7 +108,7 @@
 
 ```powershell
 cd C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory
-node test/run.mjs                # 期望 483/483
+node test/run.mjs                # 期望 494/494
 cd ..\dsh-orchestrator
 node test/run.mjs                # 期望 31/31
 cd ..\dsh-memory

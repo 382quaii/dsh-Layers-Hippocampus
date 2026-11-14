@@ -14,6 +14,7 @@
  */
 import { decayFactor } from '../decay.js';
 import { readJson, round, snippet, writeJsonAtomic } from '../util.js';
+import { requestPressure, resolveWindow } from './windowGuard.js';
 
 /** Cheap, stable estimate. Do not pretend it is an exact tokeniser. */
 export function estimateTokens(text) {
@@ -29,6 +30,9 @@ export class ContextEngine {
    * @param {number}   [options.autoRolloverThreshold]   fraction of native window that triggers a handoff
    * @param {boolean}  [options.autoRolloverEnabled]     false disables handoff and enables forced eviction
    * @param {Function} [options.getSessionTokens]        () => tokens consumed by the live session
+   * @param {Function} [options.getHostWindow]           () => model-native window from the HOST adapter (v1.6.3)
+   * @param {Function} [options.getHostUsedTokens]       () => host-measured prompt pressure (v1.6.3)
+   * @param {Function} [options.getReservedTokens]       () => completion budget the next request reserves (v1.6.3)
    */
   constructor({
     clock,
@@ -41,6 +45,9 @@ export class ContextEngine {
     autoRolloverThreshold,
     autoRolloverEnabled,
     getSessionTokens,
+    getHostWindow = null,
+    getHostUsedTokens = null,
+    getReservedTokens = null,
   } = {}) {
     this.clock = clock;
     this.getPolicy = getPolicy;
@@ -55,6 +62,15 @@ export class ContextEngine {
     this.rolloverThresholdOverride = Number.isFinite(autoRolloverThreshold) ? autoRolloverThreshold : null;
     this.rolloverEnabledOverride = typeof autoRolloverEnabled === 'boolean' ? autoRolloverEnabled : null;
     this.getSessionTokens = typeof getSessionTokens === 'function' ? getSessionTokens : null;
+    // v1.6.3: the HOST is the authority on the model's real window and on how full the
+    // prompt already is. These probes are optional so the engine still works headless
+    // (tests, legacy hosts) — but when present they override the hand-written
+    // `context.nativeTokenLimit`, which used to be treated as if it were the model
+    // window (a profile with 8000 against a 1,048,576-token model made every ratio
+    // meaningless).
+    this.getHostWindow = typeof getHostWindow === 'function' ? getHostWindow : null;
+    this.getHostUsedTokens = typeof getHostUsedTokens === 'function' ? getHostUsedTokens : null;
+    this.getReservedTokens = typeof getReservedTokens === 'function' ? getReservedTokens : null;
     this.statsFile = statsFile;
     /** @type {Array<object>} insertion-ordered block table */
     this.blocks = [];
@@ -90,9 +106,37 @@ export class ContextEngine {
     };
   }
 
-  get nativeTokenLimit() {
+  /**
+   * v1.6.3: the model's REAL context window, resolved host-first.
+   *
+   * Precedence: host adapter (`llm.resolveModelInfo().context.contextWindow`) >
+   * explicit user override (`context.nativeTokenLimit`) > 8000 legacy fallback.
+   * The user override is still honoured when the host cannot report a window (an
+   * old host or a provider without a catalogue), but it can no longer masquerade as
+   * the model's limit when the host knows better.
+   *
+   * @returns {{ window: number, source: 'host'|'config'|'default', hostWindow: number|null, configuredWindow: number|null }}
+   */
+  get window() {
     const pol = this.getPolicy?.()?.context ?? {};
-    return this.nativeTokenLimitOverride ?? pol.nativeTokenLimit ?? 8000;
+    let hostWindow = null;
+    if (this.getHostWindow) {
+      try {
+        hostWindow = this.getHostWindow();
+      } catch {
+        hostWindow = null;
+      }
+    }
+    return resolveWindow({
+      hostWindow,
+      configuredWindow: this.nativeTokenLimitOverride ?? pol.nativeTokenLimit ?? null,
+      fallback: 8000,
+    });
+  }
+
+  /** Back-compat: the number only. Prefer `window` when the source matters. */
+  get nativeTokenLimit() {
+    return this.window.window;
   }
 
   get rolloverThreshold() {
@@ -108,49 +152,88 @@ export class ContextEngine {
   /**
    * The native/layered decision, derived purely from measurements.
    *
-   * `tokens` is the effective occupancy: the larger of the blocks this engine
-   * tracks and the live session size. A session can be inside the native window
-   * while the engine's own block table is empty (or vice versa), so neither number
-   * alone is the honest answer. `getSessionTokens` is the injection point; a
-   * caller may also pass `sessionTokens` per call.
+   * v1.6.3 rewrite ("fix the denominator AND the formula"):
    *
-   * mode 'native': the model's own window can hold this session; no folding is
-   * allowed (there is nothing to fold into yet). mode 'layered': the session has
-   * outgrown the native window, so the layered memory pipeline may take over.
+   *  - the denominator is `this.window` — the HOST's real model window when the
+   *    host can report one, not the hand-written `context.nativeTokenLimit`;
+   *  - occupancy prefers the HOST's measured prompt pressure (`tokenMeter`, which
+   *    includes system prompt + tool schemas + full history) over our own
+   *    character/4 estimate of captured turns;
+   *  - the decision is made on `used + reserved`, where `reserved` is the completion
+   *    budget the next request will actually ask for. A request whose prompt fits the
+   *    window but whose `max_tokens` pushes the SUM past the limit is rejected by the
+   *    provider — that is exactly the 854,668 + 256,000 > 1,048,576 failure.
    *
-   * `remainingTokens` is headroom to the HANDOFF point (threshold * native), not
-   * to the hard limit: crossing the hard limit is already too late to hand off.
+   * `remainingTokens` is headroom to the HANDOFF point (threshold * window), not to
+   * the hard limit: crossing the hard limit is already too late to hand off.
    *
-   * @param {{ now?: number, sessionTokens?: number }} [options]
+   * @param {{ now?: number, sessionTokens?: number, usedTokens?: number, reservedTokens?: number }} [options]
    */
-  nativeState({ now = this.clock.now(), sessionTokens } = {}) {
+  nativeState({ now = this.clock.now(), sessionTokens, usedTokens, reservedTokens } = {}) {
     void now; // part of the API so callers can pin one timestamp across a snapshot
-    const limit = this.nativeTokenLimit;
+    const resolved = this.window;
+    const limit = resolved.window;
     const threshold = this.rolloverThreshold;
     const enabled = this.rolloverEnabled;
     const reported = Number.isFinite(sessionTokens) ? sessionTokens : this.getSessionTokens?.();
     const session = Number.isFinite(reported) ? reported : 0;
-    const tokens = Math.max(this.tokens(), session);
-    const ratio = round(limit > 0 ? tokens / limit : 0, 4);
-    const handoffThresholdTokens = Math.round(threshold * limit);
+
+    // Host-measured pressure wins; the block table and the session estimate are the
+    // floor (never report less than what we can see ourselves).
+    let hostUsed = Number.isFinite(usedTokens) ? usedTokens : null;
+    if (hostUsed === null && this.getHostUsedTokens) {
+      try {
+        const probed = this.getHostUsedTokens();
+        hostUsed = Number.isFinite(probed) ? probed : null;
+      } catch {
+        hostUsed = null;
+      }
+    }
+    const tokens = Math.max(this.tokens(), session, hostUsed ?? 0);
+
+    let reserved = Number.isFinite(reservedTokens) ? reservedTokens : null;
+    if (reserved === null && this.getReservedTokens) {
+      try {
+        const probed = this.getReservedTokens();
+        reserved = Number.isFinite(probed) ? probed : null;
+      } catch {
+        reserved = null;
+      }
+    }
+    const pressure = requestPressure({
+      usedTokens: tokens,
+      reservedTokens: reserved ?? 0,
+      window: limit,
+      threshold,
+    });
+    const ratio = pressure.ratio;
+    const handoffThresholdTokens = pressure.handoffAtTokens;
     return {
       mode: tokens < limit ? 'native' : 'layered',
       tokens,
-      // Effective occupancy (max of block table and session). `effectiveTokens` is
-      // the canonical name; `sessionTokens` is kept as an alias so existing callers
-      // that read the session-side name keep working.
+      // Effective occupancy (max of block table, session estimate and host pressure).
       effectiveTokens: tokens,
       sessionTokens: tokens,
       nativeTokenLimit: limit,
+      /** Where the window came from: host adapter, user override, or the legacy default. */
+      windowSource: resolved.source,
+      hostWindow: resolved.hostWindow,
+      configuredWindow: resolved.configuredWindow,
       ratio,
+      // The honest decision input: the prompt PLUS what the answer is allowed to be.
+      reservedTokens: pressure.reservedTokens,
+      projectedTokens: pressure.projectedTokens,
+      projectedRatio: pressure.projectedRatio,
+      /** True when `used + reserved` is already at/over the hard window: must not be sent. */
+      hardExceeded: pressure.hardExceeded,
       rolloverThreshold: threshold,
       rolloverEnabled: enabled,
-      rolloverDue: enabled && ratio >= threshold,
+      rolloverDue: enabled && pressure.handoffDue,
       remainingTokens: Math.max(0, Math.ceil(threshold * limit - tokens)),
       // Rollover disabled means no handoff can move the session; once the native
       // window is effectively exhausted (95%) eviction is the only honest option
       // left, and it must be FORCED rather than silently ignored.
-      forceEvictionDue: !enabled && ratio >= 0.95,
+      forceEvictionDue: !enabled && (ratio >= 0.95 || pressure.hardExceeded),
       handoffThresholdTokens,
     };
   }

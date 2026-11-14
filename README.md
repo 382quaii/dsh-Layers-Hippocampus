@@ -83,6 +83,20 @@
   静态「状态唤醒」策略常驻，两个开关都关时也不会退化成客服腔。
 - 交接**不会**自动弹出新对话：交接发生在对话中间，宿主在标记后继续同一对话；是否需要另开
   新对话由用户自己决定（v1.5.6 的 `context.autoNewSession*` 已在 1.6.3 移除）。
+- **窗口分母来自宿主，而不是配置文件**（1.6.3）：真实上限取
+  `llm.resolveModelInfo().context.contextWindow`（或 `tokenMeter.contextPressure().contextWindow`），
+  `context.nativeTokenLimit` 降级为“用户覆盖”，只在宿主无法上报时兜底；
+  `panel.session.windowSource` 会显示这次用的是 `host` / `config` / `default`。
+- **交接判定 = 已用 + 预留输出**：`used_tokens + reserved_completion_tokens >= window × threshold`。
+  已用优先取宿主 `tokenMeter` 的测量值（含系统提示、工具 schema、历史），不再是
+  `字符数 ÷ 4`。**必定放不进窗口的请求会在本地 fail-fast**，抛 `MEM_E_CONTEXT_EXCEEDED`
+  并说明 used / reserved / window，不会发出去再被 API 拒绝。
+- **同会话可续交**：交接后同一对话若压力继续上涨（比上次交接时高 ≥5 个百分点，或投影
+  ≥95% 硬上限），会重新蒸馏交接摘要，不会出现“第一次交接后就再也不交接”。
+- **单轮超大工具输出熔断（Live Compact）**：单个 `tool/result` 超过
+  `context.liveCompact.thresholdChars`（默认 200,000 字符）时，保留头 4000 / 尾 2000 字符，
+  中间压成一行指向 raw 日志的指针（带 `seq` / `call` / `tool` 坐标），原文仍可用
+  `deep_raw` 取回。宿主自带 `toolResultPruner` 时优先交给它。
 
 ### 打破线性增长：压缩 / 编码 / 语义三层
 
@@ -221,7 +235,7 @@ node scripts/wait-for-routes.mjs
 ### 6. 验证
 
 ```bash
-npm test        # 进程内全量用例（483 个）
+npm test        # 进程内全量用例（494 个）
 npm run check   # 语法检查 + 全量测试
 ```
 

@@ -206,7 +206,6 @@ export const DEFAULT_CONFIG = Object.freeze({
     // v1.6.0 cold-start injection switches (user request 2026-11-06):
     //  - summary: inject the previous handoff summary so the first turn inherits context
     //  - recentTurns: inject the last few turns of the handed-off conversation
-    //  - recentTurns: inject the last few turns of the handed-off conversation
     //    (v1.6.3 default ON: a new conversation must not start "blind")
     coldStartInjectSummary: true,
     coldStartInjectRecentTurns: true,
@@ -220,7 +219,23 @@ export const DEFAULT_CONFIG = Object.freeze({
     autoSpaceFollow: false,
     autoRolloverEnabled: true,
     autoRolloverThreshold: 0.85,
+    // v1.6.3: USER OVERRIDE ONLY. The model's real context window comes from the host
+    // adapter (`llm.resolveModelInfo().context.contextWindow`); this value is used only
+    // when the host cannot report one (headless/legacy host). Treating it as the model
+    // window is what made every pressure ratio meaningless (8000 vs 1,048,576).
     nativeTokenLimit: 8000,
+    // v1.6.3 Live Compact: pointerize ONE oversized tool result before the request goes
+    // out. A single turn can otherwise add hundreds of thousands of tokens with no
+    // maintenance tick in between. `thresholdChars` is deliberately large so ordinary
+    // tool output is untouched; the host's own `tool-result-pruner` (ptc preset,
+    // 8192/4096/1024) stays the first line of defence when it exists.
+    liveCompact: {
+      enabled: true,
+      thresholdChars: 200_000,
+      headChars: 4_000,
+      tailChars: 2_000,
+      maxNodesPerRequest: 4,
+    },
     // Security (v1.5.1): moving memories across spaces is NEVER an autonomous
     // decision. While true, the engine refuses a model-initiated transfer unless
     // the tool call carries `user_approved: true`; the UI route is the human
@@ -818,6 +833,33 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
     'context.nativeTokenLimit',
     { min: 512, max: 1_000_000 },
   );
+  // v1.6.3 Live Compact tunables. `thresholdChars` is compared against the total
+  // characters of ONE tool result's text blocks.
+  const liveCompactIn = contextIn.liveCompact ?? {};
+  const liveCompactEnabled = requireBoolean(
+    liveCompactIn.enabled === undefined ? defaults.context.liveCompact.enabled : liveCompactIn.enabled,
+    'context.liveCompact.enabled',
+  );
+  const liveCompactThresholdChars = requireInteger(
+    liveCompactIn.thresholdChars === undefined ? defaults.context.liveCompact.thresholdChars : liveCompactIn.thresholdChars,
+    'context.liveCompact.thresholdChars',
+    { min: 1000, max: 50_000_000 },
+  );
+  const liveCompactHeadChars = requireInteger(
+    liveCompactIn.headChars === undefined ? defaults.context.liveCompact.headChars : liveCompactIn.headChars,
+    'context.liveCompact.headChars',
+    { min: 0, max: 1_000_000 },
+  );
+  const liveCompactTailChars = requireInteger(
+    liveCompactIn.tailChars === undefined ? defaults.context.liveCompact.tailChars : liveCompactIn.tailChars,
+    'context.liveCompact.tailChars',
+    { min: 0, max: 1_000_000 },
+  );
+  const liveCompactMaxNodesPerRequest = requireInteger(
+    liveCompactIn.maxNodesPerRequest === undefined ? defaults.context.liveCompact.maxNodesPerRequest : liveCompactIn.maxNodesPerRequest,
+    'context.liveCompact.maxNodesPerRequest',
+    { min: 1, max: 64 },
+  );
   // Security red line (v1.5.1): default TRUE. Only an explicit operator choice may
   // disable the consent gate; a malformed value is a config error, never "false".
   const contextRequireExplicitConsentForTransfer = requireBoolean(
@@ -1351,6 +1393,13 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
       autoRolloverEnabled: contextAutoRolloverEnabled,
       autoRolloverThreshold: contextAutoRolloverThreshold,
       nativeTokenLimit: contextNativeTokenLimit,
+      liveCompact: {
+        enabled: liveCompactEnabled,
+        thresholdChars: liveCompactThresholdChars,
+        headChars: liveCompactHeadChars,
+        tailChars: liveCompactTailChars,
+        maxNodesPerRequest: liveCompactMaxNodesPerRequest,
+      },
       requireExplicitConsentForTransfer: contextRequireExplicitConsentForTransfer,
     },
     temp: { ttlDays: tempTtlDays, promotionWindowDays: tempPromotionWindowDays },

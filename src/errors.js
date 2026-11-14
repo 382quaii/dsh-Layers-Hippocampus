@@ -134,6 +134,16 @@ export const ErrorCodes = Object.freeze({
    * deterministic fallback tag instead of failing the maintenance pass.
    */
   SEMANTIC_TAG_REQUIRED: 'MEM_E_SEMANTIC_TAG_REQUIRED',
+
+  // ---- v1.6.3 context-window guard (Live Compact) ------------------------
+  /**
+   * The next request provably cannot fit the model's REAL context window
+   * (`used + reservedCompletion > window`). Thrown from the `agent/request`
+   * middleware BEFORE the request is sent, so the user sees a local, explicit
+   * failure instead of the provider answering `CONTEXT_WINDOW_EXCEEDED` after
+   * paying for the prompt.
+   */
+  CONTEXT_EXCEEDED: 'MEM_E_CONTEXT_EXCEEDED',
 });
 
 export class MemoryError extends Error {

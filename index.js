@@ -41,6 +41,7 @@ import { HostBridge } from './src/hostBridge.js';
 import { isLowValley, nextLowValleyStart, windowInfo } from './src/priceWindow.js';
 import { DreamTimer } from './src/dreamTimer.js';
 import { probeCompression, resolveEngine } from './src/compression.js';
+import { LIVE_COMPACT_DEFAULTS, liveCompactSession } from './src/context/liveCompact.js';
 import { MEMORY_API, registerMemoryRoutes } from './src/webRoutes.js';
 
 export const name = 'memory';
@@ -190,6 +191,30 @@ function defineTool(definition) {
  * because it owns the plugin's lifecycle contracts; the store itself is src/.
  */
 export function createRuntime({ ctx = null, config, options, clock, raw = null, orchestrator = null, timers = null }) {
+  // v1.6.3: the HOST is the authority on the model window and on measured prompt
+  // pressure. The engine probes are SYNCHRONOUS (they are called while computing a
+  // status/decide value), so these hold the most recent HOST-observed numbers; the
+  // `agent/request` middleware refreshes them before every call.
+  const hostProbes = {
+    /** @type {{ provider: string, model: string, window: number } | null} */
+    window: null,
+    /** Prompt tokens the host measured for the live request (pressure, no output). */
+    usedTokens: null,
+    /** Completion tokens the pending request reserves (its max_tokens). */
+    reservedTokens: null,
+    updatedAt: null,
+    lastError: null,
+  };
+  const withHostProbes = (targetOptions) => ({
+    ...targetOptions,
+    config: {
+      ...targetOptions.config,
+      getHostWindow: () => hostProbes.window?.window ?? null,
+      getHostUsedTokens: () => hostProbes.usedTokens,
+      getReservedTokens: () => hostProbes.reservedTokens,
+    },
+  });
+  options = withHostProbes(options);
   // v1.5.6 physical split: multi-space lives in dsh-orchestrator. `orchestrator` is a
   // test/embedding override; the Host supplies the real service through `ctx.get`.
   const orchestratorService = () => orchestrator ?? ctx?.get?.('orchestrator') ?? null;
@@ -720,6 +745,148 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     }
     const error = runtime.phaseError ? ` — ${asMemoryError(runtime.phaseError).code}` : '';
     return `Memory state: ${runtime.phase}${error} (not ready: memory tools answer MEM_E_NOT_READY).`;
+  };
+
+  /**
+   * v1.6.3 — the per-request gate. Runs BEFORE the provider call (the `agent/request`
+   * listener above) and does three things, in this order:
+   *
+   *  1. **Live Compact**: one oversized `tool/result` is pointerized (head + tail kept,
+   *     middle replaced by a pointer carrying the durable raw coordinates). This is the
+   *     only defence against a SINGLE turn that adds hundreds of thousands of tokens —
+   *     no threshold-based maintenance tick can react fast enough.
+   *  2. **Refresh the host probes** so the engine's denominator (real model window) and
+   *     numerator (host-measured pressure) stop being guesses.
+   *  3. **Fail fast** when `used + reserved` already exceeds the model window. The API
+   *     would reject the same request a moment later, after the tokens were spent and
+   *     without telling the state machine anything; a handoff is attempted first so the
+   *     next turn starts from a distilled tail instead of the same brick wall.
+   *
+   * Everything here is best-effort EXCEPT the deliberate `MEM_E_CONTEXT_EXCEEDED`.
+   *
+   * @param {{ agent?: object, config?: object, signal?: object }} input
+   */
+  runtime.guardRequest = async ({ agent = null, config: requestConfig = null, signal = null } = {}) => {
+    const session = agent?.session ?? null;
+    // ---- 1. Live Compact ---------------------------------------------------
+    const liveConfig = runtime.config?.context?.liveCompact ?? {};
+    if (liveConfig.enabled !== false && session) {
+      // The HOST owns the canonical pruner (`tool-result-pruner`, replay-safe, wired
+      // into the ptc preset). Delegate when present; only fall back to our own
+      // surface surgery when the host has no pruner at all.
+      const hostPruner = (() => {
+        try {
+          return ctx?.get?.('toolResultPruner') ?? null;
+        } catch {
+          return null;
+        }
+      })();
+      if (hostPruner && typeof hostPruner.pruneSession === 'function') {
+        try {
+          await hostPruner.pruneSession(session);
+          runtime.lastLiveCompact = { source: 'host', at: memory.clock.now() };
+        } catch (error) {
+          runtime.logger?.warn?.(`hippocampus: host live-compact failed: ${asMemoryError(error).code}`);
+        }
+      } else {
+        runtime.lastLiveCompact = {
+          source: 'hippocampus',
+          at: memory.clock.now(),
+          ...liveCompactSession(session, {
+            thresholdChars: liveConfig.thresholdChars ?? LIVE_COMPACT_DEFAULTS.thresholdChars,
+            headChars: liveConfig.headChars ?? LIVE_COMPACT_DEFAULTS.headChars,
+            tailChars: liveConfig.tailChars ?? LIVE_COMPACT_DEFAULTS.tailChars,
+            maxNodesPerRequest: liveConfig.maxNodesPerRequest ?? LIVE_COMPACT_DEFAULTS.maxNodesPerRequest,
+            logger: runtime.logger,
+          }),
+        };
+      }
+    }
+
+    // ---- 2. refresh the probes --------------------------------------------
+    const provider = requestConfig?.provider ?? null;
+    const model = requestConfig?.model ?? null;
+    const reserved = Number.isFinite(requestConfig?.maxTokens) ? requestConfig.maxTokens : null;
+    if (provider && model) {
+      const llm = (() => {
+        try {
+          return ctx?.get?.('llm') ?? null;
+        } catch {
+          return null;
+        }
+      })();
+      if (llm && typeof llm.resolveModelInfo === 'function') {
+        try {
+          const info = await llm.resolveModelInfo(provider, model, signal ?? undefined);
+          const window = info?.context?.contextWindow ?? null;
+          if (Number.isFinite(window) && window > 0) {
+            hostProbes.window = { provider, model, window: Math.round(window) };
+          }
+          if (Number.isFinite(info?.defaultMaxTokens)) {
+            // The adapter's own default is what an unspecified request asks for.
+            hostProbes.reservedTokens = reserved ?? info.defaultMaxTokens;
+          }
+        } catch (error) {
+          hostProbes.lastError = asMemoryError(error).code;
+        }
+      }
+    }
+    if (reserved !== null) hostProbes.reservedTokens = reserved;
+    const tokenMeter = (() => {
+      try {
+        return ctx?.get?.('tokenMeter') ?? null;
+      } catch {
+        return null;
+      }
+    })();
+    if (tokenMeter && session && typeof tokenMeter.contextPressure === 'function') {
+      try {
+        const pressure = tokenMeter.contextPressure(session) ?? {};
+        // `pressureTokens` is input + cache read/write; `projectedTokens` may already
+        // include the pending completion. Prefer the larger — under-reporting is what
+        // let 854k tokens look small.
+        const candidates = [pressure.pressureTokens, pressure.projectedTokens].filter((value) => Number.isFinite(value));
+        if (candidates.length > 0) hostProbes.usedTokens = Math.max(...candidates);
+        if (Number.isFinite(pressure.contextWindow) && pressure.contextWindow > 0 && !hostProbes.window) {
+          hostProbes.window = { provider: provider ?? 'host', model: model ?? 'host', window: Math.round(pressure.contextWindow) };
+        }
+      } catch (error) {
+        hostProbes.lastError = asMemoryError(error).code;
+      }
+    }
+    hostProbes.updatedAt = memory.clock.now();
+
+    // ---- 3. fail fast on a request that CANNOT fit -------------------------
+    const state = memory.context.nativeState({
+      usedTokens: hostProbes.usedTokens ?? undefined,
+      reservedTokens: hostProbes.reservedTokens ?? undefined,
+    });
+    if (!state.hardExceeded) return state;
+    // Try to hand off first: even though it cannot shrink THIS request, it leaves a
+    // distilled tail for the next one instead of repeating the same failure.
+    let handoff = null;
+    try {
+      handoff = await memory.checkHandoff({ now: memory.clock.now() });
+    } catch {
+      /* the fail-fast below is the contract; a failed handoff only degrades recovery */
+    }
+    throw new MemoryError(
+      ErrorCodes.CONTEXT_EXCEEDED,
+      `request does not fit the model window: ${state.projectedTokens} tokens (prompt ${state.tokens} + reserved ${state.reservedTokens}) ` +
+        `>= ${state.nativeTokenLimit} (window source: ${state.windowSource}). ` +
+        'Nothing was sent to the provider. Compact the conversation (host compaction) or start a new one; ' +
+        'the handoff summary for the tail is available for the next conversation.',
+      {
+        usedTokens: state.tokens,
+        reservedTokens: state.reservedTokens,
+        projectedTokens: state.projectedTokens,
+        window: state.nativeTokenLimit,
+        windowSource: state.windowSource,
+        ratio: state.ratio,
+        handoff: handoff?.handoff?.summaryEventId ?? null,
+        liveCompact: runtime.lastLiveCompact ?? null,
+      },
+    );
   };
 
   /**
@@ -1809,6 +1976,27 @@ export async function apply(ctx, rawConfig = {}) {
     if (typeof bus.on === 'function') {
       bus.on('session/event', captureListener);
       disposers.push(() => bus.off?.('session/event', captureListener));
+    }
+
+    // ---- v1.6.3: the request gate (Live Compact + fail-fast) ----------------
+    // Runs as a plain (non-prepend) listener so it observes the FINAL routed config:
+    // `await next()` returns `{provider, model, maxTokens}` for THIS call, and the
+    // provider call happens after the chain resolves — throwing here aborts the
+    // request instead of letting it be rejected by the API after the tokens are spent.
+    const requestGuard = async ({ agent, signal }, next) => {
+      const requestConfig = await next();
+      if (!requestConfig || signal?.aborted) return requestConfig;
+      try {
+        await runtime.guardRequest({ agent, config: requestConfig, signal });
+      } catch (error) {
+        if (error instanceof MemoryError) throw error;
+        runtime.logger?.warn?.(`hippocampus: request guard skipped: ${asMemoryError(error).code}: ${error?.message ?? error}`);
+      }
+      return requestConfig;
+    };
+    if (typeof bus.on === 'function') {
+      bus.on('agent/request', requestGuard);
+      disposers.push(() => bus.off?.('agent/request', requestGuard));
     }
 
     const guard = (operation) => {

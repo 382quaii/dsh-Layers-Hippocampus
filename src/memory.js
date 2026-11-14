@@ -51,6 +51,7 @@ import {
 import { SemanticStore } from './semantic/semanticStore.js';
 import { TempSemanticStore } from './semantic/tempSemantic.js';
 import { ContextEngine } from './context/contextEngine.js';
+import { rehandoffDecision } from './context/windowGuard.js';
 import { DEFAULT_SPACE_ID, SpaceRouter, normaliseSpaceId, validateNewSpaceId } from './spaces/singleSpace.js';
 import { nextRun, parseCron } from './cron.js';
 
@@ -452,13 +453,19 @@ export class Memory {
       maxTokens: config.context?.maxTokens,
       threshold: config.context?.threshold,
       target: config.context?.target,
-      // v1.5.0: pure physical-layer context accounting. `nativeTokenLimit` is the
-      // model's native window (Qwen mode): below it nothing is folded; the rollover
-      // threshold is measured against it, not against the memory-block budget.
+      // v1.5.0: pure physical-layer context accounting. `nativeTokenLimit` is a USER
+      // OVERRIDE only (v1.6.3): the model's real window comes from the host adapter
+      // through `getHostWindow` (see index.js), and this value is the fallback when
+      // the host cannot report one.
       nativeTokenLimit: config.context?.nativeTokenLimit,
       autoRolloverThreshold: config.context?.autoRolloverThreshold,
       autoRolloverEnabled: config.context?.autoRolloverEnabled,
       getSessionTokens: () => this.sessionUsage().tokens,
+      // v1.6.3: the three host probes. All optional: a headless/legacy host leaves them
+      // null and the engine degrades to the configured window and its own estimate.
+      getHostWindow: typeof config.getHostWindow === 'function' ? config.getHostWindow : null,
+      getHostUsedTokens: typeof config.getHostUsedTokens === 'function' ? config.getHostUsedTokens : null,
+      getReservedTokens: typeof config.getReservedTokens === 'function' ? config.getReservedTokens : null,
       statsFile: path.join(this.paths.state, 'context.json'),
     });
     this.deletePipeline = new DeletePipeline({
@@ -1866,7 +1873,28 @@ export class Memory {
       return { ...base, handoff: this.handoffState(), forcedEviction };
     }
     if (!native.rolloverDue) return base;
-    if (marker.active) return base;
+    // v1.6.3: a marker that is still ACTIVE in the SAME session used to return early
+    // forever. With the client-side "open a new conversation" controller removed, the
+    // session id no longer changes on handoff — so the first handoff permanently bricked
+    // the state machine and every later threshold crossing was silently ignored
+    // ("80% never triggered autoHandoff").
+    //
+    // Now an active marker re-handoffs when the pressure has materially GROWN past the
+    // previous handoff's ratio (or we are about to hit the hard limit). The previous
+    // marker is consumed first, so the new one describes the current tail, not the tail
+    // that was already distilled.
+    let rehandoff = null;
+    if (marker.active) {
+      const sameSession = !marker.sessionId || !usage.sessionId || marker.sessionId === usage.sessionId;
+      rehandoff = rehandoffDecision({
+        markerRatio: Number.isFinite(marker.ratio) ? marker.ratio : null,
+        projectedRatio: Number.isFinite(native.projectedRatio) ? native.projectedRatio : native.ratio,
+        sameSession,
+      });
+      if (!rehandoff.rehandoff) return { ...base, rehandoff };
+      this.clearHandoff({ reason: 'rehandoff', consumedBy: usage.sessionId });
+      marker = this.handoffState();
+    }
 
     let distilled = null;
     let failure = null;
@@ -1921,7 +1949,7 @@ export class Memory {
       ensureDir(this.paths.state);
       writeJsonAtomic(this.handoffPath(), next);
       this._markBriefingDirty();
-      return { ...base, handoff: next, distilled, failure };
+      return { ...base, handoff: next, distilled, failure, rehandoff };
     } catch (error) {
       // Marker write must never reject the caller. Report a degraded result and let
       // the host proceed; the next session still resets its own baseline.
@@ -2741,6 +2769,13 @@ export class Memory {
           mode: native.mode,
           tokens: native.tokens,
           nativeTokenLimit: native.nativeTokenLimit,
+          // v1.6.3: make the denominator auditable — a window that came from the config
+          // override instead of the host adapter is exactly what hid the 1M overflow.
+          windowSource: native.windowSource ?? null,
+          hostWindow: native.hostWindow ?? null,
+          projectedTokens: native.projectedTokens ?? null,
+          reservedTokens: native.reservedTokens ?? null,
+          hardExceeded: native.hardExceeded === true,
           threshold: native.rolloverThreshold,
           ratio: native.ratio,
           remainingTokens: native.remainingTokens,
