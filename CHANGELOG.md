@@ -19,6 +19,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     回报各阶段计数；已在运行时直接拒绝而不是排队。
   - `/memory status`：事件数、L3 摘要数、活跃标签列表、会话 token 与窗口来源
     （`host`/`config`/`default`）、静默状态、冷启动队列长度。
+    这些数字全部取自面板同一份契约（`panel.global.*` + 索引快照的活跃集合），
+    不再各自拼字段——早期实现读错了契约，导致整行显示成 `?`。
   - `/memory mute` / `/memory unmute`：紧急静默 `[Memory Hints]`。静音时**不消费标签**，
     所以解除后提示会原样回来，而不是被会话级去重池吃掉。
 - **Fixed — 月记与 Dream 重复咀嚼同一批日记**。L2.5 月记原本挂在 `maintain()` 上，与

@@ -2816,19 +2816,28 @@ export async function apply(ctx, rawConfig = {}) {
 
       if (verb === 'status') {
         if (runtime.phase !== 'ready') return fail(`记忆引擎状态：${runtime.phase}${runtime.phaseError ? `（${asMemoryError(runtime.phaseError).code}）` : ''}`);
-        const payload = runtime.uiPayload();
-        const panel = payload.panel ?? {};
+        const payload = await runtime.uiPayload();
+        const panel = payload?.panel ?? {};
+        // `/memory status` must read the SAME contract the panel does. `panel.global`
+        // holds the counters; `activeTags` there is a NUMBER, and the tag NAMES live in
+        // the index snapshot's active set.
+        const global = panel.global ?? {};
         const session = panel.session ?? {};
-        const activeTags = (panel.activeTags ?? payload.panel?.activeSet?.entries ?? []).slice?.(0, 8) ?? [];
-        const tagList = activeTags.map((entry) => (typeof entry === 'string' ? entry : entry.tag)).filter(Boolean);
+        const snapshot = runtime.memory?.indexManager?.snapshot?.();
+        const tagList = (snapshot?.activeSet?.entries ?? [])
+          .slice()
+          .sort((left, right) => (right.eventCount ?? 0) - (left.eventCount ?? 0))
+          .slice(0, 8)
+          .map((entry) => entry.tag)
+          .filter(Boolean);
         return ok(
           [
             `记忆引擎：ready（v${CAPABILITIES.version}）`,
-            `事件 ${panel.events?.total ?? '?'} 条 · L3 摘要 ${panel.semanticSummaries ?? '?'} 条 · 活跃标签 ${panel.activeTags?.length ?? tagList.length} 个`,
-            `会话 ${session.sessionId ?? '未知'} · 估算 ${session.tokens ?? 0} / 窗口 ${session.nativeTokenLimit ?? '?'}（来源 ${session.windowSource ?? 'config'}）`,
-            tagList.length ? `活跃标签：${tagList.join('、')}` : '活跃标签：无',
-            `[Memory Hints]：${runtime.hintsMuted ? '已静默' : '开启'}`,
-            `冷启动待注入 ${runtime.coldStart.pending.size} 条 / 已注入 ${runtime.coldStart.injected.size} 次`,
+            `事件 ${global.events ?? '?'} 条 · L3 摘要 ${global.semanticSummaries ?? '?'} 条 · 活跃标签 ${global.activeTags ?? '?'} 个（上限 ${runtime.config?.activeSet?.cap ?? '?'}）`,
+            `会话 ${session.sessionId ?? '未知'} · 已用 ${session.tokens ?? 0} + 预留 ${session.reservedTokens ?? 0} = ${session.projectedTokens ?? 0} / 窗口 ${session.nativeTokenLimit ?? '?'}（来源 ${session.windowSource ?? 'config'}）`,
+            `交接标记：${session.handoffActive ? `active（${session.handoffAt ?? '?'}）` : '无'} · 冷启动待注入 ${runtime.coldStart.pending.size} 条 / 已注入 ${runtime.coldStart.injected.size} 次`,
+            tagList.length ? `活跃标签 Top：${tagList.join('、')}` : '活跃标签：无',
+            `[Memory Hints]：${runtime.hintsMuted ? '已静默（/memory unmute 恢复）' : '开启'}`,
           ].join('\n'),
         );
       }
