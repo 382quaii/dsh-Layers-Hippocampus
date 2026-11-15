@@ -7,7 +7,7 @@
 
 | | |
 | --- | --- |
-| 版本 | **1.6.4** |
+| 版本 | **1.6.5** |
 | 包名 | `dsh-layers-hippocampus` |
 | 仓库 | <https://github.com/382quaii/dsh-Layers-Hippocampus> |
 | 许可证 | MIT |
@@ -98,6 +98,28 @@
   中间压成一行指向 raw 日志的指针（带 `seq` / `call` / `tool` 坐标），原文仍可用
   `deep_raw` 取回。宿主自带 `toolResultPruner` 时优先交给它。
 
+### `/memory` 指令集（0 Token）
+
+引擎半侧不驱动对话：它只提供存储、检索、蒸馏和纯文本指令。四条子命令通过宿主的
+`commands` 服务注册，`commands.execute()` 的语义是「执行已知命令、**不发给模型**」，
+所以它们**不消耗任何模型 Token**（测试用 `fetch` 调用计数断言为 0）。
+
+| 指令 | 作用 |
+|---|---|
+| `/memory resume` | 拉取上一次交接摘要并**强制重新注入**当前上下文（绕过“每会话只注入一次”的去重） |
+| `/memory maintain` | 立即触发一次后台维护：索引重建 / 月记 / L2 合并 / Dream / 冷归档，并回报各阶段计数 |
+| `/memory status` | 事件数、L3 摘要数、活跃标签、会话 token 与窗口来源、静默状态、冷启动队列 |
+| `/memory mute` / `unmute` | 紧急静默 / 恢复 `[Memory Hints]`；静音期间不消费标签，解除后提示原样回来 |
+
+外部插件要自己决定「什么时候续上」时，用原子服务接口而不是解析提示词：
+
+```js
+const summary = ctx.get('hippocampus').getLatestHandoffSummary();
+// { active, state, at, sessionId, summaryEventId, agentPreset, tailTurns, text, found }
+```
+
+该接口纯读：不装配 prompt、不消费交接标记、无副作用。
+
 ### 打破线性增长：压缩 / 编码 / 语义三层
 
 append-only 日志天然是 O(n)，只压不改斜率。三层各自掰弯一段曲线：
@@ -164,7 +186,7 @@ raw 层提供三档，覆盖从“只留关键”到“全留”：
 pnpm add dsh-layers-hippocampus
 
 # 或从 GitHub 指定 tag
-pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.4"
+pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.5"
 ```
 
 ### 2. 挂到 profile
@@ -235,7 +257,7 @@ node scripts/wait-for-routes.mjs
 ### 6. 验证
 
 ```bash
-npm test        # 进程内全量用例（494 个）
+npm test        # 进程内全量用例（502 个）
 npm run check   # 语法检查 + 全量测试
 ```
 

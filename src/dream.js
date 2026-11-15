@@ -330,9 +330,19 @@ export class DreamEngine {
     const rawEvents = view?.events;
     const events = rawEvents instanceof Map ? [...rawEvents.values()] : Array.isArray(rawEvents) ? rawEvents : [];
     const merged = new Set(this._load().mergedEventIds);
+    // v1.6.5: monthly memos are condensed FIRST by `executeDream()`, so anything they
+    // already absorbed is off-limits here — otherwise the same L2 diaries would be
+    // paid for twice (one memo write plus one per-tag LLM distillation).
+    const promotedMonthly =
+      typeof this.memory.promotedToMonthly === 'function' ? this.memory.promotedToMonthly() : new Set();
     const byTag = new Map();
+    let skippedPromoted = 0;
     for (const event of events) {
       if (!event || typeof event.eventId !== 'string' || merged.has(event.eventId)) continue;
+      if (promotedMonthly.has(event.eventId)) {
+        skippedPromoted += 1;
+        continue;
+      }
       const names = (event.tags ?? []).map(tagName).filter(Boolean);
       if (names.includes(DREAM_TAG) || names.some(isInternalTag)) continue;
       for (const tag of new Set(names)) {
@@ -340,10 +350,14 @@ export class DreamEngine {
         byTag.get(tag).push(event);
       }
     }
-    return [...byTag.entries()]
+    // `skippedPromoted` rides along on the array so `run()` can report it without a
+    // second pass over the whole event set.
+    const groups = [...byTag.entries()]
       .filter(([, list]) => list.length >= config.minGroupSize)
       .map(([tag, list]) => ({ tag, events: list }))
       .sort((a, b) => b.events.length - a.events.length || a.tag.localeCompare(b.tag));
+    Object.defineProperty(groups, 'skippedPromoted', { value: skippedPromoted, enumerable: false });
+    return groups;
   }
 
   async _callLlm({ tag, sources, config, now }) {
@@ -515,6 +529,10 @@ export class DreamEngine {
         status: 'ok',
         now,
         groups: groups.length,
+        // v1.6.5: how many events the monthly memo already absorbed (they are NOT in
+        // any group here). Non-zero is healthy: it means the scheduler ran monthly
+        // first and Dream was spared a second pass over the same material.
+        skippedPromoted: groups.skippedPromoted ?? 0,
         merged: 0,
         llmSuccess: 0,
         llmFallback: 0,

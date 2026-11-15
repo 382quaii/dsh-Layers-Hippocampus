@@ -62,7 +62,7 @@ export { resolveConfig, DEFAULT_CONFIG };
  * of letting a raw 404 reach the user.
  */
 export const CAPABILITIES = Object.freeze({
-  version: '1.6.4',
+  version: '1.6.5',
   spaces: true,
   memories: true,
   transferConsent: true,
@@ -439,6 +439,8 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
    *     conversation arms its own pending entry on its first captured turn.
    */
   runtime.coldStart = { pending: new Map(), injected: new Set(), lastSessionId: null };
+  /** v1.6.5 `/memory mute`: emergency switch that silences [Memory Hints] only. */
+  runtime.hintsMuted = false;
   const COLD_START_INJECTED_LIMIT = 64;
   const COLD_START_PENDING_LIMIT = 8;
   const COLD_START_PENDING_TTL_MS = 5 * 60_000;
@@ -549,9 +551,28 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     return entry;
   };
 
+  /**
+   * v1.6.5 `/memory resume`: force ONE more cold-start injection for this conversation.
+   *
+   * The automatic path deliberately injects at most once per `session|handoff-epoch`
+   * (a re-injection on every turn would be pure prompt noise). An explicit user
+   * command overrules that: the recorded delivery is forgotten, then the entry is
+   * re-armed with reason `command-resume`, so the NEXT prompt assembly replays the
+   * summary + tail exactly once more.
+   */
+  runtime.armColdStartNow = ({ sessionId = null, agentId = null, source = 'command-resume' } = {}) => {
+    const handoff = memory.handoffState();
+    if (!handoff?.summaryEventId) return null;
+    const epoch = `${handoff.at ?? 0}:${handoff.summaryEventId}`;
+    const key = `${sessionId ?? agentId ?? 'unknown'}|${epoch}`;
+    runtime.coldStart.injected.delete(key);
+    const armed = runtime.noteColdStart({ sessionId, agentId, source });
+    if (armed) armed.at = memory.clock.now();
+    return armed ?? null;
+  };
+
   /** Drop pendings that were never consumed (a conversation that never assembled). */
-  runtime.pruneColdStartPendings = () => {
-    const pendings = runtime.coldStart.pending;
+  runtime.pruneColdStartPendings = () => {    const pendings = runtime.coldStart.pending;
     if (pendings.size === 0) return 0;
     const now = memory.clock.now();
     let dropped = 0;
@@ -687,17 +708,23 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       const view = memory.indexManager.snapshot();
       const entries = view?.activeSet?.entries ?? [];
       const activeTags = entries.map((entry) => ({ tag: entry.tag, count: entry.eventCount ?? 0 }));
+      // v1.6.5 `/memory mute`: emergency silence for [Memory Hints]. Tags are NOT
+      // consumed while muted, so unmuting restores the same hints instead of losing
+      // them to the session-level dedup pool.
+      const hintsMuted = runtime.hintsMuted === true;
       // v1.5.6: relevance-first hints; short inputs ("继续"/"在吗") fall back to the
       // previous turn's matched tags so the model still gets a thread to pull.
-      const selected = selectRelevantTags({
-        text: runtime.lastUserText,
-        activeTags,
-        fallbackTags: runtime.lastHintTags,
-      });
+      const selected = hintsMuted
+        ? []
+        : selectRelevantTags({
+            text: runtime.lastUserText,
+            activeTags,
+            fallbackTags: runtime.lastHintTags,
+          });
       const freshTags = selected.filter((tag) => !runtime.injection.tags.has(tag));
       for (const tag of freshTags) runtime.injection.tags.add(tag);
       if (selected.length > 0) runtime.lastHintTags = selected;
-      const hints = renderMemoryHints(freshTags, { toolName: `${config.toolPrefix}_recall` });
+      const hints = hintsMuted ? '' : renderMemoryHints(freshTags, { toolName: `${config.toolPrefix}_recall` });
 
       // v1.5.6: [Active Task] is unconditional when a handoff summary or a `task:`
       // event exists — injected once per session.
@@ -1278,6 +1305,39 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       summaryEventId: handoff?.summaryEventId ?? null,
       agentPreset: runtime.agentPreset ?? null,
     };
+  };
+
+  /**
+   * v1.6.5: the ATOMIC read model an outside router plugin needs — no prompt
+   * assembly, no session bookkeeping, no side effects.
+   *
+   * `text` is the distilled handoff summary itself (not the marker), so a caller can
+   * paste it into its own UI or prompt; `tailTurns` carries the last few verbatim
+   * turns when the marker has them. A marker that exists but whose summary event is
+   * not in the index yet returns `text: null` instead of pretending there is one.
+   */
+  runtime.latestHandoffSummary = () => {
+    const handoff = memory.handoffState();
+    const base = {
+      active: handoff?.active === true,
+      state: handoff?.state ?? null,
+      at: handoff?.at ?? null,
+      sessionId: handoff?.sessionId ?? null,
+      summaryEventId: handoff?.summaryEventId ?? null,
+      agentPreset: handoff?.agentPreset ?? runtime.agentPreset ?? null,
+      tailTurns: Array.isArray(handoff?.tailTurns) ? handoff.tailTurns.map((turn) => ({ ...turn })) : [],
+      text: null,
+      found: false,
+    };
+    if (!handoff?.summaryEventId) return base;
+    try {
+      const events = memory.indexManager.snapshot()?.events ?? [];
+      const event = events.find((entry) => entry?.eventId === handoff.summaryEventId);
+      if (!event?.content) return base;
+      return { ...base, text: String(event.content).slice(0, 4000), found: true };
+    } catch {
+      return base;
+    }
   };
 
   /** "＋ 新建空间": creates the child store lazily, then returns the updated list. */
@@ -2596,7 +2656,7 @@ export async function apply(ctx, rawConfig = {}) {
         /** false after this plugin fiber is disposed; callers must re-resolve the service. */
         available: !serviceDisposed,
         l3Traits: 10,
-        service: { remember: true, recall: true, maintenance: true, handoff: true, promptState: true, stats: true },
+        service: { remember: true, recall: true, maintenance: true, handoff: true, promptState: true, stats: true, latestHandoffSummary: true },
       }),
       async remember(input = {}) {
         if (serviceDisposed) throw new MemoryError(ErrorCodes.SERVICE_DISPOSED, 'hippocampus service is disposed');
@@ -2675,6 +2735,11 @@ export async function apply(ctx, rawConfig = {}) {
         return runtime.uiPayload();
       },
       handoffView: () => (serviceDisposed ? null : runtime.handoffView()),
+      /**
+       * v1.6.5: atomic accessor for external router plugins. Read-only, no prompt
+       * assembly and no handoff consumption — the caller decides what to do with it.
+       */
+      getLatestHandoffSummary: () => (serviceDisposed ? null : runtime.latestHandoffSummary()),
       promptState: () => (serviceDisposed ? null : runtime.promptState()),
       onDispose(callback) {
         if (typeof callback !== 'function') return () => {};
@@ -2687,6 +2752,113 @@ export async function apply(ctx, rawConfig = {}) {
     };
     if (typeof ctx.provide === 'function') {
       disposers.push(ctx.provide('hippocampus', hippocampusService));
+    }
+
+    /**
+     * v1.6.5 — `/memory` command set.
+     *
+     * The host executes a registered command WITHOUT sending it to the model
+     * (`commands.execute()` is documented as "parse and execute a known command
+     * without sending it to the model"), so every sub-command below costs **zero
+     * model tokens**. They only return plain text to the UI.
+     *
+     * The registration is OPTIONAL on purpose: `ctx.get('commands')` is probed, so a
+     * host without the command service still loads this plugin (the memory core does
+     * not depend on the UI half).
+     */
+    const MEMORY_COMMAND_HELP = [
+      '用法：/memory <resume|maintain|status|mute|unmute>',
+      '  resume   拉取上一次交接摘要并注入当前上下文（不计入模型 Token）',
+      '  maintain 立即触发一次后台维护（索引重建 / 冷热归档 / 蒸馏）',
+      '  status   查看当前记忆规模、活跃标签与会话压力',
+      '  mute     静默 [Memory Hints] 注入（紧急降噪）',
+      '  unmute   恢复 [Memory Hints] 注入',
+    ].join('\n');
+
+    runtime.memoryCommand = async (invocation) => {
+      const raw = String(invocation?.rawInput ?? '').trim();
+      const [verbRaw, ...rest] = raw.split(/\s+/);
+      const verb = (verbRaw ?? '').toLowerCase();
+      const sessionId = runtime.memory?.sessionUsage?.()?.sessionId ?? null;
+      const agentId = invocation?.agent?.id ?? null;
+      const ok = (text) => ({ kind: 'success', text });
+      const fail = (text) => ({ kind: 'error', text });
+
+      if (verb === '' || verb === 'help') return ok(MEMORY_COMMAND_HELP);
+
+      if (verb === 'resume') {
+        const summary = runtime.latestHandoffSummary();
+        if (!summary?.summaryEventId) return fail('没有可恢复的交接摘要：尚未发生过交接。');
+        // Re-arm the cold-start injection for THIS conversation even if it was already
+        // delivered once — an explicit command outranks the once-per-epoch dedupe.
+        runtime.armColdStartNow({ sessionId, agentId, source: 'command-resume' });
+        const head = summary.found
+          ? `已注入上一次交接摘要（${summary.summaryEventId}${summary.active ? '，交接标记仍 active' : ''}）。`
+          : `交接摘要事件 ${summary.summaryEventId} 暂不在索引中（可能尚未重建），已请求重新注入。`;
+        const tail = summary.tailTurns?.length ? `\n附带上一次对话最后 ${summary.tailTurns.length} 轮原话。` : '';
+        return ok(head + tail);
+      }
+
+      if (verb === 'maintain') {
+        if (rest.length > 0 && rest[0] !== 'now') return fail('用法：/memory maintain');
+        if (runtime.phase !== 'ready') return fail(`记忆引擎尚未就绪（${runtime.phase}），稍后再试。`);
+        if (runtime.maintenanceInFlight) return fail('维护已在运行中，本次请求被忽略。');
+        const result = await runtime.runMaintenance('manual');
+        const report = result?.report ?? {};
+        const parts = ['维护完成：'];
+        if (report.logGen) parts.push(`日志代 ${report.logGen} / 索引代 ${report.indexGen}`);
+        if (report.monthly) parts.push(`月记 ${report.monthly.generated} 条`);
+        if (report.l2Merge) parts.push(`L2 合并 ${report.l2Merge.merged ?? 0} 组`);
+        if (report.dream) parts.push(`Dream ${report.dream.merged ?? 0} 条`);
+        if (report.rawArchive) parts.push(`冷归档 ${report.rawArchive.archived ?? 0} 个`);
+        return ok(parts.join('；'));
+      }
+
+      if (verb === 'status') {
+        if (runtime.phase !== 'ready') return fail(`记忆引擎状态：${runtime.phase}${runtime.phaseError ? `（${asMemoryError(runtime.phaseError).code}）` : ''}`);
+        const payload = runtime.uiPayload();
+        const panel = payload.panel ?? {};
+        const session = panel.session ?? {};
+        const activeTags = (panel.activeTags ?? payload.panel?.activeSet?.entries ?? []).slice?.(0, 8) ?? [];
+        const tagList = activeTags.map((entry) => (typeof entry === 'string' ? entry : entry.tag)).filter(Boolean);
+        return ok(
+          [
+            `记忆引擎：ready（v${CAPABILITIES.version}）`,
+            `事件 ${panel.events?.total ?? '?'} 条 · L3 摘要 ${panel.semanticSummaries ?? '?'} 条 · 活跃标签 ${panel.activeTags?.length ?? tagList.length} 个`,
+            `会话 ${session.sessionId ?? '未知'} · 估算 ${session.tokens ?? 0} / 窗口 ${session.nativeTokenLimit ?? '?'}（来源 ${session.windowSource ?? 'config'}）`,
+            tagList.length ? `活跃标签：${tagList.join('、')}` : '活跃标签：无',
+            `[Memory Hints]：${runtime.hintsMuted ? '已静默' : '开启'}`,
+            `冷启动待注入 ${runtime.coldStart.pending.size} 条 / 已注入 ${runtime.coldStart.injected.size} 次`,
+          ].join('\n'),
+        );
+      }
+
+      if (verb === 'mute' || verb === 'unmute') {
+        const next = verb === 'mute';
+        if (runtime.hintsMuted === next) return ok(next ? '已经是静默状态。' : '当前并未静默。');
+        runtime.hintsMuted = next;
+        if (next) runtime.injection.tags.clear();
+        return ok(next ? '已静默 [Memory Hints]（记忆写入与召回不受影响，/memory unmute 恢复）。' : '已恢复 [Memory Hints] 注入。');
+      }
+
+      return fail(`未知子命令 "${verbRaw}"。\n${MEMORY_COMMAND_HELP}`);
+    };
+
+    try {
+      const commands = typeof ctx.get === 'function' ? ctx.get('commands') : null;
+      if (commands && typeof commands.register === 'function') {
+        disposers.push(
+          commands.register({
+            name: 'memory',
+            description: '海马体：恢复交接摘要 / 触发维护 / 查看状态 / 静默提示',
+            input: { hint: 'resume | maintain | status | mute | unmute' },
+            handler: (invocation) => runtime.memoryCommand(invocation),
+          }),
+        );
+      }
+    } catch (error) {
+      // A host without a command service is a valid host; the memory core is unaffected.
+      ctx?.logger?.debug?.(`hippocampus: /memory command not registered: ${asMemoryError(error).code}`);
     }
     disposers.push(() => {
       serviceDisposed = true;

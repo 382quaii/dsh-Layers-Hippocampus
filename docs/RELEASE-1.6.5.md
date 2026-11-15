@@ -1,15 +1,38 @@
-# Release 1.6.4 — 发布准备（本地）
+# Release 1.6.5 — 发布准备（本地）
 
-> 版本：**1.6.4**（2026-11-14：修复 1M 上下文溢出——接入宿主真实窗口、`used + reserved` 判定、Fail-Fast 拦截、同会话续交、Live Compact；并含 1.6.3 未曾发布的全部内容：配置 schema 迁移 + `strictStartup` 启动安全降级 + 设置页简洁模式 + 交接冷启动按会话注入 + 复习队列消费 + 面板/引擎状态对齐；`CAPABILITIES.version` 与测试断言同步）。
+> 版本：**1.6.5**（2026-11-15：回归微内核——`/memory` 指令集（0 Token）、蒸馏唯一调度器与月记防重复咀嚼、原子服务接口 `getLatestHandoffSummary()`；并含 1.6.4 的 1M 上下文溢出修复与 1.6.3 未曾发布的全部内容：配置 schema 迁移 + `strictStartup` 启动安全降级 + 设置页简洁模式 + 交接冷启动按会话注入 + 复习队列消费 + 面板/引擎状态对齐；`CAPABILITIES.version` 与测试断言同步）。
 
 > 状态：**代码与文档已就绪；仓库推送 / npm 发布 / 市场 PR 需要你的 GitHub 与 npm 凭据，代理与网络，本会话未执行。**
-> 基线：`dsh-memory` 工作区，全量 **494/494 测试通过**（79 个测试文件；另有 `dsh-orchestrator` 31/31）。
+> 基线：`dsh-memory` 工作区，全量 **502/502 测试通过**（80 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；插件市场仍无条目（未发布 npm）。
 
 ## 本版内容
 
-**主线一：把 2026-11-13 的“旧配置启动阻断”事故固化为引擎能力。**
+**主线一：回归微内核——指令集 0 Token、蒸馏单一调度器、原子服务接口。**
 **主线二：修复 2026-11-14 的 1M 上下文溢出事故（分母 / 分子 / 状态机 / 单轮熔断四处）。**
+
+### 主线一（1.6.5）
+
+1. **`/memory` 指令集（0 Token）**：`resume` / `maintain` / `status` / `mute` / `unmute` 经宿主
+   `commands` 服务注册。`commands.execute()` 的语义是「执行已知命令、**不发给模型**」，
+   因此不产生模型请求（测试包住 `globalThis.fetch` 计数断言为 0）。
+   - `resume` 先删掉 `session|handoffEpoch` 的投递记录再布防（`armColdStartNow()`），
+     绕过「每会话只注入一次」的自动去重，用户随时可以把摘要拉回来。
+   - `maintain` 走 `runtime.runMaintenance('manual')`，回报 logGen/indexGen/月记/L2合并/Dream/冷归档。
+   - `mute` 只压 `[Memory Hints]`，且**静音期间不消费标签**——解除后提示原样回来。
+2. **蒸馏收拢为唯一调度器**：`executeDream()` 先跑月记（L2.5，只处理已结束的自然月），
+   再跑 Dream。被月记吸收的日记 id 记入 `state/months.json` 的 `promoted` 映射
+   （即 `promoted_to_monthly`），`DreamEngine.collectGroups()` 直接跳过并在报告给出
+   `skippedPromoted`。**raw 日志仍 append-only 不可改写**——标记落在派生状态，语义等价、可重建。
+   `maintain()` 不再产出月记。
+3. **原子服务接口**：`ctx.get('hippocampus').getLatestHandoffSummary()` 返回
+   `{active, state, at, sessionId, summaryEventId, agentPreset, tailTurns, text, found}`。
+   纯读：不装配 prompt、不消费 marker、无副作用。外部路由插件据此自己决定何时续上。
+4. **微内核边界锁死**：源码扫描禁止 `index.js` 与 `src/**` 出现 `uiWorkspace` /
+   `startSession(` / `sessionStorage` / `appendMode` / `onSlot(` / `slots.register(` /
+   `ctx.slots =`。会话控制归外部路由插件。
+
+### 主线二（1.6.4）
 
 事故回顾（主线二）：一次请求携带 **854,668 prompt tokens + 预留 256,000 completion tokens**
 = 1,110,668 > 模型真实窗口 **1,048,576**，被 provider 以 `CONTEXT_WINDOW_EXCEEDED` 拒绝；
@@ -98,13 +121,17 @@
   新增 `test/v164.windowGuard.test.js`（11 例）锁 1M 溢出的全部修复：宿主窗口优先、
   `used + reserved` 判定（含真实数字 854,668 + 256,000）、`rehandoffDecision` 四分支、
   指针化（代理对不被劈开、`surfaceOp.replace` 形状）、`MEM_E_CONTEXT_EXCEEDED` 拦截、
-  无宿主服务时绝不阻断。全量 **494/494**（79 个测试文件）。
+  无宿主服务时绝不阻断。新增 `test/v165.micokernel.test.js`（8 例）锁微内核契约：
+  `/memory` 全子命令返回纯文本且**网络调用数为 0**、静音真的不注入提示、`resume` 在无交接时
+  明确报错且与服务接口同源、`executeDream()` 先跑月记并写入 `promoted`、`maintain()` 不再产
+  月记、已晋升日记下一轮仍被排除、源码扫描无 UI/追加模式监听。
+  全量 **502/502**（80 个测试文件）。
 
-完整历史见 [CHANGELOG.md](../CHANGELOG.md) 的 `[1.6.4]` / `[1.6.3]` / `[1.6.2]` / `[1.6.1]` 段。
+完整历史见 [CHANGELOG.md](../CHANGELOG.md) 的 `[1.6.5]` / `[1.6.4]` / `[1.6.3]` / `[1.6.2]` / `[1.6.1]` 段。
 
 ## 发布步骤（需要你执行）
 
-> 两个包：`dsh-layers-hippocampus@1.6.4`（已有 git remote）与
+> 两个包：`dsh-layers-hippocampus@1.6.5`（已有 git remote）与
 > `dsh-layers-orchestrator@0.1.0`（**目前不是 git 仓库**，需先 init/建远端）。
 > 全部命令在 PowerShell 下执行；`node`/`npm`/`pnpm` 用 DSH runtime 自带的绝对路径。
 
@@ -112,7 +139,7 @@
 
 ```powershell
 cd C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory
-node test/run.mjs                # 期望 494/494
+node test/run.mjs                # 期望 502/502
 cd ..\dsh-orchestrator
 node test/run.mjs                # 期望 31/31
 cd ..\dsh-memory
@@ -127,12 +154,11 @@ npm pack --dry-run               # 预检实际发布内容（含/不含不该�
 cd C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory
 git add -A
 git status --short                 # 最后确认没有 node_modules / state / 测试临时目录
-git commit -m "chore(release): v1.6.4 - fix 1M context overflow, add live compact and handoff rehandoff"
+git commit -m "chore(release): v1.6.5 - microkernel return, /memory commands (0 token), single distillation scheduler"
 
-# 历史 tag 已存在（v1.5.5 / v1.5.7 / v1.6.0 / v1.6.1 / v1.6.2）。
-# 本地 v1.6.3 从未发布，本版把它全部内容并入 1.6.4 => 删掉旧 tag，重建 v1.6.4。
-git tag -d v1.6.3
-git tag -a v1.6.4 -m "v1.6.4: context window fix, live compact, rehandoff"
+# 历史 tag：v1.5.5 / v1.5.7 / v1.6.0 / v1.6.1 / v1.6.2 / v1.6.4。
+# 本次只新增 v1.6.5，不需要删任何 tag。
+git tag -a v1.6.5 -m "v1.6.5: /memory command set (0 token), single distillation scheduler, atomic handoff summary accessor"
 git push origin main --follow-tags
 ```
 
@@ -173,7 +199,7 @@ npm view dsh-layers-orchestrator version
 ```powershell
 cd C:\Users\86135\.dsh\profiles\desktop
 # 编辑 package.json：
-#   "dsh-layers-hippocampus": "1.6.4"
+#   "dsh-layers-hippocampus": "1.6.5"
 #   "dsh-layers-orchestrator": "0.1.0"
 pnpm install
 # 重启 DSH

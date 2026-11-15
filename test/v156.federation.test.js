@@ -49,11 +49,12 @@ test('a cross-space monthly memo is claimed once; the sibling space skips its co
     for (const space of [a, b]) {
       await space.memory.remember({ content: 'September record', tags: ['project:sept'], salience: 0.9, eventTime });
     }
-    const first = await a.memory.maintain({ reason: 'federation-test' });
+    // v1.6.5: monthly memos are scheduled by `executeDream()`, not by `maintain()`.
+    const first = await a.memory.executeDream({});
     assert.equal(first.monthly.generated, 1, 'the first space generates the memo');
     assert.equal(first.monthly.skipped, 0);
 
-    const second = await b.memory.maintain({ reason: 'federation-test' });
+    const second = await b.memory.executeDream({});
     assert.equal(second.monthly.generated, 0, 'the sibling space does not duplicate it');
     assert.equal(second.monthly.skipped, 1);
     assert.equal(second.monthly.skippedEntries[0].owner, 'monthly:a');

@@ -2176,13 +2176,10 @@ export class Memory {
     this.assertOpen();
     const report = await this.maintenance.run({ reason });
     this._boot = { status: 'ok', logGen: report.logGen, indexGen: report.indexGen };
-    // Monthly memos are part of maintenance: a completed natural month becomes
-    // one durable memo before the graph is rebuilt from the same index.
-    try {
-      report.monthly = await this.generateMonthlyMemos();
-    } catch (error) {
-      report.monthlyError = error instanceof Error ? error.message : String(error);
-    }
+    // v1.6.5: monthly memos (L2.5) are NOT generated here any more. They used to run
+    // from maintenance AND the Dream leg could then distill the very same diaries per
+    // tag — two condensations of one material. `executeDream()` now schedules them
+    // first and marks what they absorbed as `promoted_to_monthly`.
     // v1.5.6: L2 multi-merge runs offline, after the read model converged. A failure
     // must never fail maintenance (duplicates are cosmetic, the log is the truth).
     try {
@@ -2329,11 +2326,27 @@ export class Memory {
    * deterministic local merge and records `MEM_E_DREAM_LLM_FALLBACK`; the returned
    * record always carries `meta.source_event_ids`.
    *
+   * v1.6.5: this is the ONE distillation scheduler. Monthly memos (L2.5) used to run
+   * from `maintain()` on their own schedule, which meant an event could be condensed
+   * into a monthly memo and then distilled AGAIN per tag by Dream in the same night —
+   * two network/storage passes over the same material. Ordering now lives here:
+   * monthly aggregation FIRST (it only touches COMPLETED months), then tag-level
+   * distillation over what is left. `generateMonthlyMemos()` marks every event it
+   * absorbed as `promoted_to_monthly`, and Dream's `collectGroups()` skips those.
+   *
    * @param {{now?: number, fetchImpl?: Function, logger?: object}} [options]
    */
   async executeDream(options = {}) {
     this.assertOpen();
-    return this.dream.run(options);
+    const run = { monthly: null, monthlyError: null };
+    try {
+      run.monthly = await this.generateMonthlyMemos({ now: options.now ?? this.clock.now() });
+    } catch (error) {
+      // A memo failure must never cancel the tag distillation that follows.
+      run.monthlyError = error instanceof Error ? error.message : String(error);
+    }
+    const report = await this.dream.run(options);
+    return { ...report, monthly: run.monthly, monthlyError: run.monthlyError };
   }
 
   /** Circuit + last-run snapshot for the panel / admin surface. */
@@ -2549,17 +2562,38 @@ export class Memory {
   }
 
   /**
+   * v1.6.5: ids that a monthly memo already absorbed, i.e. "promoted to monthly".
+   *
+   * The append-only log never gets rewritten (charter: the log is the truth source),
+   * so the flag lives in `state/months.json` under `promoted` and is exposed as a set
+   * here. Dream reads it through `collectGroups()` so an event is distilled at most
+   * once — monthly aggregation happens first and owns those ids from then on.
+   */
+  promotedToMonthly() {
+    const state = readJson(this.monthlyStatePath(), null);
+    const promoted = state && typeof state === 'object' ? state.promoted : null;
+    if (!promoted || typeof promoted !== 'object') return new Set();
+    return new Set(Object.keys(promoted));
+  }
+
+  /**
    * Multi-level time aggregation: once a natural month is over, its diaries are
    * condensed into one monthly memo (tag `status:monthly`). Memos are written as
    * ordinary episodes, so they are durable; retrieval gives them no decay and a
    * boost when the query is about a fuzzy historical period.
+   *
+   * v1.6.5: every absorbed event id is recorded as `promoted_to_monthly` in
+   * `state/months.json`, and `executeDream()` — not `maintain()` — drives this step,
+   * so Dream never re-distills what the monthly memo already condensed.
    */
   async generateMonthlyMemos({ now = this.clock.now() } = {}) {
     const view = this.indexManager.snapshot();
     const events = view?.events ?? [];
+    const promoted = new Set(this.promotedToMonthly());
     const byMonth = new Map();
     for (const event of events) {
       if (!event.day) continue;
+      if (promoted.has(event.eventId)) continue;
       if ((event.tags ?? []).some((tag) => (tag.tag ?? tag) === MONTHLY_TAG)) continue;
       const month = String(event.day).slice(0, 7);
       if (!/^\d{4}-\d{2}$/.test(month)) continue;
@@ -2568,6 +2602,9 @@ export class Memory {
     }
     const state = readJson(this.monthlyStatePath(), null);
     const done = new Set(Array.isArray(state?.months) ? state.months : []);
+    // Carry previous promotions forward: a memo written by an older version has no
+    // record of what it absorbed, and dropping the map would re-distill its events.
+    const promotedMap = state && typeof state.promoted === 'object' && state.promoted !== null ? { ...state.promoted } : {};
     const generated = [];
     const skipped = [];
     for (const [month, list] of [...byMonth].sort(([a], [b]) => a.localeCompare(b))) {
@@ -2618,13 +2655,22 @@ export class Memory {
         meta: { source_event_ids: list.map((event) => event.eventId).sort() },
       });
       done.add(month);
+      // v1.6.5: the memo now owns these events; Dream must not chew them again.
+      for (const event of list) promotedMap[event.eventId] = month;
       generated.push({ month, eventId: result.eventId, status: result.status, events: list.length });
     }
     if (generated.length > 0) {
       ensureDir(this.paths.state);
-      writeJsonAtomic(this.monthlyStatePath(), { schema: 1, months: [...done].sort(), updatedAt: now });
+      writeJsonAtomic(this.monthlyStatePath(), { schema: 1, months: [...done].sort(), promoted: promotedMap, updatedAt: now });
     }
-    return { generated: generated.length, months: generated.map((entry) => entry.month), entries: generated, skipped: skipped.length, skippedEntries: skipped };
+    return {
+      generated: generated.length,
+      months: generated.map((entry) => entry.month),
+      entries: generated,
+      skipped: skipped.length,
+      skippedEntries: skipped,
+      promoted: Object.keys(promotedMap).length,
+    };
   }
 
   async extractTrend({ content, sourceEvents = [], tags = [], occurredAt, ttlDays } = {}) {

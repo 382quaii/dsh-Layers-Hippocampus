@@ -4,6 +4,46 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.5] — 2026-11-15
+
+**回归微内核：引擎只负责存储、检索与蒸馏，绝不驱动对话；蒸馏只有一个总调度器；
+面板的全部能力收进 `/memory` 指令集，且不花一分模型 Token。**
+
+- **Added — `/memory` 指令集（0 Token）**。四条子命令通过宿主的 `commands` 服务注册，
+  `commands.execute()` 的语义是「parse and execute a known command **without sending it
+  to the model**」，因此不产生任何模型请求（测试用 `fetch` 计数断言为 0）：
+  - `/memory resume`：拉取上一次交接摘要并**强制重新注入**当前上下文。它绕过「每会话
+    每交接批次只注入一次」的去重（`armColdStartNow()` 先删掉该 `session|epoch` 的投递
+    记录再布防），所以用户可以随时把摘要拉回来；没有交接时明确回「没有可恢复的交接摘要」。
+  - `/memory maintain`：立即触发一次后台维护（索引重建 / 月记 / L2 合并 / Dream / 冷归档），
+    回报各阶段计数；已在运行时直接拒绝而不是排队。
+  - `/memory status`：事件数、L3 摘要数、活跃标签列表、会话 token 与窗口来源
+    （`host`/`config`/`default`）、静默状态、冷启动队列长度。
+  - `/memory mute` / `/memory unmute`：紧急静默 `[Memory Hints]`。静音时**不消费标签**，
+    所以解除后提示会原样回来，而不是被会话级去重池吃掉。
+- **Fixed — 月记与 Dream 重复咀嚼同一批日记**。L2.5 月记原本挂在 `maintain()` 上，与
+  Dream 各走各的调度，同一条 L2 日记可能先被压进月记、再被按标签蒸馏一次。
+  现在 **`executeDream()` 是唯一的蒸馏总调度器**：先跑月记（只处理已结束的自然月），
+  再让 Dream 处理剩下的材料。被月记吸收的事件 id 记入 `state/months.json` 的
+  `promoted` 映射（即 `promoted_to_monthly`），`DreamEngine.collectGroups()` 直接跳过，
+  并在报告里给出 `skippedPromoted` 计数。
+  **为什么不写进事件本身**：raw 日志是 append-only 的唯一真相源，永不改写；标记放在
+  派生状态里，语义等价且可重建。
+- **Added — 原子服务接口 `getLatestHandoffSummary()`**。`ctx.get('hippocampus')
+  .getLatestHandoffSummary()` 返回 `{ active, state, at, sessionId, summaryEventId,
+  agentPreset, tailTurns, text, found }`，纯读：不装配 prompt、不消费 marker、不产生副作用。
+  外部路由插件想自己决定「什么时候续上、怎么展示」时用它，而不是去解析提示词。
+- **Changed — 微内核边界**。引擎半侧（`index.js` + `src/**`）不含任何宿主 UI 或追加模式
+  监听：`autoNewSession` 整链已在 1.6.3 删除，本次用测试把这条边界**锁死**——源码扫描
+  禁止出现 `uiWorkspace` / `startSession(` / `sessionStorage` / `appendMode` /
+  `onSlot(` / `slots.register(` / `ctx.slots =`。会话控制交给外部路由插件。
+- **Tests**：新增 `test/v165.micokernel.test.js`（8 例）：`/memory` 注册与全部子命令返回
+  纯文本、**网络调用数为 0**、静默真的不注入提示、`resume` 在无交接时明确报错且服务接口
+  与它同源、`executeDream()` 先跑月记并把日记标进 `promoted`、`maintain()` 不再产出月记、
+  已晋升日记在下一轮仍被排除、以及上面那条「无 UI/追加模式监听」的源码扫描。
+  `test/flow.test.js` 与 `test/v156.federation.test.js` 的月记断言随调度器迁移改为
+  `executeDream()`。全量 **502/502**（80 个测试文件）。
+
 ## [1.6.4] — 2026-11-14
 
 **修复 1M 上下文溢出（`CONTEXT_WINDOW_EXCEEDED`）：交接判定的分母、分子与状态机三处

@@ -173,6 +173,39 @@ export function fakeCtx({ orchestrator = true } = {}) {
   const contexts = [];
   const cleanups = [];
   const services = new Map();
+  /**
+   * v1.6.5: minimal `commands` service. The real host executes a command WITHOUT a
+   * model round-trip, which is exactly what lets a test assert "0 tokens": here the
+   * fake only ever calls the registered handler with a parsed `rawInput`.
+   */
+  const registeredCommands = new Map();
+  const commands = {
+    register(definition) {
+      registeredCommands.set(definition.name, definition);
+      return () => registeredCommands.delete(definition.name);
+    },
+    find(_agent, name) {
+      return registeredCommands.get(String(name ?? '').replace(/^\//, '')) ?? null;
+    },
+    list() {
+      return [...registeredCommands.values()];
+    },
+    async execute(agent, line) {
+      const text = String(line ?? '').trim();
+      if (!text.startsWith('/')) return undefined;
+      const [head, ...rest] = text.slice(1).split(/\s+/);
+      const definition = registeredCommands.get(head);
+      if (!definition) return undefined;
+      return definition.handler({
+        commandId: 'cmd_' + head,
+        agent: agent ?? null,
+        rawInput: rest.join(' '),
+        attachments: [],
+        signal: new AbortController().signal,
+      });
+    },
+  };
+  services.set('commands', commands);
   // v1.5.6: the space adapter is an optional Host service (dsh-orchestrator).
   // Engine/plugin tests get it by default; single-space tests set it false.
   if (orchestrator) services.set('orchestrator', createOrchestratorStub());
@@ -235,6 +268,7 @@ export function fakeCtx({ orchestrator = true } = {}) {
     sections,
     contexts,
     services,
+    commands,
     dispose() {
       while (cleanups.length > 0) cleanups.pop()();
     },

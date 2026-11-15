@@ -1,9 +1,9 @@
 # dsh-layers-hippocampus · 功能 / 实现 / 版本演进
 
-> 版本基线：**v1.6.4（2026-11-14：修复 1M 上下文溢出——宿主真实窗口、`used + reserved` 判定、Fail-Fast 拦截、同会话续交、Live Compact；并含 1.6.3 未曾发布的全部内容）**
-> 验证状态：**494 / 494 测试通过**（79 个测试文件 · 52 个源码文件 · 零运行时依赖）
+> 版本基线：**v1.6.5（2026-11-15：回归微内核——`/memory` 指令集（0 Token）、蒸馏唯一调度器与月记防重复咀嚼、原子服务接口 `getLatestHandoffSummary()`；并含 1.6.4 的 1M 溢出修复与 1.6.3 未曾发布的全部内容）**
+> 验证状态：**502 / 502 测试通过**（80 个测试文件 · 52 个源码文件 · 零运行时依赖）
 > 数据位置（本机当前）：`D:\Users\86135\memory`（本地 JSONL，可迁移）
-> 本文与 `README.md`、`docs/ARCHITECTURE.zh.md`、`CHANGELOG.md`、`docs/RELEASE-1.6.4.md` 配套。
+> 本文与 `README.md`、`docs/ARCHITECTURE.zh.md`、`CHANGELOG.md`、`docs/RELEASE-1.6.5.md` 配套。
 
 ---
 
@@ -167,11 +167,13 @@ DeepSeek Harness（DSH）的**本地优先长期记忆 Host 插件**。它不把
 | **1.6.3** | **配置 schema 版本与迁移机制**（`CONFIG_SCHEMA_VERSION=3`，先迁移后严格校验，迁移只补值不覆盖、必告警）；**`strictStartup` 启动安全降级**（默认 `true`；显式 `false` 时越界值回退安全默认并降级启动，类型错误/未知键仍 fail-fast）；启动状态进入 `CAPABILITIES.startup` 与 `panel.startup`/`panel.configVersion`/`panel.configWarnings`；**设置页简洁模式**（纯显示层，只留身份 / 上下文窗口 / 存储位置迁移 / raw 三项）；**交接冷启动按会话幂等注入**（`session\|handoffEpoch` 键，兄弟 agent 先装配不吞注入；`handoff.json` 带 `tailTurns` 回放最后 5 轮原话；`coldStartInjectRecentTurns` 默认改开）；**移除 `context.autoNewSession*`**（交接继续同一对话，不再弹出第二个空会话） |
 | **1.6.4** | **修复 1M 上下文溢出**：`src/context/windowGuard.js#resolveWindow()` 让**宿主上报的真实窗口（1,048,576）优先**，`context.nativeTokenLimit` 降级为用户覆盖；判定改 `used + reserved >= window × threshold`（`requestPressure()`），已用优先取宿主 `tokenMeter` 的测量值；`agent/request` 中间件对**必定放不进窗口**的请求本地 fail-fast 抛 `MEM_E_CONTEXT_EXCEEDED`（不发出去白付计费）；`checkHandoff()` 的 `if (marker.active) return base;` 改为 `rehandoffDecision()`，同会话压力再涨 ≥5 点或投影 ≥95% 时**允许续交**；新增 **Live Compact**（`src/context/liveCompact.js`）：单个 `tool/result` 超 `thresholdChars`（默认 200,000 字符）时保留头 4000 / 尾 2000、中间压成可检索指针（含 `seq`/`call`/`tool`，原文仍可 `deep_raw` 取回），宿主有 `toolResultPruner` 时优先委托。11 例 `test/v164.windowGuard.test.js` |
 
+| **1.6.5** | **回归微内核**：`/memory` 指令集（`resume` / `maintain` / `status` / `mute` / `unmute`）经宿主 `commands` 服务注册，`commands.execute()` 不发给模型 → **0 Token**（测试以 `fetch` 计数为 0 断言）；`resume` 绕过 `session\|epoch` 去重强制重放交接摘要；`mute` 只压 `[Memory Hints]` 且不消费标签；**蒸馏唯一调度器** `executeDream()`：先跑月记（L2.5）再蒸馏，被月记吸收的日记记入 `state/months.json#promoted`（`promoted_to_monthly`），`DreamEngine.collectGroups()` 跳过并在报告给出 `skippedPromoted`；raw 日志仍不可改写；新增原子服务接口 `hippocampus.getLatestHandoffSummary()`（纯读，不装配 prompt、不消费 marker）；源码扫描锁死「引擎半侧无 UI / 追加模式监听」。8 例 `test/v165.micokernel.test.js` |
+
 ---
 
 ## 6. 测试与质量
 
-- **494 / 494 通过**，79 个测试文件；进程内 `node --test`（`test/run.mjs`），30 秒看门狗，时间一律注入 `FakeClock`。
+- **502 / 502 通过**，80 个测试文件；进程内 `node --test`（`test/run.mjs`），30 秒看门狗，时间一律注入 `FakeClock`。
 - 覆盖维度：身份幂等、索引重建一致性、召回排序与置信度、raw 四字段与游标扫描、哈希恢复、两阶段删除与墓碑、标签树生命周期与重放一致性、多空间降级、配置 fail-fast、UI 源码契约、崩溃恢复（200ms checkpoint 窗口）、事件循环让出。
 - 运维脚本：`scripts/bench-protocol.mjs`（基准协议）、`scripts/repair-handoff.mjs`（交接修复）。
 
@@ -180,7 +182,7 @@ DeepSeek Harness（DSH）的**本地优先长期记忆 Host 插件**。它不把
 ## 7. 已知边界与风险（诚实清单）
 
 1. **多空间依赖外部能力**：无 `dsh-orchestrator` 时只有单空间与 8 个工具，这是显式降级，不是 bug；
-2. **版本节奏**：1.5.7 的临时冻结已于 2026-11-07 全面解除，恢复语义化版本（当前 1.6.4）；
+2. **版本节奏**：1.5.7 的临时冻结已于 2026-11-07 全面解除，恢复语义化版本（当前 1.6.5）；
 3. **保存窗口**：日志 append 是 durable 的，但 manifest checkpoint 有 200ms 延迟；崩溃后依赖 `unflushedBytes` + 重建兜底；
 4. **raw 尾扫偏置**：单分片超过 `maxScanTurns`（默认 5000）时一次只看最新 N 条，更早历史需调大预算或按时间窗分页；
 5. **置信度阈值**：在高度同质的数据上不触发（A/B 已验证为 0 收益），不适合当作默认的“省 token”手段；

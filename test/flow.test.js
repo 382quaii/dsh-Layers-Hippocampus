@@ -79,7 +79,7 @@ test('a completed month becomes a monthly memo once, and it does not decay', asy
     await memory.remember({ content: 'october release shipped', tags: ['project:october'], eventTime: Date.UTC(2023, 9, 20), happenedAt: Date.UTC(2023, 9, 20) });
     clock.set(T0);
 
-    const report = await memory.maintain({ reason: 'monthly' });
+    const report = await memory.executeDream({ now: T0 });
     assert.equal(report.monthly.generated, 1);
     assert.deepEqual(report.monthly.months, ['2023-10']);
 
@@ -91,9 +91,13 @@ test('a completed month becomes a monthly memo once, and it does not decay', asy
 
     const state = JSON.parse(fs.readFileSync(memory.monthlyStatePath(), 'utf8'));
     assert.deepEqual(state.months, ['2023-10']);
+    // v1.6.5: the absorbed diaries are recorded as `promoted_to_monthly`.
+    const absorbed = view.events.filter((event) => (event.tags ?? []).some((tag) => tag.tag === 'project:october'));
+    assert.equal(absorbed.length, 2);
+    for (const event of absorbed) assert.equal(state.promoted[event.eventId], '2023-10');
 
-    // Idempotent: a second maintenance does not write a second memo.
-    const again = await memory.maintain({ reason: 'monthly-again' });
+    // Idempotent: a second run does not write a second memo.
+    const again = await memory.executeDream({ now: T0 });
     assert.equal(again.monthly.generated, 0);
     assert.equal(view.events.filter((event) => event.tags.some((tag) => tag.tag === MONTHLY_TAG)).length, 1);
 
