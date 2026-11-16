@@ -1,9 +1,9 @@
 # dsh-layers-hippocampus · 功能 / 实现 / 版本演进
 
-> 版本基线：**v1.6.5（2026-11-15：回归微内核——`/memory` 指令集（0 Token）、蒸馏唯一调度器与月记防重复咀嚼、原子服务接口 `getLatestHandoffSummary()`；并含 1.6.4 的 1M 溢出修复与 1.6.3 未曾发布的全部内容）**
+> 版本基线：**v1.6.6（2026-11-16：发布修正——1.6.5 的 npm 制品缺 Live Compact 修复；本版补上「每轮偷裁工具结果」修复，并含 M3 测试跨包解耦与 M5 错误码边界。累计 1.6.5 的微内核回归：`/memory` 指令集、蒸馏唯一调度器与月记防重复咀嚼、原子服务接口 `getLatestHandoffSummary()`）**
 > 验证状态：**510 / 510 测试通过**（81 个测试文件 · 52 个源码文件 · 零运行时依赖）
 > 数据位置（本机当前）：`D:\Users\86135\memory`（本地 JSONL，可迁移）
-> 本文与 `README.md`、`docs/ARCHITECTURE.zh.md`、`CHANGELOG.md`、`docs/RELEASE-1.6.5.md` 配套。
+> 本文与 `README.md`、`docs/ARCHITECTURE.zh.md`、`CHANGELOG.md`、`docs/RELEASE-1.6.6.md` 配套。
 
 ---
 
@@ -168,6 +168,7 @@ DeepSeek Harness（DSH）的**本地优先长期记忆 Host 插件**。它不把
 | **1.6.4** | **修复 1M 上下文溢出**：`src/context/windowGuard.js#resolveWindow()` 让**宿主上报的真实窗口（1,048,576）优先**，`context.nativeTokenLimit` 降级为用户覆盖；判定改 `used + reserved >= window × threshold`（`requestPressure()`），已用优先取宿主 `tokenMeter` 的测量值；`agent/request` 中间件对**必定放不进窗口**的请求本地 fail-fast 抛 `MEM_E_CONTEXT_EXCEEDED`（不发出去白付计费）；`checkHandoff()` 的 `if (marker.active) return base;` 改为 `rehandoffDecision()`，同会话压力再涨 ≥5 点或投影 ≥95% 时**允许续交**；新增 **Live Compact**（`src/context/liveCompact.js`）：单个 `tool/result` 超 `thresholdChars`（默认 200,000 字符）时保留头 4000 / 尾 2000、中间压成可检索指针（含 `seq`/`call`/`tool`，原文仍可 `deep_raw` 取回），宿主有 `toolResultPruner` 时优先委托。11 例 `test/v164.windowGuard.test.js` |
 
 | **1.6.5** | **回归微内核**：`/memory` 指令集（`resume` / `maintain` / `status` / `mute` / `unmute`）经宿主 `commands` 服务注册，`commands.execute()` 不发给模型 → **0 Token**（测试以 `fetch` 计数为 0 断言）；`resume` 绕过 `session\|epoch` 去重强制重放交接摘要；`mute` 只压 `[Memory Hints]` 且不消费标签；**蒸馏唯一调度器** `executeDream()`：先跑月记（L2.5）再蒸馏，被月记吸收的日记记入 `state/months.json#promoted`（`promoted_to_monthly`），`DreamEngine.collectGroups()` 跳过并在报告给出 `skippedPromoted`；raw 日志仍不可改写；新增原子服务接口 `hippocampus.getLatestHandoffSummary()`（纯读，不装配 prompt、不消费 marker）；源码扫描锁死「引擎半侧无 UI / 追加模式监听」。8 例 `test/v165.micokernel.test.js` |
+| **1.6.6** | **发布修正版**：1.6.5 的 npm 制品（`gitHead 28776c7`）**缺 Live Compact 修复**——`guardRequest` 曾在每次 `agent/request` 上委托宿主 `toolResultPruner.pruneSession()`，而宿主用的是预设预算（ptc `thresholdChars 8192` → 4k 头 + 1k 尾）且只在 `compaction-basic` 的 `context-overflow` 分支调用，等于把「溢出时裁剪」变成「每轮都裁剪」，一次 pass 可掉约 80k tokens（用户看到的「10% 直接掉到 7%」）。本版只跑自己的保守裁剪（`context.liveCompact`，默认 200,000 / 4,000 / 2,000 / 每请求 4 节点）+ 回归用例断言宿主 pruner 在健康请求上零调用；**M3** `test/orchestrator.js` 桥接（`via: 'package' \| 'sibling'`）+ 22 例 `orchestratorTest()` 缺包时 skipped 带原因（两包在位 510/510、单包 454 pass / 0 fail / 56 skipped）；**M5** `src/errors.js#fromOrchestratorError()` + `ORCHESTRATOR_CODE_MAP` 单向翻译 `ORCH_E_*` → `MEM_E_*`（三个 consent 码都落到 `MEM_E_REQUIRE_USER_CONSENT`，未列入码不拍平、原始码留在 `details.orchestratorCode`）。7 例 `test/v166.errorContract.test.js` |
 
 ---
 
@@ -182,7 +183,7 @@ DeepSeek Harness（DSH）的**本地优先长期记忆 Host 插件**。它不把
 ## 7. 已知边界与风险（诚实清单）
 
 1. **多空间依赖外部能力**：无 `dsh-orchestrator` 时只有单空间与 8 个工具，这是显式降级，不是 bug；
-2. **版本节奏**：1.5.7 的临时冻结已于 2026-11-07 全面解除，恢复语义化版本（当前 1.6.5）；
+2. **版本节奏**：1.5.7 的临时冻结已于 2026-11-07 全面解除，恢复语义化版本（当前 1.6.6）；
 3. **保存窗口**：日志 append 是 durable 的，但 manifest checkpoint 有 200ms 延迟；崩溃后依赖 `unflushedBytes` + 重建兜底；
 4. **raw 尾扫偏置**：单分片超过 `maxScanTurns`（默认 5000）时一次只看最新 N 条，更早历史需调大预算或按时间窗分页；
 5. **置信度阈值**：在高度同质的数据上不触发（A/B 已验证为 0 收益），不适合当作默认的“省 token”手段；

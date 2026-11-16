@@ -62,7 +62,7 @@ export { resolveConfig, DEFAULT_CONFIG };
  * of letting a raw 404 reach the user.
  */
 export const CAPABILITIES = Object.freeze({
-  version: '1.6.5',
+  version: '1.6.6',
   spaces: true,
   memories: true,
   transferConsent: true,
@@ -798,7 +798,7 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     // ---- 1. Live Compact ---------------------------------------------------
     // ONLY our own conservative pass, on OUR threshold (200k chars by default).
     //
-    // v1.6.5: this used to delegate to the host's `toolResultPruner` on EVERY
+    // v1.6.6: this used to delegate to the host's `toolResultPruner` on EVERY
     // request, which was wrong twice over:
     //   - the host prunes with the PRESET's budget (ptc: 8192 chars -> 4k head +
     //     1k tail), so an ordinary 20 KB file read was silently cut down on the

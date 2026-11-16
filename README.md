@@ -7,7 +7,7 @@
 
 | | |
 | --- | --- |
-| 版本 | **1.6.5** |
+| 版本 | **1.6.6** |
 | 包名 | `dsh-layers-hippocampus` |
 | 仓库 | <https://github.com/382quaii/dsh-Layers-Hippocampus> |
 | 许可证 | MIT |
@@ -186,7 +186,7 @@ raw 层提供三档，覆盖从“只留关键”到“全留”：
 pnpm add dsh-layers-hippocampus
 
 # 或从 GitHub 指定 tag
-pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.5"
+pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.6"
 ```
 
 ### 2. 挂到 profile
