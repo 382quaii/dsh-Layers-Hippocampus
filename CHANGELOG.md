@@ -39,6 +39,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   监听：`autoNewSession` 整链已在 1.6.3 删除，本次用测试把这条边界**锁死**——源码扫描
   禁止出现 `uiWorkspace` / `startSession(` / `sessionStorage` / `appendMode` /
   `onSlot(` / `slots.register(` / `ctx.slots =`。会话控制交给外部路由插件。
+- **Fixed — 上下文在每轮请求里被悄悄缩水（“从 10% 直接掉到 7%”）**。1.6.4 的
+  `guardRequest` 在**每一次** `agent/request` 上都把宿主 `toolResultPruner.pruneSession()`
+  委托执行了一遍。两处都错：
+  - 宿主用的预算是 **预设自己的**（ptc: `thresholdChars 8192` → 留 4k 头 + 1k 尾），
+    于是一次普通的 20 KB 文件读取在下一次请求就被腰斩；
+  - 宿主自己只在 compaction-basic 的 `context-overflow` 分支里调它
+    （`this.ctx.get('toolResultPruner')?.pruneSession(agent.session)`），
+    「溢出时裁剪」被我们变成了「每一轮都裁剪」。实测一次 pass 可掉 **~80k tokens**。
+  现在 Live Compact **只跑我们自己的保守裁剪**：单条 `tool/result` 超过
+  `context.liveCompact.thresholdChars`（默认 200,000 字符）才指针化，头部 4k / 尾部 2k
+  原样保留、中间换成 `deep_raw` 可取回的指针行。健康的对话**永远不会被改写**——
+  宿主压缩链路的裁剪仍由宿主在真溢出时负责。
+  新增回归用例锁定：请求里即使注入了假 `toolResultPruner`，`pruneSession` 的调用次数也必须为 0，
+  且一条 20k 字符的正常结果不产生任何 surface 改写。
 - **Tests**：新增 `test/v165.micokernel.test.js`（8 例）：`/memory` 注册与全部子命令返回
   纯文本、**网络调用数为 0**、静默真的不注入提示、`resume` 在无交接时明确报错且服务接口
   与它同源、`executeDream()` 先跑月记并把日记标进 `promoted`、`maintain()` 不再产出月记、

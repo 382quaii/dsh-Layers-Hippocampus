@@ -281,3 +281,50 @@ test('a host with no llm/tokenMeter service never blocks a request', async () =>
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/**
+ * Regression for the "context keeps collapsing from 10% to 7%" report (2026-11-16).
+ *
+ * The guard used to delegate to the HOST `toolResultPruner` on EVERY request. The host
+ * prunes with the PRESET's budget (ptc: 8192 chars → 4k head + 1k tail), and its own
+ * caller only invokes it on the `context-overflow` trigger. Calling it per request
+ * therefore rewrote ordinary tool results turn after turn, and one pass could drop
+ * ~80k tokens at once.
+ */
+test('the guard never rewrites an ordinary tool result on a healthy request', async () => {
+  const dir = tempDir('no-silent-prune');
+  const fixture = fakeCtx();
+  let hostPruneCalls = 0;
+  fixture.services.set('toolResultPruner', {
+    pruneSession() {
+      hostPruneCalls += 1;
+      return { pruned: [], charsRemoved: 0 };
+    },
+  });
+  fixture.services.set('tokenMeter', { contextPressure: () => ({ pressureTokens: 20_000, contextWindow: WINDOW }) });
+  const appended = [];
+  const session = {
+    surface: { nodes: [1] },
+    eventAt: () => ({
+      type: 'tool/result',
+      data: { message: { source: { callId: 'c1' }, content: [{ type: 'text', text: 'x'.repeat(20_000) }] } },
+    }),
+    deriveEventMessage: (event) => event.data.message,
+    append: (type, data, options) => {
+      appended.push({ type, options });
+      return { seq: 99 };
+    },
+  };
+  try {
+    await apply(fixture.ctx, { dataDir: dir, maintenanceCron: '0 */6 * * *', autoMaintainOnBoot: false });
+    const runtime = getRuntime(fixture.ctx);
+    await runtime.ready;
+    await runtime.guardRequest({ agent: { session }, config: { provider: 'p', model: 'm', maxTokens: 256_000 } });
+    assert.equal(hostPruneCalls, 0, 'the host pruner is the host compaction path’s job, not ours');
+    assert.deepEqual(appended, [], 'a 20k-char result is under our 200k threshold and must stay intact');
+    assert.equal(runtime.lastLiveCompact?.pruned, 0);
+  } finally {
+    fixture.dispose();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -796,26 +796,23 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
   runtime.guardRequest = async ({ agent = null, config: requestConfig = null, signal = null } = {}) => {
     const session = agent?.session ?? null;
     // ---- 1. Live Compact ---------------------------------------------------
+    // ONLY our own conservative pass, on OUR threshold (200k chars by default).
+    //
+    // v1.6.5: this used to delegate to the host's `toolResultPruner` on EVERY
+    // request, which was wrong twice over:
+    //   - the host prunes with the PRESET's budget (ptc: 8192 chars -> 4k head +
+    //     1k tail), so an ordinary 20 KB file read was silently cut down on the
+    //     very next request;
+    //   - the host itself only calls `pruneSession` on the `context-overflow`
+    //     trigger inside compaction-basic. Calling it per request turned "prune at
+    //     overflow" into "shrink every single turn" — exactly the reported
+    //     "context drops from 10% to 7% over and over".
+    // Our pointerization keeps head/tail plus a `deep_raw` recoverable pointer and
+    // only fires on a genuinely oversized single result, so a healthy conversation
+    // is never rewritten.
     const liveConfig = runtime.config?.context?.liveCompact ?? {};
     if (liveConfig.enabled !== false && session) {
-      // The HOST owns the canonical pruner (`tool-result-pruner`, replay-safe, wired
-      // into the ptc preset). Delegate when present; only fall back to our own
-      // surface surgery when the host has no pruner at all.
-      const hostPruner = (() => {
-        try {
-          return ctx?.get?.('toolResultPruner') ?? null;
-        } catch {
-          return null;
-        }
-      })();
-      if (hostPruner && typeof hostPruner.pruneSession === 'function') {
-        try {
-          await hostPruner.pruneSession(session);
-          runtime.lastLiveCompact = { source: 'host', at: memory.clock.now() };
-        } catch (error) {
-          runtime.logger?.warn?.(`hippocampus: host live-compact failed: ${asMemoryError(error).code}`);
-        }
-      } else {
+      try {
         runtime.lastLiveCompact = {
           source: 'hippocampus',
           at: memory.clock.now(),
@@ -827,6 +824,8 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
             logger: runtime.logger,
           }),
         };
+      } catch (error) {
+        runtime.logger?.warn?.(`hippocampus: live compact failed: ${asMemoryError(error).code}`);
       }
     }
 
