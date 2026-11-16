@@ -167,12 +167,78 @@ export class MemoryError extends Error {
 /** Wrap an unknown thrown value as a MemoryError with the given fallback code. */
 export function asMemoryError(err, code = ErrorCodes.IO) {
   if (err instanceof MemoryError) return err;
+  // v1.6.6 (M5): an orchestrator-namespace failure that reached our boundary is
+  // translated, never flattened to MEM_E_IO (see ORCHESTRATOR_CODE_MAP below).
+  if (isOrchestratorCode(err?.code)) return fromOrchestratorError(err, code);
   const message = err instanceof Error ? err.message : String(err);
   // A plain Error may already carry a MEM_E_* code (node http handlers, stream
   // helpers). Keep it: downgrading a CONFIG_* failure to MEM_E_IO would make the
   // HTTP layer answer {"code":"MEM_E_IO"} for a perfectly specific validation error.
   const carried = typeof err?.code === 'string' && err.code.startsWith('MEM_E_') ? err.code : code;
   const wrapped = new MemoryError(carried, message, err?.details);
+  wrapped.cause = err;
+  return wrapped;
+}
+
+/**
+ * v1.6.6 (M5): the two packages share a boundary, not an error namespace.
+ *
+ * `dsh-orchestrator` owns two contracts on purpose:
+ *   - `MEM_E_*` for the code MOVED OUT of this core (router/transfer/space), so a
+ *     tool or HTTP result keeps the exact code a client already branches on — see
+ *     `dsh-orchestrator/src/compat.js`;
+ *   - `ORCH_E_*` for the orchestrator's OWN surfaces (consent broker, federation
+ *     map, claim registry) — see `dsh-orchestrator/src/errors.js`.
+ *
+ * Anything that reaches THIS package's tool/HTTP result must therefore speak
+ * `MEM_E_*`. Rather than rewrite the orchestrator's internal codes (which would
+ * break its own tests and its documented API), the translation happens here, at the
+ * single boundary every failure crosses. The mapping is total and one-way:
+ *
+ *   | orchestrator code         | memory code                | why                       |
+ *   |---------------------------|----------------------------|---------------------------|
+ *   | ORCH_E_CONSENT_REQUIRED   | MEM_E_REQUIRE_USER_CONSENT | the agent must ask a human |
+ *   | ORCH_E_CONSENT_INVALID    | MEM_E_REQUIRE_USER_CONSENT | a bad token is no consent  |
+ *   | ORCH_E_CONSENT_CONSUMED   | MEM_E_REQUIRE_USER_CONSENT | single-use: ask again      |
+ *   | ORCH_E_SPACE_INVALID      | MEM_E_SPACE_INVALID        | same payload, same verdict |
+ *   | ORCH_E_INVALID_INPUT      | MEM_E_INVALID_INPUT        | same payload, same verdict |
+ *   | ORCH_E_NOT_READY          | MEM_E_NOT_READY            | same payload, same verdict |
+ *   | ORCH_E_FEDERATION_CONFLICT| MEM_E_FEDERATION_FAILED    | bookkeeping, not the write |
+ *
+ * A code that is not listed is NOT silently flattened to MEM_E_IO: it keeps the
+ * caller's fallback, and the original code stays available on `details.orchestratorCode`.
+ */
+export const ORCHESTRATOR_CODE_MAP = Object.freeze({
+  ORCH_E_CONSENT_REQUIRED: 'MEM_E_REQUIRE_USER_CONSENT',
+  ORCH_E_CONSENT_INVALID: 'MEM_E_REQUIRE_USER_CONSENT',
+  ORCH_E_CONSENT_CONSUMED: 'MEM_E_REQUIRE_USER_CONSENT',
+  ORCH_E_SPACE_INVALID: 'MEM_E_SPACE_INVALID',
+  ORCH_E_INVALID_INPUT: 'MEM_E_INVALID_INPUT',
+  ORCH_E_NOT_READY: 'MEM_E_NOT_READY',
+  ORCH_E_FEDERATION_CONFLICT: 'MEM_E_FEDERATION_FAILED',
+});
+
+/** True when the code belongs to the orchestrator's own namespace. */
+export function isOrchestratorCode(code) {
+  return typeof code === 'string' && code.startsWith('ORCH_E_');
+}
+
+/**
+ * Translate an orchestrator-namespace error into this package's namespace.
+ * Returns the ORIGINAL error unchanged when it is not an ORCH_E_* failure (so a
+ * MEM_E_* passthrough is never rewrapped), and otherwise wraps it with the mapped
+ * code, keeping `details.orchestratorCode` for forensics.
+ */
+export function fromOrchestratorError(err, code = ErrorCodes.IO) {
+  const orchestratorCode = typeof err?.code === 'string' ? err.code : null;
+  if (!isOrchestratorCode(orchestratorCode)) return asMemoryError(err, code);
+  const mapped = ORCHESTRATOR_CODE_MAP[orchestratorCode] ?? code;
+  const message = err instanceof Error ? err.message : String(err);
+  const wrapped = new MemoryError(
+    mapped,
+    message,
+    { orchestratorCode, ...(err?.details && typeof err.details === 'object' ? err.details : {}) },
+  );
   wrapped.cause = err;
   return wrapped;
 }

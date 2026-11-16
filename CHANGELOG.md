@@ -53,12 +53,34 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   宿主压缩链路的裁剪仍由宿主在真溢出时负责。
   新增回归用例锁定：请求里即使注入了假 `toolResultPruner`，`pruneSession` 的调用次数也必须为 0，
   且一条 20k 字符的正常结果不产生任何 surface 改写。
+- **Changed — 错误码边界（M5）**。`dsh-orchestrator` 故意维护两套命名空间：`MEM_E_*`
+  属于**搬出去**的引擎（`spaceRouter`/`transfer`，客户端的 HTTP 状态映射已经按它分支，
+  拆分不得改名），`ORCH_E_*` 属于 Orchestrator 自己的接口（`consent`/`router`/`dedupe`/
+  `federation`）。现在跨越边界的失败在**唯一出口** `src/errors.js#asMemoryError()` 处
+  被单向翻译：新增 `ORCHESTRATOR_CODE_MAP`（`ORCH_E_CONSENT_REQUIRED|INVALID|CONSUMED`
+  → `MEM_E_REQUIRE_USER_CONSENT`，`ORCH_E_SPACE_INVALID`/`ORCH_E_INVALID_INPUT`/
+  `ORCH_E_NOT_READY` 同名映射，`ORCH_E_FEDERATION_CONFLICT` → `MEM_E_FEDERATION_FAILED`），
+  原始码保留在 `details.orchestratorCode`。**未列入的 `ORCH_E_*` 不会被拍平成 `MEM_E_IO`**，
+  而是保留调用方 fallback 码。最关键的一条：AI 看到的仍然是
+  `MEM_E_REQUIRE_USER_CONSENT`——授权闸门不会因为跨包而被降级成 IO 错误。
+  测试 `test/v166.errorContract.test.js`（7 例）断言映射全覆盖、目标码都真实存在、
+  details 不丢、以及 `MEM_E_*` 与普通错误原样透传。映射表同时写进
+  `dsh-orchestrator/README.md` 的「错误码边界」小节，两个包的读者看到同一份约定。
+- **Changed — 测试与兄弟包解耦（M3）**。`test/` 里原先有 9 个文件用**同级 checkout 相对路径**
+  直接 `import '../../dsh-orchestrator/src/*.js'`，单独发布本包时整套测试会在 import 阶段
+  就 `ERR_MODULE_NOT_FOUND`。新增 `test/orchestrator.js` 桥接：先按包名解析已安装的
+  `dsh-layers-orchestrator`（`via: 'package'`），失败再退回同级目录（`via: 'sibling'`），
+  两者都不存在时导出 `null` 符号并给出 `unavailableReason`；`orchestratorTest()` 在缺少
+  该包时把 22 个真正依赖多空间的用例注册为 **skipped 并写明原因**，而不是让它们红。
+  `test/helpers.js` 的 `makeMemory()` 默认值改为 `MULTI_SPACE_AVAILABLE`，并在
+  「要求多空间但包不在」时抛出可读错误，杜绝 `new null()`。实测：装好兄弟包 **510/510、
+  skipped 0**；把兄弟目录移走 **454 pass / 0 fail / 56 skipped**。
 - **Tests**：新增 `test/v165.micokernel.test.js`（8 例）：`/memory` 注册与全部子命令返回
   纯文本、**网络调用数为 0**、静默真的不注入提示、`resume` 在无交接时明确报错且服务接口
   与它同源、`executeDream()` 先跑月记并把日记标进 `promoted`、`maintain()` 不再产出月记、
   已晋升日记在下一轮仍被排除、以及上面那条「无 UI/追加模式监听」的源码扫描。
   `test/flow.test.js` 与 `test/v156.federation.test.js` 的月记断言随调度器迁移改为
-  `executeDream()`。全量 **503/503**（80 个测试文件）。
+  `executeDream()`。全量 **510/510**（81 个测试文件）。
 
 ## [1.6.4] — 2026-11-14
 
