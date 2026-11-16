@@ -15,12 +15,12 @@ import test from 'node:test';
 import { apply, getRuntime } from '../index.js';
 import { resolveConfig } from '../src/config.js';
 import { EDITABLE_CONFIG_KEYS } from '../src/webRoutes.js';
-import { ContentRegistry } from '../../dsh-orchestrator/src/dedupe.js';
+import { orchestratorTest, ContentRegistry } from './orchestrator.js';
 import { createOrchestratorStub, fakeCtx, tempDir, T0 } from './helpers.js';
 
 const DAY = 86_400_000;
 
-test('crossSpaceRecall is off by default and fail-fast', () => {
+orchestratorTest('crossSpaceRecall is off by default and fail-fast', () => {
   assert.equal(resolveConfig({}).features.crossSpaceRecall, false);
   assert.equal(resolveConfig({ features: { crossSpaceRecall: true } }).features.crossSpaceRecall, true);
   assert.throws(
@@ -54,7 +54,7 @@ async function withRuntime(crossSpaceRecall, body) {
   }
 }
 
-test('flag true: recall aggregates every open space', async () => {
+orchestratorTest('flag true: recall aggregates every open space', async () => {
   await withRuntime(true, async (runtime) => {
     assert.equal(runtime.capabilities().crossSpaceRecall, true);
     await runtime.createSpace('work');
@@ -69,7 +69,7 @@ test('flag true: recall aggregates every open space', async () => {
   });
 });
 
-test('flag false (default): recall stays single-space', async () => {
+orchestratorTest('flag false (default): recall stays single-space', async () => {
   await withRuntime(false, async (runtime) => {
     assert.equal(runtime.capabilities().crossSpaceRecall, false);
     await runtime.createSpace('work');

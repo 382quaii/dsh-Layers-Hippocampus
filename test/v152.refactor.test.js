@@ -21,6 +21,9 @@ import { Readable } from 'node:stream';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+// v1.6.6 (M3): the multi-space surface only exists when the orchestrator package is
+// installed; without it these cases are registered as skipped (with the reason).
+import { orchestratorTest } from './orchestrator.js';
 import { createRuntime } from '../index.js';
 import { resolveConfig, toMemoryOptions } from '../src/config.js';
 import { validateMigrationPaths } from '../src/migrationRunner.js';
@@ -134,7 +137,7 @@ test('runtime.startMigration fails fast on bad targets and keeps the old directo
 
 // ---- B. SpaceSelector routing isolation ------------------------------------
 
-test('every read follows ?space=<id>: stats, graph, memories and session do not bleed', async () => {
+orchestratorTest('every read follows ?space=<id>: stats, graph, memories and session do not bleed', async () => {
   await withRuntime(async ({ runtime }) => {
     // The default space gets its own event and its own session accounting.
     await runtime.memory.remember({ content: 'default-space fact', tags: ['iso:probe'], salience: 0.9 });
@@ -179,7 +182,7 @@ test('every read follows ?space=<id>: stats, graph, memories and session do not 
   });
 });
 
-test('SpaceSelector backend: ensureSpace creates an EMPTY space and stats route honours ?space=', async () => {
+orchestratorTest('SpaceSelector backend: ensureSpace creates an EMPTY space and stats route honours ?space=', async () => {
   await withRuntime(async ({ runtime }) => {
     const created = await runtime.ensureSpace('private');
     assert.equal(created.spaceId, 'private');
@@ -208,7 +211,7 @@ test('SpaceSelector backend: ensureSpace creates an EMPTY space and stats route 
 
 // ---- C. consent gate backstop ----------------------------------------------
 
-test('unauthorized transfer is blocked at the ENGINE and at the HTTP route', async () => {
+orchestratorTest('unauthorized transfer is blocked at the ENGINE and at the HTTP route', async () => {
   await withRuntime(async ({ runtime }) => {
     const stored = await runtime.memory.remember({ content: 'consent refactor probe', tags: ['iso:consent'], salience: 0.9 });
     await assert.rejects(

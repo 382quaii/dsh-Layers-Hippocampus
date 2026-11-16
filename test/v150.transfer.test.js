@@ -25,14 +25,14 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import test from 'node:test';
 import { Memory } from '../src/memory.js';
-import {
+import { orchestratorTest,
   PRIVACY_CATEGORIES,
   TRANSFER_MODES,
   buildTransferRecord,
-  scanPrivacy,
   sanitiseTransferMeta,
+  scanPrivacy,
   transferBetweenSpaces,
-} from '../../dsh-orchestrator/src/transfer.js';
+} from './orchestrator.js';
 import { SMALL_POLICY, T0, logRecords, makeMemory } from './helpers.js';
 
 const HOUR = 3_600_000;
@@ -92,7 +92,7 @@ function findSpaceRouter(memory) {
   return null;
 }
 
-test('copy: target gets fresh ids and transfer tags, source stays retained', async () => {
+orchestratorTest('copy: target gets fresh ids and transfer tags, source stays retained', async () => {
   const spaces = await openSpaces();
   const { source, target } = spaces;
   try {
@@ -165,7 +165,7 @@ test('copy: target gets fresh ids and transfer tags, source stays retained', asy
   }
 });
 
-test('move: target written first, source parked for grace-period deletion', async () => {
+orchestratorTest('move: target written first, source parked for grace-period deletion', async () => {
   const spaces = await openSpaces();
   const { source, target } = spaces;
   try {
@@ -218,7 +218,7 @@ test('move: target written first, source parked for grace-period deletion', asyn
   }
 });
 
-test('move: graceHours is clamped to at least one hour', async () => {
+orchestratorTest('move: graceHours is clamped to at least one hour', async () => {
   const spaces = await openSpaces();
   const { source, target } = spaces;
   try {
@@ -239,7 +239,7 @@ test('move: graceHours is clamped to at least one hour', async () => {
   }
 });
 
-test('move: a partial target failure throws and parks nothing on the source', async () => {
+orchestratorTest('move: a partial target failure throws and parks nothing on the source', async () => {
   const source = await makeMemory({ policy: SMALL_POLICY });
   try {
     const ids = await seedSource(source.memory);
@@ -275,7 +275,7 @@ test('move: a partial target failure throws and parks nothing on the source', as
   }
 });
 
-test('privacy: a CN id card blocks the transfer, writing and parking nothing', async () => {
+orchestratorTest('privacy: a CN id card blocks the transfer, writing and parking nothing', async () => {
   const spaces = await openSpaces();
   const { source, target } = spaces;
   try {
@@ -317,7 +317,7 @@ test('privacy: a CN id card blocks the transfer, writing and parking nothing', a
   }
 });
 
-test('privacy: an assignment-shaped credential blocks without leaking the secret', async () => {
+orchestratorTest('privacy: an assignment-shaped credential blocks without leaking the secret', async () => {
   const spaces = await openSpaces();
   const { source, target } = spaces;
   try {
@@ -353,7 +353,7 @@ test('privacy: an assignment-shaped credential blocks without leaking the secret
   }
 });
 
-test('raw_turn meta is stripped before the copy reaches the target', async () => {
+orchestratorTest('raw_turn meta is stripped before the copy reaches the target', async () => {
   const spaces = await openSpaces();
   const { source, target } = spaces;
   try {
@@ -395,7 +395,7 @@ test('raw_turn meta is stripped before the copy reaches the target', async () =>
   }
 });
 
-test('scanPrivacy: only privacy-shaped content is blocked', () => {
+orchestratorTest('scanPrivacy: only privacy-shaped content is blocked', () => {
   assert.deepEqual(scanPrivacy('the token budget for the planner is 4000 tokens'), {
     blocked: false,
     categories: [],
@@ -424,7 +424,7 @@ test('scanPrivacy: only privacy-shaped content is blocked', () => {
   assert.equal(verdict.blocked, true);
 });
 
-test('sanitiseTransferMeta: deep-clones, strips raw_* at every level, never mutates', () => {
+orchestratorTest('sanitiseTransferMeta: deep-clones, strips raw_* at every level, never mutates', () => {
   const input = {
     raw_turn: 'x',
     keep: 'ok',
@@ -450,7 +450,7 @@ test('sanitiseTransferMeta: deep-clones, strips raw_* at every level, never muta
   });
 });
 
-test('buildTransferRecord: tags, salience, time, entity and sanitised meta', () => {
+orchestratorTest('buildTransferRecord: tags, salience, time, entity and sanitised meta', () => {
   assert.deepEqual(TRANSFER_MODES, ['copy', 'move']);
   assert.ok(Object.isFrozen(TRANSFER_MODES));
 
@@ -497,7 +497,7 @@ test('buildTransferRecord: tags, salience, time, entity and sanitised meta', () 
   }
 });
 
-test('transferBetweenSpaces: mode and ids are validated before any side effect', async () => {
+orchestratorTest('transferBetweenSpaces: mode and ids are validated before any side effect', async () => {
   const spaces = await openSpaces();
   const { source, target } = spaces;
   try {
@@ -531,7 +531,7 @@ test('transferBetweenSpaces: mode and ids are validated before any side effect',
   }
 });
 
-test('memory.transferEvents: copy through the public facade', async (t) => {
+orchestratorTest('memory.transferEvents: copy through the public facade', async (t) => {
   const source = await makeMemory({ policy: SMALL_POLICY });
   let opened = null;
   try {

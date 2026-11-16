@@ -16,12 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { ContextEngine } from '../src/context/contextEngine.js';
-import {
-  DEFAULT_SPACE_ID,
-  SPACE_ID_PATTERN,
-  SpaceRouter,
-  normaliseSpaceId,
-} from '../../dsh-orchestrator/src/spaceRouter.js';
+import { orchestratorTest, DEFAULT_SPACE_ID, SPACE_ID_PATTERN, SpaceRouter, normaliseSpaceId } from './orchestrator.js';
 import { FakeClock, T0, tempDir } from './helpers.js';
 
 /**
@@ -60,7 +55,7 @@ function makeRouter(dir) {
   return { router, owner, calls };
 }
 
-test('different spaces run concurrently while one space stays FIFO', async () => {
+orchestratorTest('different spaces run concurrently while one space stays FIFO', async () => {
   const dir = tempDir('space-concurrency');
   const { router } = makeRouter(dir);
   try {
@@ -121,7 +116,7 @@ test('different spaces run concurrently while one space stays FIFO', async () =>
   }
 });
 
-test('spaces are isolated directories and unsafe ids are rejected', async () => {
+orchestratorTest('spaces are isolated directories and unsafe ids are rejected', async () => {
   const dir = tempDir('space-isolation');
   const { router, owner, calls } = makeRouter(dir);
   try {
@@ -191,7 +186,7 @@ test('spaces are isolated directories and unsafe ids are rejected', async () => 
   }
 });
 
-test('nativeState switches to layered exactly at the native token limit', () => {
+orchestratorTest('nativeState switches to layered exactly at the native token limit', () => {
   const clock = new FakeClock(T0);
   // No config overrides: the documented defaults must be 4000 / 8000.
   const engine = new ContextEngine({ clock, getPolicy: () => ({}) });
@@ -222,7 +217,7 @@ test('nativeState switches to layered exactly at the native token limit', () => 
   assert.equal(sessionEngine.nativeState().effectiveTokens, 9000, 'max(blocks, session), not blocks alone');
 });
 
-test('remainingTokens measures headroom to the handoff point', () => {
+orchestratorTest('remainingTokens measures headroom to the handoff point', () => {
   const engine = new ContextEngine({
     clock: new FakeClock(T0),
     getPolicy: () => ({}),
@@ -244,7 +239,7 @@ test('remainingTokens measures headroom to the handoff point', () => {
   assert.equal(native.rolloverDue, false);
 });
 
-test('rollover disabled forces eviction at 95% of the native window', () => {
+orchestratorTest('rollover disabled forces eviction at 95% of the native window', () => {
   const clock = new FakeClock(T0);
   const base = {
     clock,
@@ -289,7 +284,7 @@ test('rollover disabled forces eviction at 95% of the native window', () => {
   assert.ok(report.evicted.length > 0);
 });
 
-test('legacy threshold eviction is unchanged', () => {
+orchestratorTest('legacy threshold eviction is unchanged', () => {
   const engine = new ContextEngine({
     clock: new FakeClock(T0),
     getPolicy: () => ({}),

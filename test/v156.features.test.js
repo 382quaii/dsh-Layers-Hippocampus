@@ -18,6 +18,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+// v1.6.6 (M3): the multi-space surface only exists when the orchestrator package is
+// installed; without it these cases are registered as skipped (with the reason).
+import { orchestratorTest } from './orchestrator.js';
 import { apply, getRuntime } from '../index.js';
 import { resolveConfig } from '../src/config.js';
 import { Memory } from '../src/memory.js';
@@ -137,7 +140,7 @@ test('multiSpace=false: engine and capabilities refuse space operations', async 
   });
 });
 
-test('crossSpaceTransfer=false alone: reads/writes work, transfer is refused', async () => {
+orchestratorTest('crossSpaceTransfer=false alone: reads/writes work, transfer is refused', async () => {
   await withPlugin({ features: { crossSpaceTransfer: false } }, async ({ ctx, runtime }) => {
     assert.equal(ctx.toolsMap.has('memory_space_transfer'), false);
     assert.equal(ctx.toolsMap.has('memory_transfer_to_global'), false);
@@ -153,7 +156,7 @@ test('crossSpaceTransfer=false alone: reads/writes work, transfer is refused', a
   });
 });
 
-test('defaults: space tools + capabilities stay on (no regression)', async () => {
+orchestratorTest('defaults: space tools + capabilities stay on (no regression)', async () => {
   await withPlugin({}, async ({ ctx, runtime }) => {
     assert.equal(ctx.toolsMap.has('memory_space_transfer'), true);
     assert.equal(ctx.toolsMap.has('memory_transfer_to_global'), true);

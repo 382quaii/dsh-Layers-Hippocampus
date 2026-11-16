@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 import { Memory } from '../src/memory.js';
-import { ContentRegistry } from '../../dsh-orchestrator/src/dedupe.js';
+import { orchestratorTest, ContentRegistry } from './orchestrator.js';
 import { FakeClock, SMALL_POLICY, T0, tempDir } from './helpers.js';
 
 const DAY = 86_400_000;
@@ -32,7 +32,7 @@ async function seed(memory, { monthly = true } = {}) {
   return { a, b, memo };
 }
 
-test('the memo wins over owned events and reports merge stats', async () => {
+orchestratorTest('the memo wins over owned events and reports merge stats', async () => {
   const dir = tempDir('read-merge');
   const clock = new FakeClock(T0);
   const dedupe = new ContentRegistry();
@@ -52,7 +52,7 @@ test('the memo wins over owned events and reports merge stats', async () => {
   }
 });
 
-test('without the Orchestrator dedupe service the recall payload is unchanged', async () => {
+orchestratorTest('without the Orchestrator dedupe service the recall payload is unchanged', async () => {
   const dir = tempDir('read-merge-plain');
   const clock = new FakeClock(T0);
   const memory = await Memory.open({ dataDir: dir, clock, policy: SMALL_POLICY });

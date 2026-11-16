@@ -20,6 +20,9 @@ import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
 import fs from 'node:fs';
 import test from 'node:test';
+// v1.6.6 (M3): the multi-space surface only exists when the orchestrator package is
+// installed; without it these cases are registered as skipped (with the reason).
+import { orchestratorTest } from './orchestrator.js';
 import { apply, getRuntime } from '../index.js';
 import { resolveConfig } from '../src/config.js';
 import { EDITABLE_CONFIG_KEYS, MEMORY_API, createMemoryRoutes, validatePatch } from '../src/webRoutes.js';
@@ -79,7 +82,7 @@ test('MEM_E_REQUIRE_USER_CONSENT: the engine gate fires before any validation or
   });
 });
 
-test('the agent tool blocks without user_approved and succeeds with it', async () => {
+orchestratorTest('the agent tool blocks without user_approved and succeeds with it', async () => {
   await withPlugin({}, async ({ host, runtime }) => {
     const stored = await seed(runtime);
     const definition = host.tools.get('memory_space_transfer');
@@ -105,7 +108,7 @@ test('the agent tool blocks without user_approved and succeeds with it', async (
   });
 });
 
-test('transfer_to_global honours the same gate and targets the global space', async () => {
+orchestratorTest('transfer_to_global honours the same gate and targets the global space', async () => {
   await withPlugin({}, async ({ host, runtime }) => {
     const stored = await seed(runtime, 'global transfer probe', ['consent:global']);
     const definition = host.tools.get('memory_transfer_to_global');
@@ -124,7 +127,7 @@ test('transfer_to_global honours the same gate and targets the global space', as
   });
 });
 
-test('the operator can disable the gate explicitly (and only then does it pass)', async () => {
+orchestratorTest('the operator can disable the gate explicitly (and only then does it pass)', async () => {
   await withPlugin({ context: { requireExplicitConsentForTransfer: false } }, async ({ host, runtime }) => {
     const stored = await seed(runtime, 'gate-off probe', ['consent:off']);
     const definition = host.tools.get('memory_space_transfer');
@@ -134,7 +137,7 @@ test('the operator can disable the gate explicitly (and only then does it pass)'
   });
 });
 
-test('engine-level transferEvents enforces the same contract', async () => {
+orchestratorTest('engine-level transferEvents enforces the same contract', async () => {
   const { memory, cleanup } = await makeMemory();
   try {
     const stored = await memory.remember({ content: 'engine consent probe', tags: ['consent:engine'], salience: 0.9 });
@@ -154,7 +157,7 @@ test('engine-level transferEvents enforces the same contract', async () => {
   }
 });
 
-test('prompt layer: the red-line block names both tools and the retry protocol', async () => {
+orchestratorTest('prompt layer: the red-line block names both tools and the retry protocol', async () => {
   await withPlugin({}, async ({ host }) => {
     const policy = host.sections.find((section) => section.name === 'memory:policy');
     assert.ok(policy, 'the static policy section exists');

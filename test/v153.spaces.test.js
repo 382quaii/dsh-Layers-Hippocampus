@@ -23,7 +23,7 @@ import { createRuntime } from '../index.js';
 import { resolveConfig, toMemoryOptions } from '../src/config.js';
 import { ErrorCodes } from '../src/errors.js';
 import { MEMORY_API, createMemoryRoutes, registerMemoryRoutes } from '../src/webRoutes.js';
-import { validateNewSpaceId } from '../../dsh-orchestrator/src/spaceRouter.js';
+import { orchestratorTest, validateNewSpaceId } from './orchestrator.js';
 import { createOrchestratorStub, FakeClock, T0, makeMemory, tempDir } from './helpers.js';
 
 const CLIENT_PATH = new URL('../ui/client.js', import.meta.url);
@@ -75,7 +75,7 @@ async function withRuntime(body) {
 
 // ---- 1. route-drift lock (the direct 404 prevention) -----------------------
 
-test('every client API path exists verbatim in the backend route table (no slash drift)', () => {
+orchestratorTest('every client API path exists verbatim in the backend route table (no slash drift)', () => {
   const source = fs.readFileSync(CLIENT_PATH, 'utf8');
   // The client keeps one API constant table. Parse it and compare path-by-path.
   const tableStart = source.indexOf('const API = {');
@@ -105,7 +105,7 @@ test('every client API path exists verbatim in the backend route table (no slash
 
 // ---- 2. engine Fail-Fast: MEM_E_SPACE_INVALID ------------------------------
 
-test('validateNewSpaceId rejects malformed / reserved / default ids with MEM_E_SPACE_INVALID', () => {
+orchestratorTest('validateNewSpaceId rejects malformed / reserved / default ids with MEM_E_SPACE_INVALID', () => {
   const invalid = ['', '   ', 'Bad', 'bad id!', 'a/b', '..', '.', 'work.', 'con', 'nul', 'com1', 'x'.repeat(65), null, 42];
   for (const value of invalid) {
     assert.throws(
@@ -121,7 +121,7 @@ test('validateNewSpaceId rejects malformed / reserved / default ids with MEM_E_S
   assert.equal(ErrorCodes.SPACE_INVALID, 'MEM_E_SPACE_INVALID');
 });
 
-test('Memory.createSpace rejects conflicts before writing anything', async () => {
+orchestratorTest('Memory.createSpace rejects conflicts before writing anything', async () => {
   const { memory, cleanup } = await makeMemory();
   try {
     const first = await memory.createSpace('33');
@@ -145,7 +145,7 @@ test('Memory.createSpace rejects conflicts before writing anything', async () =>
 
 // ---- 3. HTTP: 201 / 400 MEM_E_SPACE_INVALID / capability handshake ---------
 
-test('POST /spaces creates (201), rejects invalid + duplicate (400 MEM_E_SPACE_INVALID)', async () => {
+orchestratorTest('POST /spaces creates (201), rejects invalid + duplicate (400 MEM_E_SPACE_INVALID)', async () => {
   await withRuntime(async ({ runtime }) => {
     const routes = createMemoryRoutes({ runtime });
     const created = await call(
@@ -184,7 +184,7 @@ test('POST /spaces creates (201), rejects invalid + duplicate (400 MEM_E_SPACE_I
 // The strongest anti-404 assertion: take the path the CLIENT actually calls,
 // register the routes the way the host does, dispatch a real POST through that
 // exact path, and prove a HANDLER answered (never the router's 404).
-test('the client create path is captured by the registered host routes (no 404)', async () => {
+orchestratorTest('the client create path is captured by the registered host routes (no 404)', async () => {
   await withRuntime(async ({ runtime }) => {
     const source = fs.readFileSync(CLIENT_PATH, 'utf8');
     const literal = /spaces:\s*'([^']+)'/.exec(source)?.[1];
@@ -245,7 +245,7 @@ function loadClient() {
   });
 }
 
-test('the client maps 404 and route-missing failures to the exact human copy', () => {
+orchestratorTest('the client maps 404 and route-missing failures to the exact human copy', () => {
   const module = loadClient();
   assert.equal(typeof module.describeSpaceError, 'function');
   assert.equal(module.describeSpaceError({ code: 'MEM_E_SPACES', message: 'HTTP 404' }), FRIENDLY_404);
@@ -275,7 +275,7 @@ test('the client maps 404 and route-missing failures to the exact human copy', (
   }
 });
 
-test('the capability handshake turns an old host into a version hint, not a 404', () => {
+orchestratorTest('the capability handshake turns an old host into a version hint, not a 404', () => {
   const module = loadClient();
   assert.equal(module.spaceCreateAvailable({ capabilities: { spaces: true } }).available, true);
   for (const payload of [null, {}, { capabilities: {} }, { capabilities: { spaces: false } }]) {

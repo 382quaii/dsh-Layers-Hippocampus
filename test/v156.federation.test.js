@@ -8,8 +8,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Memory } from '../src/memory.js';
-import { ContentRegistry } from '../../dsh-orchestrator/src/dedupe.js';
-import { FederationMap } from '../../dsh-orchestrator/src/federation.js';
+import { orchestratorTest, ContentRegistry, FederationMap } from './orchestrator.js';
 import { SMALL_POLICY, T0, tempDir } from './helpers.js';
 
 const DAY = 86_400_000;
@@ -20,7 +19,7 @@ async function openSpace(spaceId, federation, dedupe) {
   return { memory, dir };
 }
 
-test('business tags are federated across spaces; internal status tags are not', async () => {
+orchestratorTest('business tags are federated across spaces; internal status tags are not', async () => {
   const federation = new FederationMap();
   const a = await openSpace('a', federation, null);
   const b = await openSpace('b', federation, null);
@@ -39,7 +38,7 @@ test('business tags are federated across spaces; internal status tags are not', 
   }
 });
 
-test('a cross-space monthly memo is claimed once; the sibling space skips its copy', async () => {
+orchestratorTest('a cross-space monthly memo is claimed once; the sibling space skips its copy', async () => {
   const dedupe = new ContentRegistry();
   const a = await openSpace('a', null, dedupe);
   const b = await openSpace('b', null, dedupe);

@@ -14,6 +14,9 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
+// v1.6.6 (M3): the multi-space surface only exists when the orchestrator package is
+// installed; without it these cases are registered as skipped (with the reason).
+import { orchestratorTest } from './orchestrator.js';
 import { apply, compileParameters, createRuntime, defineTool, getRuntime, REFLECTION_THRESHOLD } from '../index.js';
 import { resolveConfig, toMemoryOptions } from '../src/config.js';
 import { isProcessAlive, migrateDataDir } from '../src/migration.js';
@@ -36,7 +39,7 @@ test('P0: every registered tool schema has an object root and a required list', 
   assert.equal(tool.parameters.type, 'object');
 });
 
-test('P0: the host-facing definitions are object-rooted, including memory_admin', async () => {
+orchestratorTest('P0: the host-facing definitions are object-rooted, including memory_admin', async () => {
   const dir = tempDir('schema');
   const host = fakeCtx();
   try {

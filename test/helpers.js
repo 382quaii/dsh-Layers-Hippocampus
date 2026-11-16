@@ -16,8 +16,14 @@ import { CONFIG_SCHEMA_VERSION, migrateConfig } from '../src/config.js';
 import { Memory } from '../src/memory.js';
 // v1.5.6 physical split: the multi-space engine lives in the sibling package; the
 // suite injects it through the same adapter seam the Host service uses.
-import { SpaceRouter as MultiSpaceRouter } from '../../dsh-orchestrator/src/spaceRouter.js';
-import { transferBetweenSpaces } from '../../dsh-orchestrator/src/transfer.js';
+// v1.6.6 (M3): resolved through `test/orchestrator.js` so the memory package can be
+// tested on its own — see that file for why a bare `../../dsh-orchestrator` import
+// made the suite un-publishable. `MultiSpaceRouter` is null when it is absent, and
+// every fixture below then degrades to single-space instead of constructing `new null()`.
+import { SpaceRouter as MultiSpaceRouter, transferBetweenSpaces, unavailableReason } from './orchestrator.js';
+
+/** Multi-space fixtures need the orchestrator package; absent it they run single-space. */
+export const MULTI_SPACE_AVAILABLE = MultiSpaceRouter !== null && transferBetweenSpaces !== null;
 
 export { DAY_MS, FakeClock };
 
@@ -29,6 +35,7 @@ export function tempDir(prefix = 'dsh-memory-test') {
 }
 
 export function createOrchestratorStub({ dedupe = null, federation = null } = {}) {
+  if (!MULTI_SPACE_AVAILABLE) return null;
   return {
     createSpaceAdapter: ({ owner, dataDir, openChild }) => new MultiSpaceRouter({ owner, dataDir, openChild }),
     transfer: transferBetweenSpaces,
@@ -37,11 +44,17 @@ export function createOrchestratorStub({ dedupe = null, federation = null } = {}
   };
 }
 
+/** Readable failure for a test that truly needs the router while it is absent. */
+function requireMultiSpace() {
+  if (!MULTI_SPACE_AVAILABLE) throw new Error(`${unavailableReason} (multi-space fixture unavailable)`);
+}
+
 /**
  * Options that inject the Orchestrator's multi-space engine into a raw
  * `Memory.open(...)` call (tests that bypass the plugin runtime).
  */
 export function multiSpaceOptions({ config = {}, dedupe = null, federation = null } = {}) {
+  requireMultiSpace();
   const buildSpaces = (owner) =>
     new MultiSpaceRouter({
       owner,
@@ -65,7 +78,7 @@ export function multiSpaceOptions({ config = {}, dedupe = null, federation = nul
 /** Policy that admits tags after a single event, so small fixtures have a resident set. */
 export const SMALL_POLICY = Object.freeze({ activeSet: { minEvents: 1, minMass: 0.01 } });
 
-export async function makeMemory({ dir = tempDir(), start = T0, policy = SMALL_POLICY, config = {}, multiSpace = true, dedupe = null, federation = null } = {}) {
+export async function makeMemory({ dir = tempDir(), start = T0, policy = SMALL_POLICY, config = {}, multiSpace = MULTI_SPACE_AVAILABLE, dedupe = null, federation = null } = {}) {
   const clock = new FakeClock(start);
   // v1.5.6: L2 multi-merge is exercised by its own suite. Fixtures disable it by
   // default so a test that floods ONE tag keeps exact index counts; a test that
@@ -88,23 +101,30 @@ export async function makeMemory({ dir = tempDir(), start = T0, policy = SMALL_P
   };
   // v1.5.6 physical split: multi-space lives in dsh-orchestrator; the engine tests
   // inject its router/transfer through the same adapter seam the Host uses.
-  const buildSpaces = (owner) =>
-    new MultiSpaceRouter({
-      owner,
-      dataDir: owner.dataDir,
-      openChild: async (childDir) =>
-        Memory.open({
-          dataDir: childDir,
-          clock: owner.clock,
-          policy: owner._policyInput ?? policy,
-          config: resolvedConfig,
-          spaceId: String(childDir).split(/[\\/]/).pop(),
-          spacesFactory: buildSpaces,
-          transfer: transferBetweenSpaces,
-          ...(dedupe ? { dedupe } : {}),
-          ...(federation ? { federation } : {}),
-        }),
-    });
+  // v1.6.6 (M3): when the orchestrator is not installed the fixture opens a plain
+  // single-space memory instead of building a router out of nothing.
+  const buildSpaces = MULTI_SPACE_AVAILABLE
+    ? (owner) =>
+        new MultiSpaceRouter({
+          owner,
+          dataDir: owner.dataDir,
+          openChild: async (childDir) =>
+            Memory.open({
+              dataDir: childDir,
+              clock: owner.clock,
+              policy: owner._policyInput ?? policy,
+              config: resolvedConfig,
+              spaceId: String(childDir).split(/[\\/]/).pop(),
+              spacesFactory: buildSpaces,
+              transfer: transferBetweenSpaces,
+              ...(dedupe ? { dedupe } : {}),
+              ...(federation ? { federation } : {}),
+            }),
+        })
+    : null;
+  if (multiSpace === true && !MULTI_SPACE_AVAILABLE) {
+    throw new Error(`${unavailableReason} (makeMemory({ multiSpace: true }) needs it)`);
+  }
   const memory = await Memory.open({
     dataDir: dir,
     clock,
@@ -112,7 +132,7 @@ export async function makeMemory({ dir = tempDir(), start = T0, policy = SMALL_P
     config: resolvedConfig,
     ...(dedupe ? { dedupe } : {}),
     ...(federation ? { federation } : {}),
-    ...(multiSpace ? { spacesFactory: buildSpaces, transfer: transferBetweenSpaces } : {}),
+    ...(multiSpace && MULTI_SPACE_AVAILABLE ? { spacesFactory: buildSpaces, transfer: transferBetweenSpaces } : {}),
   });
   return {
     memory,
@@ -208,7 +228,12 @@ export function fakeCtx({ orchestrator = true } = {}) {
   services.set('commands', commands);
   // v1.5.6: the space adapter is an optional Host service (dsh-orchestrator).
   // Engine/plugin tests get it by default; single-space tests set it false.
-  if (orchestrator) services.set('orchestrator', createOrchestratorStub());
+  // v1.6.6 (M3): no orchestrator installed → no service (the plugin already treats
+  // it as "multi-space unavailable" at runtime, so this is the honest fixture).
+  if (orchestrator) {
+    const stub = createOrchestratorStub();
+    if (stub) services.set('orchestrator', stub);
+  }
   const ctx = {
     logger: { info() {}, warn() {}, error() {}, debug() {} },
     tools: {

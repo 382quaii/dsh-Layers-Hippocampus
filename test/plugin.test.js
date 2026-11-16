@@ -10,6 +10,9 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+// v1.6.6 (M3): the multi-space surface only exists when the orchestrator package is
+// installed; without it these cases are registered as skipped (with the reason).
+import { orchestratorTest } from './orchestrator.js';
 import { apply, getRuntime, inject, resolveConfig } from '../index.js';
 import { createOrchestratorStub, tempDir } from './helpers.js';
 
@@ -120,7 +123,7 @@ test('an invalid policy is rejected at activation, before any store is created',
   }
 });
 
-test('apply registers ten tools and both prompt layers, and dispose removes them', async () => {
+orchestratorTest('apply registers ten tools and both prompt layers, and dispose removes them', async () => {
   const dir = tempDir('ctx');
   const ctx = fakeCtx();
   try {

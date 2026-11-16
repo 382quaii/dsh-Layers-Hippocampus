@@ -9,12 +9,12 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { ContentRegistry } from '../../dsh-orchestrator/src/dedupe.js';
+import { orchestratorTest, ContentRegistry } from './orchestrator.js';
 import { makeMemory, T0 } from './helpers.js';
 
 const DAY = 86_400_000;
 
-test('recallAcrossSpaces returns hits from every space with provenance', async () => {
+orchestratorTest('recallAcrossSpaces returns hits from every space with provenance', async () => {
   const dedupe = new ContentRegistry();
   const fixture = await makeMemory({ dedupe });
   try {
@@ -36,7 +36,7 @@ test('recallAcrossSpaces returns hits from every space with provenance', async (
   }
 });
 
-test('a monthly memo hides its owned events across spaces', async () => {
+orchestratorTest('a monthly memo hides its owned events across spaces', async () => {
   const dedupe = new ContentRegistry();
   const fixture = await makeMemory({ dedupe });
   try {

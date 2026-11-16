@@ -12,6 +12,9 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
+// v1.6.6 (M3): the multi-space surface only exists when the orchestrator package is
+// installed; without it these cases are registered as skipped (with the reason).
+import { orchestratorTest } from './orchestrator.js';
 import { apply, getRuntime } from '../index.js';
 import { createOrchestratorStub, fakeCtx, makeMemory, tempDir } from './helpers.js';
 
@@ -73,7 +76,7 @@ test('without the Orchestrator service the plugin advertises and registers only 
   }
 });
 
-test('injecting the Orchestrator service brings the multi-space surface back', async () => {
+orchestratorTest('injecting the Orchestrator service brings the multi-space surface back', async () => {
   const dir = tempDir('single-space-orch');
   const { ctx, tools, services, dispose } = fakeCtx({ orchestrator: false });
   services.set('orchestrator', createOrchestratorStub());

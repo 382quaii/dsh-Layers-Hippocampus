@@ -14,6 +14,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import test from 'node:test';
+// v1.6.6 (M3): the multi-space surface only exists when the orchestrator package is
+// installed; without it these cases are registered as skipped (with the reason).
+import { orchestratorTest } from './orchestrator.js';
 import { apply, getRuntime, ORCHESTRATOR_REPO } from '../index.js';
 import { MEMORY_API, createMemoryRoutes } from '../src/webRoutes.js';
 import { createOrchestratorStub, fakeCtx, tempDir } from './helpers.js';
@@ -66,7 +69,7 @@ async function withPluginManager(manager, body) {
   }
 }
 
-test('already installed is reported without touching the Host installer', async () => {
+orchestratorTest('already installed is reported without touching the Host installer', async () => {
   let called = 0;
   const { ctx } = { ctx: null };
   const manager = { inspect: async () => ({ status: 'accepted' }), installBundle: async () => { called += 1; return { application: 'applied' }; } };

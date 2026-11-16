@@ -16,6 +16,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+// v1.6.6 (M3): the multi-space surface only exists when the orchestrator package is
+// installed; without it these cases are registered as skipped (with the reason).
+import { orchestratorTest } from './orchestrator.js';
 import { HANDOFF_TAG, FOLDED_TAG } from '../src/memory.js';
 import { resolveConfig, toMemoryOptions } from '../src/config.js';
 import { apply, createRuntime, getRuntime } from '../index.js';
@@ -172,7 +175,7 @@ test('a NEW session consumes the previous handoff marker', async () => {
   }
 });
 
-test('targetSpaceId isolates stores, survives concurrent writes and rejects path-like ids', async () => {
+orchestratorTest('targetSpaceId isolates stores, survives concurrent writes and rejects path-like ids', async () => {
   const { memory, cleanup } = await makeMemory();
   try {
     const [alpha, beta] = await Promise.all([
@@ -230,7 +233,7 @@ test('the panel session group feeds the status bar contract', async () => {
   }
 });
 
-test('the memory_space_transfer tool defaults to copy and routes to the target space', async () => {
+orchestratorTest('the memory_space_transfer tool defaults to copy and routes to the target space', async () => {
   const dir = tempDir('v150-transfer-tool');
   const host = fakeCtx();
   try {

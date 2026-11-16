@@ -19,6 +19,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import test from 'node:test';
+// v1.6.6 (M3): the multi-space surface only exists when the orchestrator package is
+// installed; without it these cases are registered as skipped (with the reason).
+import { orchestratorTest } from './orchestrator.js';
 import { resolveConfig } from '../src/config.js';
 import { Memory } from '../src/memory.js';
 import { EDITABLE_CONFIG_KEYS } from '../src/webRoutes.js';
@@ -93,7 +96,7 @@ test('recall returns hits verbatim: no confidence annotation, no low-confidence 
 
 // ---- B. multi-space fixed overhead ----------------------------------------
 
-test('multi-space overhead: bounded lazy boot and linear storage for N=10', { timeout: 60_000 }, async () => {
+orchestratorTest('multi-space overhead: bounded lazy boot and linear storage for N=10', { timeout: 60_000 }, async () => {
   const N = 10;
   const PER_SPACE = 20;
   const rootDir = tempDir('v154-multispace');

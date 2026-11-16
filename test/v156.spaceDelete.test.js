@@ -15,6 +15,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import test from 'node:test';
+// v1.6.6 (M3): the multi-space surface only exists when the orchestrator package is
+// installed; without it these cases are registered as skipped (with the reason).
+import { orchestratorTest } from './orchestrator.js';
 import { apply, getRuntime } from '../index.js';
 import { MEMORY_API, createMemoryRoutes } from '../src/webRoutes.js';
 import { fakeCtx, makeMemory, T0, tempDir } from './helpers.js';
@@ -52,7 +55,7 @@ async function call(routes, request) {
   return res;
 }
 
-test('a named space can be deleted; default and missing spaces are refused', async () => {
+orchestratorTest('a named space can be deleted; default and missing spaces are refused', async () => {
   const fixture = await makeMemory();
   try {
     const { memory } = fixture;
@@ -101,7 +104,7 @@ test('the strict single-space core refuses deletion entirely', async () => {
   }
 });
 
-test('the capabilities handshake versions deletion (old hosts hide the button)', async () => {
+orchestratorTest('the capabilities handshake versions deletion (old hosts hide the button)', async () => {
   const dir = tempDir('space-delete-caps');
   const { ctx, dispose } = fakeCtx();
   try {
@@ -124,7 +127,7 @@ test('the capabilities handshake versions deletion (old hosts hide the button)',
   }
 });
 
-test('POST /spaces {action:delete} removes the space and returns the refreshed list', async () => {
+orchestratorTest('POST /spaces {action:delete} removes the space and returns the refreshed list', async () => {
   const dir = tempDir('space-delete-route');
   const { ctx, dispose } = fakeCtx();
   try {
