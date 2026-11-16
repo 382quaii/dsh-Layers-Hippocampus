@@ -1,7 +1,7 @@
 # dsh-layers-hippocampus · 功能 / 实现 / 版本演进
 
 > 版本基线：**v1.6.5（2026-11-15：回归微内核——`/memory` 指令集（0 Token）、蒸馏唯一调度器与月记防重复咀嚼、原子服务接口 `getLatestHandoffSummary()`；并含 1.6.4 的 1M 溢出修复与 1.6.3 未曾发布的全部内容）**
-> 验证状态：**502 / 502 测试通过**（80 个测试文件 · 52 个源码文件 · 零运行时依赖）
+> 验证状态：**503 / 503 测试通过**（80 个测试文件 · 52 个源码文件 · 零运行时依赖）
 > 数据位置（本机当前）：`D:\Users\86135\memory`（本地 JSONL，可迁移）
 > 本文与 `README.md`、`docs/ARCHITECTURE.zh.md`、`CHANGELOG.md`、`docs/RELEASE-1.6.5.md` 配套。
 
@@ -173,7 +173,7 @@ DeepSeek Harness（DSH）的**本地优先长期记忆 Host 插件**。它不把
 
 ## 6. 测试与质量
 
-- **502 / 502 通过**，80 个测试文件；进程内 `node --test`（`test/run.mjs`），30 秒看门狗，时间一律注入 `FakeClock`。
+- **503 / 503 通过**，80 个测试文件；进程内 `node --test`（`test/run.mjs`），30 秒看门狗，时间一律注入 `FakeClock`。
 - 覆盖维度：身份幂等、索引重建一致性、召回排序与置信度、raw 四字段与游标扫描、哈希恢复、两阶段删除与墓碑、标签树生命周期与重放一致性、多空间降级、配置 fail-fast、UI 源码契约、崩溃恢复（200ms checkpoint 窗口）、事件循环让出。
 - 运维脚本：`scripts/bench-protocol.mjs`（基准协议）、`scripts/repair-handoff.mjs`（交接修复）。
 
@@ -194,7 +194,7 @@ DeepSeek Harness（DSH）的**本地优先长期记忆 Host 插件**。它不把
 ## 8. 快速开始（本机）
 
 ```powershell
-cd C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory
+cd D:\86135\Documents\dsh\workspace\dsh-memory
 node test/run.mjs                 # 399 测试
 node scripts/bench-protocol.mjs   # 写入/召回基准
 ```

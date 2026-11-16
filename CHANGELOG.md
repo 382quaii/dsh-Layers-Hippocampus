@@ -58,7 +58,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   与它同源、`executeDream()` 先跑月记并把日记标进 `promoted`、`maintain()` 不再产出月记、
   已晋升日记在下一轮仍被排除、以及上面那条「无 UI/追加模式监听」的源码扫描。
   `test/flow.test.js` 与 `test/v156.federation.test.js` 的月记断言随调度器迁移改为
-  `executeDream()`。全量 **502/502**（80 个测试文件）。
+  `executeDream()`。全量 **503/503**（80 个测试文件）。
 
 ## [1.6.4] — 2026-11-14
 
