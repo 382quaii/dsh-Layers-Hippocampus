@@ -2,7 +2,10 @@
 
 > 版本：**1.6.7**（2026-11-17：**发布链完整性修正**——事后核对发现 1.6.6 的 npm 制品（`gitHead 99a07cb`）是从**另一份旧 checkout** 发布的，只含 Live Compact 修复，**不含** M3/M5。本版把这两项送出去，并把已发布提交并入 `main` 历史、让 `v1.6.6` tag 指向 npm 实际制品。累计 1.6.6 的 Live Compact 修复、1.6.5 的微内核回归、1.6.4 的 1M 溢出修复、以及 1.6.3 的配置迁移与启动降级）。
 
-> 状态：**代码与文档已就绪；仓库推送 / npm 发布 / 市场 PR 需要你的 GitHub 与 npm 凭据，代理与网络，本会话未执行。**
+> 状态：**代码与文档已提交；`main` 与 `v1.6.7` tag 已推送到 GitHub（远端 `main = 2bd4f30`，
+> 三个 tag `v1.6.5→28776c7` / `v1.6.6→99a07cb` / `v1.6.7→2bd4f30` 与本地、npm 三方一致）。
+> 剩余 **npm publish** 未执行：本机 `~/.npmrc` 里的 token 已失效（`npm whoami` 返回
+> `E401 Unauthorized`），需要你重新登录或换一个新 token 后再发。**
 > 基线：`dsh-memory` 工作区，全量 **510/510 测试通过**（81 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；插件市场仍无条目（未发布 npm）。
 
