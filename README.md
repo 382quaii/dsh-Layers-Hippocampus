@@ -96,7 +96,14 @@
 - **单轮超大工具输出熔断（Live Compact）**：单个 `tool/result` 超过
   `context.liveCompact.thresholdChars`（默认 200,000 字符）时，保留头 4000 / 尾 2000 字符，
   中间压成一行指向 raw 日志的指针（带 `seq` / `call` / `tool` 坐标），原文仍可用
-  `deep_raw` 取回。宿主自带 `toolResultPruner` 时优先交给它。
+  `deep_raw` 取回。**只跑本插件自己的保守策略**，不委托宿主的 `toolResultPruner`
+  （1.6.6：宿主的预算是预设自己的 8k 级阈值，每轮委托等于每轮偷偷掉几十 k tokens）。
+- **索引式注入（1.6.7，默认）**：`context.injectMode = 'index'` 时，每个记忆块只往 Prompt
+  里放一行指针 `- [memory <eventId>] 标签 · 标题`，正文按需用 `recall` 取；
+  8,000 字符的正文（≈2,000 tokens）变成通常不到 60 tokens 的指针行。
+  `context.injectMode = 'full'` 是旧行为的一键回退（正文直接进 Prompt，按整段计费）。
+  `[Memory Blocks]` 标记名与缓存前缀语义保持不变；`briefing` 块（运营方钉死的策略）
+  永不降级为指针。
 
 ### `/memory` 指令集（0 Token）
 
@@ -247,7 +254,7 @@ node scripts/wait-for-routes.mjs
 设置 → 海马体记忆 顶部可切换 **简洁模式 / 专业模式**：
 
 - **简洁模式**只显示四块：**身份**（事件时间策略）、**上下文窗口**（预算 / 注入上限 /
-  淘汰阈值 / 收敛目标 / 是否注入）、**系统级存储位置迁移**、**原始回合留存**
+  淘汰阈值 / 收敛目标 / 是否注入 / 注入形态）、**系统级存储位置迁移**、**原始回合留存**
   （只留 `raw.mode`、总量上限、冷压缩引擎三项）。
 - 它是**纯显示层**：隐藏项不渲染，也不参与保存——POST 只携带可见键，文件里其余配置
   保持原值（新装即默认值，专业模式下调过的不会被覆盖）。
@@ -257,7 +264,7 @@ node scripts/wait-for-routes.mjs
 ### 6. 验证
 
 ```bash
-npm test        # 进程内全量用例（510 个）
+npm test        # 进程内全量用例（519 个）
 npm run check   # 语法检查 + 全量测试
 ```
 

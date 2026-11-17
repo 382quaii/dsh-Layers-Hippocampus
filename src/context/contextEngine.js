@@ -21,6 +21,43 @@ export function estimateTokens(text) {
   return Math.max(1, Math.ceil(String(text ?? '').length / 4));
 }
 
+/**
+ * v1.6.7 M1 — how a block reaches the prompt.
+ *
+ *   index  one pointer line: `- [memory <eventId>] tag1 · tag2 · <title>`
+ *   full   the legacy behaviour: `- [memory <eventId>] <first 200 chars of body>`
+ *
+ * `index` is the default because the pointer is enough to decide whether to call the
+ * recall tool, and the body costs prompt budget on every single turn.
+ */
+export const INDEX_MODE = 'index';
+export const FULL_MODE = 'full';
+export const INJECT_MODES = Object.freeze([INDEX_MODE, FULL_MODE]);
+/** Characters of the block body kept as its "title" in index mode. */
+export const INDEX_TITLE_CHARS = 80;
+/** Tags shown on one pointer line; the rest are implied by the recall result. */
+export const INDEX_TAG_LIMIT = 3;
+
+/**
+ * The ONE place a block becomes prompt text. `render()` and the token accounting
+ * both call it, so what the engine measures is exactly what it emits — the previous
+ * split (measure the body, emit a 200-char snippet) understated the window and is
+ * the bug this whole feature is about.
+ */
+export function renderBlockLine(block, { mode = INDEX_MODE } = {}) {
+  // A briefing block IS its own body: it is the pinned operator policy that must be
+  // read verbatim, so it never degrades to a pointer.
+  if (block.kind === 'briefing') return String(block.text ?? '');
+  if (mode === FULL_MODE) return `- [memory ${block.id}] ${snippet(block.text, 200)}`;
+  const tags = Array.isArray(block.tags) ? block.tags.filter(Boolean).slice(0, INDEX_TAG_LIMIT) : [];
+  const rawTitle = String(block.title ?? '').replace(/\s+/g, ' ').trim();
+  // The cap applies HERE, not only in inject(): renderBlockLine is exported and any
+  // caller (or a block restored from an older shape) may hand it an oversized title.
+  const title = rawTitle ? snippet(rawTitle, INDEX_TITLE_CHARS) : snippet(block.text, INDEX_TITLE_CHARS);
+  const head = tags.length > 0 ? tags.join(' · ') : block.kind;
+  return `- [memory ${block.id}] ${head}${title ? ` · ${title}` : ''}`;
+}
+
 export class ContextEngine {
   /**
    * @param {object}   options
@@ -48,6 +85,7 @@ export class ContextEngine {
     getHostWindow = null,
     getHostUsedTokens = null,
     getReservedTokens = null,
+    injectMode = null,
   } = {}) {
     this.clock = clock;
     this.getPolicy = getPolicy;
@@ -71,6 +109,12 @@ export class ContextEngine {
     this.getHostWindow = typeof getHostWindow === 'function' ? getHostWindow : null;
     this.getHostUsedTokens = typeof getHostUsedTokens === 'function' ? getHostUsedTokens : null;
     this.getReservedTokens = typeof getReservedTokens === 'function' ? getReservedTokens : null;
+    // v1.6.7 M1: `index` renders one pointer line per block (eventId + tags +
+    // title) instead of the block body. The body is NOT lost — it is fetched on
+    // demand with the recall tool. This is a prompt-budget decision: a full block is
+    // ~200 chars of context the model usually does not need yet, and it is paid for
+    // on EVERY turn while the block lives.
+    this.injectModeOverride = injectMode === INDEX_MODE || injectMode === FULL_MODE ? injectMode : null;
     this.statsFile = statsFile;
     /** @type {Array<object>} insertion-ordered block table */
     this.blocks = [];
@@ -104,6 +148,13 @@ export class ContextEngine {
       threshold: this.thresholdOverride ?? pol.threshold ?? 0.85,
       target: this.targetOverride ?? pol.target ?? 0.7,
     };
+  }
+
+  /** v1.6.7 M1: constructor override > policy > `index` (the documented default). */
+  get injectMode() {
+    const pol = this.getPolicy?.()?.context ?? {};
+    const mode = this.injectModeOverride ?? pol.injectMode;
+    return mode === FULL_MODE ? FULL_MODE : INDEX_MODE;
   }
 
   /**
@@ -259,6 +310,10 @@ export class ContextEngine {
     salience = 0.5,
     at,
     pinned = false,
+    // v1.6.7 M1 pointer metadata. Both are optional: a caller that supplies neither
+    // still gets a usable pointer (the title falls back to the head of the body).
+    title = null,
+    tags = null,
     now = this.clock.now(),
   }) {
     if (!id) throw new Error('ContextEngine.inject requires an id');
@@ -268,7 +323,15 @@ export class ContextEngine {
       id,
       kind,
       text: body,
-      tokens: Number.isFinite(tokens) ? Math.max(1, Math.round(tokens)) : estimateTokens(body),
+      title: title === null ? null : String(title).replace(/\s+/g, ' ').trim().slice(0, INDEX_TITLE_CHARS) || null,
+      tags: Array.isArray(tags) ? tags.filter((tag) => typeof tag === 'string' && tag.length > 0).slice(0, 12) : null,
+      // A caller that states a weight keeps it (tests and `[Active Task]` accounting
+      // depend on that); otherwise the weight is derived from the block, and
+      // `tokensOf()` re-derives it if `injectMode` later flips.
+      tokens: Number.isFinite(tokens)
+        ? Math.max(1, Math.round(tokens))
+        : estimateTokens(this.injectMode === FULL_MODE ? body : renderBlockLine({ id, kind, text: body, title, tags }, { mode: INDEX_MODE })),
+      explicitTokens: Number.isFinite(tokens) ? Math.max(1, Math.round(tokens)) : null,
       salience: Number.isFinite(salience) ? Math.max(0, Math.min(1, salience)) : 0.5,
       at: Number.isFinite(at) ? at : now,
       pinned: pinned === true,
@@ -286,8 +349,31 @@ export class ContextEngine {
     return block;
   }
 
+  /**
+   * Tokens this block costs in the prompt RIGHT NOW.
+   *
+   * `full` keeps the LEGACY weight (the whole body, even though `render()` shows a
+   * 200-char snippet): that accounting is the one every existing operator and test
+   * calibrated against, and silently shrinking it would make the window admit far
+   * more blocks than the old tuning expected.
+   *
+   * `index` charges the pointer LINE, because that is all it emits — charging for a
+   * body that never enters the prompt is exactly the waste M1 removes.
+   *
+   * Recomputed rather than stored: `injectMode` is live config, so a block injected
+   * while `full` was on must be re-measured the moment the mode flips. An explicit
+   * weight from the caller always wins — that is a contract, not an estimate.
+   */
+  tokensOf(block) {
+    if (block.explicitTokens !== null) return block.explicitTokens;
+    if (this.injectMode === FULL_MODE) return estimateTokens(block.text);
+    return estimateTokens(renderBlockLine(block, { mode: INDEX_MODE }));
+  }
+
   tokens() {
-    return this.blocks.reduce((sum, block) => sum + block.tokens, 0);
+    let sum = 0;
+    for (const block of this.blocks) sum += this.tokensOf(block);
+    return sum;
   }
 
   usage({ now = this.clock.now() } = {}) {
@@ -365,11 +451,19 @@ export class ContextEngine {
         }
       }
       if (!victim) break; // everything left is pinned: report, never force
+      const victimTokens = this.tokensOf(victim);
       this.blocks = this.blocks.filter((b) => b.id !== victim.id);
-      current -= victim.tokens;
+      current -= victimTokens;
       // Keep the TEXT of the victim: folding ("推币机") needs what was evicted,
       // not just its id — the block is gone from the window either way.
-      const record = { id: victim.id, kind: victim.kind, tokens: victim.tokens, score: round(victimScore, 6), text: victim.text, at: victim.at };
+      const record = {
+        id: victim.id,
+        kind: victim.kind,
+        tokens: victimTokens,
+        score: round(victimScore, 6),
+        text: victim.text,
+        at: victim.at,
+      };
       evictedNow.push(record);
       this.evicted.push({ ...record, at: now });
     }
@@ -399,11 +493,12 @@ export class ContextEngine {
    * Render the surviving blocks. v1.5.6: `excludeIds` lets prompt assembly drop
    * blocks already injected earlier in the SAME session (dedup by block id).
    */
-  render({ excludeIds = null } = {}) {
+  render({ excludeIds = null, mode = null } = {}) {
     const excluded = excludeIds instanceof Set ? excludeIds : null;
+    const renderMode = mode === FULL_MODE || mode === INDEX_MODE ? mode : this.injectMode;
     return this.blocks
       .filter((block) => !(excluded && excluded.has(block.id)))
-      .map((block) => (block.kind === 'briefing' ? block.text : `- [memory ${block.id}] ${snippet(block.text, 200)}`))
+      .map((block) => renderBlockLine(block, { mode: renderMode }))
       .join('\n');
   }
 
@@ -412,17 +507,20 @@ export class ContextEngine {
     return {
       ...this.usage({ now }),
       maxTokens,
+      injectMode: this.injectMode,
       // Native/layered measurement rides along with the panel snapshot so status
       // readers never have to reconstruct it from the block table.
       native: this.nativeState({ now }),
       blocks: this.blocks.map((block) => ({
         id: block.id,
         kind: block.kind,
-        tokens: block.tokens,
+        tokens: this.tokensOf(block),
         salience: block.salience,
         score: round(this.score(block, now), 6),
         pinned: block.pinned,
         at: block.at,
+        tags: block.tags,
+        title: block.title,
       })),
       recentlyEvicted: this.evicted.slice(-10),
       savedTokens: this.savedTokens,

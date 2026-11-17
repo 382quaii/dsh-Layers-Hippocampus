@@ -466,6 +466,8 @@ export class Memory {
       getHostWindow: typeof config.getHostWindow === 'function' ? config.getHostWindow : null,
       getHostUsedTokens: typeof config.getHostUsedTokens === 'function' ? config.getHostUsedTokens : null,
       getReservedTokens: typeof config.getReservedTokens === 'function' ? config.getReservedTokens : null,
+      // v1.6.7 M1: `index` (default) emits pointer lines instead of block bodies.
+      injectMode: config.context?.injectMode,
       statsFile: path.join(this.paths.state, 'context.json'),
     });
     this.deletePipeline = new DeletePipeline({

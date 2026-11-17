@@ -42,6 +42,7 @@ import { isLowValley, nextLowValleyStart, windowInfo } from './src/priceWindow.j
 import { DreamTimer } from './src/dreamTimer.js';
 import { probeCompression, resolveEngine } from './src/compression.js';
 import { LIVE_COMPACT_DEFAULTS, liveCompactSession } from './src/context/liveCompact.js';
+import { snippet } from './src/util.js';
 import { MEMORY_API, registerMemoryRoutes } from './src/webRoutes.js';
 
 export const name = 'memory';
@@ -133,6 +134,18 @@ export const PROMPT_STATE_RULES = [
   'Memory state (live). The engine measures and pages this window; never trim it yourself.',
   'Only the memory blocks listed below are remembered facts for this turn - do not invent memories, tags or details.',
   'When a detail is missing, call the memory tools instead of guessing.',
+].join('\n');
+
+/**
+ * v1.6.7 M1 — the `index` mode needs ONE extra sentence, or the model will treat a
+ * pointer line as if it were the memory itself. This is the only difference between
+ * the two rule sets; everything else stays byte-identical so the prefix cache is
+ * unaffected by a mode that does not change it.
+ */
+export const PROMPT_STATE_RULES_INDEX = [
+  PROMPT_STATE_RULES,
+  'Each block below is an INDEX POINTER: eventId, tags and a title. The full text is NOT here —',
+  'call the recall tool with that eventId (or its tags) when you actually need the detail.',
 ].join('\n');
 
 function errorJson(error) {
@@ -764,8 +777,11 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
         sessionId: usage?.sessionId ?? null,
         agentId: assemblyContext?.agent?.id ?? null,
       });
+      // v1.6.7 M1: in `index` mode the window renders pointer lines, so the rules
+      // must say so — otherwise the model reads a title as if it were the memory.
+      const rules = memory.context.injectMode === 'full' ? PROMPT_STATE_RULES : PROMPT_STATE_RULES_INDEX;
       return (
-        composePrompt({ rules: PROMPT_STATE_RULES, activeTask: activeTaskBlock, blocks, hints }) +
+        composePrompt({ rules, activeTask: activeTaskBlock, blocks, hints }) +
         marker +
         (coldStart ? `\n${coldStart}` : '')
       );
@@ -2927,12 +2943,24 @@ export async function apply(ctx, rawConfig = {}) {
 function injectRecall(runtime, result) {
   const { memory, config } = runtime;
   const now = memory.clock.now();
+  /** First line of a snippet is the most informative thing a pointer can carry. */
+  const pointerTitle = (hit) => {
+    const first = String(hit?.snippet ?? '')
+      .split('\n')
+      .map((line) => line.trim())
+      .find((line) => line.length > 0);
+    return first ? snippet(first, 96) : null;
+  };
   for (const hit of (result.hits ?? []).slice(0, memory.policy.context.blockTopK)) {
     if (!hit?.eventId) continue;
     memory.context.inject({
       id: hit.eventId,
       kind: 'recall',
+      // v1.6.7 M1: the body is kept (folding and `full` mode still need it) but in
+      // `index` mode only the pointer line reaches the prompt.
       text: `${hit.day ?? ''} ${hit.snippet ?? ''}`.trim(),
+      title: pointerTitle(hit),
+      tags: Array.isArray(hit.tags) ? hit.tags : null,
       salience: hit.salience,
       at: hit.eventTime,
       now,
@@ -2948,6 +2976,8 @@ function injectRecall(runtime, result) {
       id,
       kind: 'semantic',
       text: summary.text,
+      title: summary.title ?? null,
+      tags: summary.tags ?? null,
       salience: summary.confidence,
       at: summary.updatedAt,
       now,

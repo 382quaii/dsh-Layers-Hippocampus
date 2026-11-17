@@ -1,21 +1,34 @@
 # Release 1.6.7 — 发布准备（本地）
 
-> 版本：**1.6.7**（2026-11-17：**发布链完整性修正**——事后核对发现 1.6.6 的 npm 制品（`gitHead 99a07cb`）是从**另一份旧 checkout** 发布的，只含 Live Compact 修复，**不含** M3/M5。本版把这两项送出去，并把已发布提交并入 `main` 历史、让 `v1.6.6` tag 指向 npm 实际制品。累计 1.6.6 的 Live Compact 修复、1.6.5 的微内核回归、1.6.4 的 1M 溢出修复、以及 1.6.3 的配置迁移与启动降级）。
+> 版本：**1.6.7**（2026-11-17：**索引式提示注入 M1** + **发布链完整性修正**——事后核对发现 1.6.6 的 npm 制品（`gitHead 99a07cb`）是从**另一份旧 checkout** 发布的，只含 Live Compact 修复，**不含** M3/M5。本版把这两项送出去，并把已发布提交并入 `main` 历史、让 `v1.6.6` tag 指向 npm 实际制品。累计 1.6.6 的 Live Compact 修复、1.6.5 的微内核回归、1.6.4 的 1M 溢出修复、以及 1.6.3 的配置迁移与启动降级）。
 
-> 状态：**代码与文档已提交；`main` 与 `v1.6.7` tag 已推送到 GitHub（远端 `main = 2bd4f30`，
-> 三个 tag `v1.6.5→28776c7` / `v1.6.6→99a07cb` / `v1.6.7→2bd4f30` 与本地、npm 三方一致）。
+> 状态：**代码与文档已提交；`main` 与 `v1.6.7` tag 已推送到 GitHub。**
 > 剩余 **npm publish** 未执行：本机 `~/.npmrc` 里的 token 已失效（`npm whoami` 返回
 > `E401 Unauthorized`），需要你重新登录或换一个新 token 后再发。**
-> 基线：`dsh-memory` 工作区，全量 **510/510 测试通过**（81 个测试文件；另有 `dsh-orchestrator` 31/31）。
+> 基线：`dsh-memory` 工作区，全量 **519/519 测试通过**（82 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；插件市场仍无条目（未发布 npm）。
 
 ## 本版内容
 
-**主线一：发布链完整性——把 1.6.6 漏发的 M3（测试跨包解耦）与 M5（错误码边界）送往 npm，并修复发布历史分叉。**
-**主线二：Live Compact 不再委托宿主 pruner（「10%→7%」的真凶，1.6.6，已发布）。**
-**主线三：回归微内核——指令集 0 Token、蒸馏单一调度器、原子服务接口（1.6.5，已发布）。**
+**主线一：索引式提示注入（M1）——每轮 Prompt 不再为记忆正文付费。**
+**主线二：发布链完整性——把 1.6.6 漏发的 M3（测试跨包解耦）与 M5（错误码边界）送往 npm，并修复发布历史分叉。**
+**主线三：Live Compact 不再委托宿主 pruner（「10%→7%」的真凶，1.6.6，已发布）。**
+**主线四：回归微内核——指令集 0 Token、蒸馏单一调度器、原子服务接口（1.6.5，已发布）。**
 
-### 主线一（1.6.7）
+### 主线一（1.6.7 · M1）
+
+1. **`context.injectMode`（默认 `index`）**：每个记忆块只注入一行指针
+   `- [memory <eventId>] 标签 · 标签 · 标题`；正文不进 Prompt，需要细节时用 `memory_recall`
+   按 eventId / 标签取。`full` 保留旧渲染（正文前 200 字）与旧计费，一行即可回退。
+2. **计费随渲染形态走**：`ContextEngine.tokensOf()` 在 index 下只计指针行、在 full 下仍计整段正文
+   （旧口径不动既有调优）；调用方**显式传入的 `tokens` 永远优先**，折叠/驱逐排序不变。
+   实测差异是数量级的：8,000 字符正文 ≈ 2,000 tokens，指针行通常 < 60 tokens。
+3. **边界不变**：`[Memory Blocks]` 标记名保持不变（缓存前缀语义不变）；`briefing` 块永不降级为指针；
+   只有 index 模式下规则段多一行「这是索引指针，正文须调 recall」。
+4. **可配置**：`context.injectMode` 进 `EDITABLE_CONFIG_KEYS`，设置页「上下文窗口」卡片新增下拉，
+   简洁模式下同样可见可存。9 例 `test/v167.m1.test.js`。
+
+### 主线二（1.6.7 · 发布链）
 
 1. **发布历史分叉修复**。1.6.6 的 npm 制品 `gitHead 99a07cb` 来自旧 checkout
    （`C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory`），
@@ -38,7 +51,7 @@
 4. **1.6.5 / 1.6.6 tag 归位**：`v1.6.5` 指向实际发布的 `28776c7`，`v1.6.6` 指向实际发布的
    `99a07cb`，两者都与 npm/GitHub 一致（npm 版本不可覆盖）。
 
-### 主线二（1.6.6）
+### 主线三（1.6.6）
 
 1. **不再每轮委托宿主 `toolResultPruner`**。旧实现里 `guardRequest` 在**每一次**
    `agent/request` 上都 `await hostPruner.pruneSession(session)`。两处都错：
@@ -49,7 +62,7 @@
    4,000 头 / 2,000 尾 / 每请求最多 4 个节点），健康对话**永不被改写**。
    回归用例断言：注入假 pruner 后健康请求上 `pruneSession` 调用次数 **0**。
 
-### 主线三（1.6.5）
+### 主线四（1.6.5）
 
 1. **`/memory` 指令集（0 Token）**：`resume` / `maintain` / `status` / `mute` / `unmute` 经宿主
    `commands` 服务注册。`commands.execute()` 的语义是「执行已知命令、**不发给模型**」，
@@ -70,9 +83,9 @@
    `startSession(` / `sessionStorage` / `appendMode` / `onSlot(` / `slots.register(` /
    `ctx.slots =`。会话控制归外部路由插件。
 
-### 主线三（1.6.4）
+### 主线五（1.6.4）
 
-事故回顾（主线三）：一次请求携带 **854,668 prompt tokens + 预留 256,000 completion tokens**
+事故回顾（1.6.4 主线）：一次请求携带 **854,668 prompt tokens + 预留 256,000 completion tokens**
 = 1,110,668 > 模型真实窗口 **1,048,576**，被 provider 以 `CONTEXT_WINDOW_EXCEEDED` 拒绝；
 而本插件的所有压力判定都认为“才用了几千 token”。三个独立缺陷叠加：
 
@@ -163,9 +176,9 @@
   `/memory` 全子命令返回纯文本且**网络调用数为 0**、静音真的不注入提示、`resume` 在无交接时
   明确报错且与服务接口同源、`executeDream()` 先跑月记并写入 `promoted`、`maintain()` 不再产
   月记、已晋升日记下一轮仍被排除、源码扫描无 UI/追加模式监听。
-  全量 **510/510**（81 个测试文件）。
+  全量 **519/519**（82 个测试文件）。
 
-完整历史见 [CHANGELOG.md](../CHANGELOG.md) 的 `[1.6.6]` / `[1.6.5]` / `[1.6.4]` / `[1.6.3]` / `[1.6.2]` / `[1.6.1]` 段。
+完整历史见 [CHANGELOG.md](../CHANGELOG.md) 的 `[1.6.7]` / `[1.6.6]` / `[1.6.5]` / `[1.6.4]` / `[1.6.3]` / `[1.6.2]` / `[1.6.1]` 段。
 
 ## 发布步骤（需要你执行）
 
@@ -180,7 +193,7 @@
 
 ```powershell
 cd D:\86135\Documents\dsh\workspace\dsh-memory
-node test/run.mjs                # 期望 510/510
+node test/run.mjs                # 期望 519/519
 cd ..\dsh-orchestrator
 node test/run.mjs                # 期望 31/31
 cd ..\dsh-memory

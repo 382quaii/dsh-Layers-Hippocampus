@@ -10,7 +10,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DAY_MS, T0, makeMemory } from './helpers.js';
 
-const CONFIG = { context: { maxTokens: 1000, threshold: 0.85, target: 0.7 } };
+// v1.6.7 M1: this suite tests the PAGING MATH (tokens, eviction, ordering), which is
+// mode-independent. It pins `full` so each injected body keeps its literal weight —
+// the pointer-line accounting is covered by `test/v167.m1.test.js`.
+const CONFIG = { context: { maxTokens: 1000, threshold: 0.85, target: 0.7, injectMode: 'full' } };
 
 test('the engine evicts by score down to the target, and storage stays intact', async () => {
   const { memory, clock, cleanup } = await makeMemory({ config: CONFIG });

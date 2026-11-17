@@ -62,6 +62,9 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   'context.threshold',
   'context.target',
   'context.injectPrompt',
+  // v1.6.7 M1: `index` (pointer lines) vs `full` (legacy bodies). Editable so an
+  // operator can fall back without editing the profile by hand.
+  'context.injectMode',
   // REMOVED v1.5.3: 'context.minInjectConfidence' (dead token knob). It is no
   // longer editable — the config validator rejects it loudly on profile load.
   // v1.5.0 multi-space routing + session handoff. Pure physical layer: these

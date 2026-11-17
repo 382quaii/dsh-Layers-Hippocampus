@@ -198,6 +198,11 @@ export const DEFAULT_CONFIG = Object.freeze({
     threshold: 0.85,
     target: 0.7,
     injectPrompt: true,
+    // v1.6.7 M1 `index` (default) emits ONE pointer line per memory block —
+    // `- [memory <eventId>] tag · tag · title` — instead of the block body; the body
+    // is fetched on demand with the recall tool. `full` restores the legacy rendering
+    // for anyone who wants the old prompt shape back.
+    injectMode: 'index',
     // v1.6.3 REMOVED: `autoNewSession` / `autoNewSessionPoll` /
     // `autoNewSessionIntervalSeconds`. Handing off is an in-conversation event; the
     // host now CONTINUES the same conversation after the marker instead of opening a
@@ -789,6 +794,13 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
   }
   const contextInjectPrompt =
     contextIn.injectPrompt === undefined ? defaults.context.injectPrompt : requireBoolean(contextIn.injectPrompt, 'context.injectPrompt');
+  // v1.6.7 M1: an enum, not a boolean — `index` is the new default, `full` is the
+  // legacy body rendering, and a typo must fail fast rather than silently pick one.
+  const contextInjectMode = requireEnum(
+    contextIn.injectMode === undefined ? defaults.context.injectMode : contextIn.injectMode,
+    'context.injectMode',
+    ['index', 'full'],
+  );
   const contextColdStartInjectSummary = requireBoolean(
     contextIn.coldStartInjectSummary === undefined
       ? defaults.context.coldStartInjectSummary
@@ -1385,6 +1397,7 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
       threshold: contextThreshold,
       target: contextTarget,
       injectPrompt: contextInjectPrompt,
+      injectMode: contextInjectMode,
       // v1.6.3 cold-start injection switches (independent booleans).
       coldStartInjectSummary: contextColdStartInjectSummary,
       coldStartInjectRecentTurns: contextColdStartInjectRecentTurns,

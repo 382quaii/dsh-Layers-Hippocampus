@@ -144,7 +144,10 @@ test('the panel follows writes: events, generations and last success', async () 
 
 test('cumulative saved tokens are the sum of evicted blocks and survive a reopen', async () => {
   const dir = tempDir('panel-tokens');
-  const first = await makeMemory({ dir, config: { context: { maxTokens: 120 } } });
+  // v1.6.7 M1: this test is about the PERSISTED eviction accumulator, not about the
+  // pointer rendering, so it pins `full` to keep the bodies expensive enough to evict.
+  const small = { context: { maxTokens: 120, injectMode: 'full' } };
+  const first = await makeMemory({ dir, config: small });
   try {
     first.memory.context.inject({ id: 'b1', text: 'x'.repeat(400), tags: ['preference'], salience: 0.1 });
     first.memory.context.inject({ id: 'b2', text: 'y'.repeat(400), tags: ['preference'], salience: 0.1 });
@@ -156,7 +159,7 @@ test('cumulative saved tokens are the sum of evicted blocks and survive a reopen
     first.memory.close();
 
     // The accumulator is derived state persisted at eviction time, not recomputed.
-    const second = await makeMemory({ dir, config: { context: { maxTokens: 120 } } });
+    const second = await makeMemory({ dir, config: small });
     try {
       const after = (await second.memory.status()).panel;
       assert.equal(after.tokens.cumulativeSavedTokens, panel.tokens.cumulativeSavedTokens);

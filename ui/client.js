@@ -2528,6 +2528,9 @@
         'context.threshold',
         'context.target',
         'context.injectPrompt',
+        // v1.6.7 M1: visible in the 上下文窗口 card in both modes, so it must also be
+        // in the simple-mode allowlist — a control that renders but never saves is a lie.
+        'context.injectMode',
         'raw.mode',
         'raw.maxTotalMb',
         'raw.compressionEngine',
@@ -2639,6 +2642,7 @@
             threshold: Number(config.context.threshold),
             target: Number(config.context.target),
             injectPrompt: Boolean(config.context.injectPrompt),
+            injectMode: config.context && config.context.injectMode === 'full' ? 'full' : 'index',
             // v1.5.0 physical routing + session handoff. Read with defaults so an
             // older Host half that has not learned these keys yet still renders.
             autoSpaceFollow: Boolean((config.context && config.context.autoSpaceFollow) ?? false),
@@ -3020,6 +3024,7 @@
             'context.threshold': Number(draft.context.threshold),
             'context.target': Number(draft.context.target),
             'context.injectPrompt': Boolean(draft.context.injectPrompt),
+            'context.injectMode': draft.context.injectMode === 'full' ? 'full' : 'index',
             'context.autoSpaceFollow': Boolean(draft.context.autoSpaceFollow),
             'context.autoRolloverEnabled': Boolean(draft.context.autoRolloverEnabled),
             'context.coldStartInjectSummary': Boolean(draft.context.coldStartInjectSummary),
@@ -3566,6 +3571,19 @@
               label: '注入上下文预算段（context.injectPrompt）',
               checked: draft.context.injectPrompt,
               onChange: (value) => edit('context.injectPrompt', value),
+              disabled,
+            }),
+            // v1.6.7 M1: pointer lines by default. `full` is kept as the escape hatch
+            // for anyone who wants the old body rendering back.
+            h(Select, {
+              label: '记忆块注入形态（context.injectMode）',
+              hint: '索引（推荐）：每块只注入 eventId + 标签 + 标题，正文按需用 recall 取；占用已用窗口的 1/10 不到。全文：沿用旧版渲染，正文直接进 Prompt（更费 Token）。',
+              value: draft.context.injectMode === 'full' ? 'full' : 'index',
+              options: [
+                { value: 'index', label: '索引（eventId + 标签 + 标题）' },
+                { value: 'full', label: '全文（旧版渲染）' },
+              ],
+              onChange: (value) => edit('context.injectMode', value),
               disabled,
             }),
           ),

@@ -6,10 +6,25 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [1.6.7] — 2026-11-17
 
-**发布链完整性修正：1.6.6 在 npm 上的制品（`gitHead 99a07cb`）是从一份**旧 checkout**
-发布的，只带来 Live Compact 修复，**不含** M3（测试跨包解耦）与 M5（错误码边界）。
-1.6.7 把这两项送往 npm，并让仓库历史与已发布标签不再分叉。**
+**发布链完整性修正 + 索引式提示注入（M1）。1.6.6 在 npm 上的制品（`gitHead 99a07cb`）
+是从一份**旧 checkout** 发布的，只带来 Live Compact 修复，**不含** M3（测试跨包解耦）
+与 M5（错误码边界）。1.6.7 把这两项送往 npm，并让仓库历史与已发布标签不再分叉；
+M1 则是本版的主线功能——每轮 Prompt 不再为记忆**正文**付费。**
 
+- **Changed — 索引式提示注入（M1）**。`context.injectMode` 新增两个取值：
+  - `index`（**新默认**）：每个记忆块只注入一行指针
+    `- [memory <eventId>] 标签 · 标签 · 标题`。正文不进 Prompt，需要细节时用
+    `memory_recall` 按 eventId / 标签取。`[Memory Blocks]` 标记名保持不变，因此缓存前缀
+    语义不变；规则段多一行「这些是索引指针，正文须调 recall」，**只在 index 模式下出现**。
+  - `full`：沿用旧版渲染（正文前 200 字）与旧版计费（整段正文），一行代码即可回退。
+  - **窗口计费随渲染形态走**：`ContextEngine.tokensOf()` 在 index 模式下只计指针行，
+    在 full 模式下仍计整段正文（旧口径，不动既有调优）；调用方**显式传入的 `tokens`
+    永远优先**，折叠与驱逐的排序不变。
+  - `index` 模式下 `tokens()` 的实测差异是数量级的：8,000 字符的正文约 2,000 tokens，
+    指针行通常 < 60 tokens。
+  - `briefing` 块（运营方钉死的策略）**永不降级为指针**，始终整段渲染。
+  - 可编辑键新增 `context.injectMode`（`index` / `full`，非法值 fail-fast），设置页
+    「上下文窗口」卡片新增下拉；简洁模式下同样可见可存。
 - **Changed — 测试与兄弟包解耦（M3）**。`test/orchestrator.js` 先按包名 `dsh-layers-orchestrator/src/*`
   解析、失败再退回同级 checkout（`via: 'package' | 'sibling'`）；22 个真正依赖多空间的用例改走
   `orchestratorTest()`，缺包时注册为 **skipped 并带原因**而不是 import 阶段崩掉整套测试。
@@ -23,7 +38,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `ORCH_E_NOT_READY` → `MEM_E_NOT_READY`、`ORCH_E_FEDERATION_CONFLICT` → `MEM_E_FEDERATION_FAILED`；
   **未列入的 `ORCH_E_*` 不会被拍平成 `MEM_E_IO`**，原始码保留在 `details.orchestratorCode` 里可审计。
   映射表同步写进 `dsh-orchestrator/README.md` 的「错误码边界」一节。
-- **Tests**：新增 `test/v166.errorContract.test.js`（7 例）。全量 **510/510**（81 个测试文件）。
+- **Tests**：新增 `test/v166.errorContract.test.js`（7 例）与 `test/v167.m1.test.js`（9 例：
+  默认 index、指针行构成、index 计费 = 渲染行、full 保留旧渲染与旧计费、显式权重优先、
+  briefing 不降级、标题截断与回退、`injectMode` 校验与可编辑、规则段只在 index 出现、
+  recall 命中把标签与标题带进窗口且正文尾巴不出现）。
+  全量 **519/519**（82 个测试文件）。
 
 ## [1.6.6] — 2026-11-16
 
