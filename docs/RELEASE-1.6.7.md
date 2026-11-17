@@ -1,6 +1,6 @@
-# Release 1.6.6 — 发布准备（本地）
+# Release 1.6.7 — 发布准备（本地）
 
-> 版本：**1.6.6**（2026-11-16：**发布修正版**——M7 联网复核发现 1.6.5 的 npm 制品（`gitHead 28776c7`）里没有 Live Compact 那条修复，装 npm 版的用户仍会遇到「每轮偷裁工具结果」；本版把它送出，并同批送出 M3（测试跨包解耦）与 M5（错误码边界）。累计 1.6.5 的微内核回归、1.6.4 的 1M 溢出修复、以及 1.6.3 未曾发布的全部内容）。
+> 版本：**1.6.7**（2026-11-17：**发布链完整性修正**——事后核对发现 1.6.6 的 npm 制品（`gitHead 99a07cb`）是从**另一份旧 checkout** 发布的，只含 Live Compact 修复，**不含** M3/M5。本版把这两项送出去，并把已发布提交并入 `main` 历史、让 `v1.6.6` tag 指向 npm 实际制品。累计 1.6.6 的 Live Compact 修复、1.6.5 的微内核回归、1.6.4 的 1M 溢出修复、以及 1.6.3 的配置迁移与启动降级）。
 
 > 状态：**代码与文档已就绪；仓库推送 / npm 发布 / 市场 PR 需要你的 GitHub 与 npm 凭据，代理与网络，本会话未执行。**
 > 基线：`dsh-memory` 工作区，全量 **510/510 测试通过**（81 个测试文件；另有 `dsh-orchestrator` 31/31）。
@@ -8,10 +8,34 @@
 
 ## 本版内容
 
-**主线一：发布修正——Live Compact 不再委托宿主 pruner（「10%→7%」的真凶）、M3 测试跨包解耦、M5 错误码边界。**
-**主线二：回归微内核——指令集 0 Token、蒸馏单一调度器、原子服务接口（1.6.5，已发布）。**
+**主线一：发布链完整性——把 1.6.6 漏发的 M3（测试跨包解耦）与 M5（错误码边界）送往 npm，并修复发布历史分叉。**
+**主线二：Live Compact 不再委托宿主 pruner（「10%→7%」的真凶，1.6.6，已发布）。**
+**主线三：回归微内核——指令集 0 Token、蒸馏单一调度器、原子服务接口（1.6.5，已发布）。**
 
-### 主线一（1.6.6）
+### 主线一（1.6.7）
+
+1. **发布历史分叉修复**。1.6.6 的 npm 制品 `gitHead 99a07cb` 来自旧 checkout
+   （`C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory`），
+   只改了 `package.json` 版本号一行，父提交是 `66a3b93`；主线的 M3（`9752903`）与
+   M5（`6fb610f`）**没有进那个 tarball**。处理：
+   - `git fetch` 把 `99a07cb` 拉进新仓库，`git merge` 成合并提交（发布提交现在可达、可追溯）；
+   - 本地 `v1.6.6` tag 重建为指向 `99a07cb`（npm 实际制品），并 `--force` 推送，使
+     GitHub tag 与 npm 一致；
+   - 版本号升 **1.6.7**，让 M3/M5 走新制品；
+   - 桌面 profile 的 `node_modules` junction 曾被指回旧 checkout，已重指到
+     `D:\86135\Documents\dsh\workspace\dsh-memory`。
+2. **M3 测试与兄弟包解耦**：新增 `test/orchestrator.js` 桥接（`via: 'package' | 'sibling'`），
+   22 个真正依赖多空间的用例改走 `orchestratorTest()`，缺包时 **skipped 带原因** 而非整套崩；
+   `makeMemory()` 的 `multiSpace` 默认 `MULTI_SPACE_AVAILABLE`。
+   验收：两包在位 **510/510（skipped 0）**；单包 **454 pass / 0 fail / 56 skipped**。
+3. **M5 错误码边界**：`src/errors.js#fromOrchestratorError()` + `ORCHESTRATOR_CODE_MAP`
+   单向翻译 `ORCH_E_*` → `MEM_E_*`；三个 consent 码统一落到 `MEM_E_REQUIRE_USER_CONSENT`，
+   未列入的码**不拍平成 `MEM_E_IO`**，原始码保留在 `details.orchestratorCode`。
+   映射表同步写进 `dsh-orchestrator/README.md`。7 例 `test/v166.errorContract.test.js`。
+4. **1.6.5 / 1.6.6 tag 归位**：`v1.6.5` 指向实际发布的 `28776c7`，`v1.6.6` 指向实际发布的
+   `99a07cb`，两者都与 npm/GitHub 一致（npm 版本不可覆盖）。
+
+### 主线二（1.6.6）
 
 1. **不再每轮委托宿主 `toolResultPruner`**。旧实现里 `guardRequest` 在**每一次**
    `agent/request` 上都 `await hostPruner.pruneSession(session)`。两处都错：
@@ -21,18 +45,8 @@
    现在只跑本插件自己的保守策略（`context.liveCompact`：默认 200,000 字符阈值 /
    4,000 头 / 2,000 尾 / 每请求最多 4 个节点），健康对话**永不被改写**。
    回归用例断言：注入假 pruner 后健康请求上 `pruneSession` 调用次数 **0**。
-2. **M3 测试与兄弟包解耦**：新增 `test/orchestrator.js` 桥接（`via: 'package' | 'sibling'`），
-   22 个真正依赖多空间的用例改走 `orchestratorTest()`，缺包时 **skipped 带原因** 而非整套崩；
-   `makeMemory()` 的 `multiSpace` 默认 `MULTI_SPACE_AVAILABLE`。
-   验收：两包在位 **510/510（skipped 0）**；单包 **454 pass / 0 fail / 56 skipped**。
-3. **M5 错误码边界**：`src/errors.js#fromOrchestratorError()` + `ORCHESTRATOR_CODE_MAP`
-   单向翻译 `ORCH_E_*` → `MEM_E_*`；三个 consent 码统一落到 `MEM_E_REQUIRE_USER_CONSENT`，
-   未列入的码**不拍平成 `MEM_E_IO`**，原始码保留在 `details.orchestratorCode`。
-   映射表同步写进 `dsh-orchestrator/README.md`。7 例 `test/v166.errorContract.test.js`。
-4. **1.6.5 tag 归位**：本地 `v1.6.5` 原先指向未发布的 `66a3b93`，已重建为 annotated
-   并指向**实际发布**的 `28776c7`，与 npm/GitHub 保持一致（npm 版本不可覆盖）。
 
-### 主线二（1.6.5）
+### 主线三（1.6.5）
 
 1. **`/memory` 指令集（0 Token）**：`resume` / `maintain` / `status` / `mute` / `unmute` 经宿主
    `commands` 服务注册。`commands.execute()` 的语义是「执行已知命令、**不发给模型**」，
@@ -152,7 +166,7 @@
 
 ## 发布步骤（需要你执行）
 
-> 两个包：`dsh-layers-hippocampus@1.6.6`（已有 git remote）与
+> 两个包：`dsh-layers-hippocampus@1.6.7`（已有 git remote）与
 > `dsh-layers-orchestrator@0.1.0`（**目前不是 git 仓库**，需先 init/建远端）。
 > 全部命令在 PowerShell 下执行；`node`/`npm`/`pnpm` 用 DSH runtime 自带的绝对路径。
 > **本机网络注意**：证书链校验被中间打断，`git` 需 `GIT_SSL_NO_VERIFY=1` 才能访问 origin；
@@ -178,19 +192,20 @@ npm pack --dry-run               # 预检实际发布内容（含/不含不该�
 cd D:\86135\Documents\dsh\workspace\dsh-memory
 git add -A
 git status --short                 # 最后确认没有 node_modules / state / 测试临时目录
-git commit -m "chore(release): v1.6.6 - ship the live-compact fix that 1.6.5 npm bundle missed; M3 + M5"
+git commit -m "chore(release): v1.6.7 - ship M3 + M5 that the 1.6.6 npm bundle missed; merge the published commit"
 
-# 历史 tag：v1.5.5 / v1.5.7 / v1.6.0 / v1.6.1 / v1.6.2 / v1.6.4 / v1.6.5。
-# v1.6.5 已指向实际发布的 28776c7（annotated），不要动它。
-# 本次只新增 v1.6.6，不需要删任何 tag。
-git tag -a v1.6.6 -m "v1.6.6: stop delegating the host pruner per request; test/orchestrator bridge (M3); ORCH_E_* boundary (M5)"
+# 历史 tag：v1.5.5 / v1.5.7 / v1.6.0 / v1.6.1 / v1.6.2 / v1.6.4 / v1.6.5 / v1.6.6。
+# v1.6.5 已指向实际发布的 28776c7、v1.6.6 已指向实际发布的 99a07cb（均为 annotated），不要动它们。
+# 本次只新增 v1.6.7，不需要删任何 tag。
+git tag -a v1.6.7 -m "v1.6.7: test/orchestrator bridge (M3); ORCH_E_* boundary (M5)"
 $env:GIT_SSL_NO_VERIFY="1"         # 本机证书链校验被中间打断，git 需要它才能连 origin
 git push origin main --follow-tags
 Remove-Item Env:GIT_SSL_NO_VERIFY
 ```
 
-> 本地领先远端 4 个提交（`66a3b93` pruner 修复、`bbc55f7` 路径、`9752903` M3、`6fb610f` M5），
-> 加上本次 release 提交，一次性推上去。远端 `main` 目前是 `28776c7`（= npm 1.6.5 的 gitHead）。
+> 远端 `main` 当前是 `4a463b2`（含并入的已发布提交 `99a07cb` 与 `v1.6.6` 指向修正，
+> 这两步已在本地完成并推送）。本次 release 提交在其之上；`v1.6.5` / `v1.6.6` 两个 tag
+> 已在远端与 npm 对齐，无需再动。
 
 ### 2. dsh-memory：npm 发布
 
@@ -234,7 +249,7 @@ npm view dsh-layers-orchestrator version
 ```powershell
 cd C:\Users\86135\.dsh\profiles\desktop
 # 编辑 package.json：
-#   "dsh-layers-hippocampus": "1.6.6"
+#   "dsh-layers-hippocampus": "1.6.7"
 #   "dsh-layers-orchestrator": "0.1.0"
 pnpm install
 # 重启 DSH
@@ -266,8 +281,14 @@ npm view dsh-layers-hippocampus dist-tags
   `compaction-basic` + `tool-result-pruner`）或用户开新对话。宿主没有 `llm` / `tokenMeter`
   服务时，窗口分母回落到 `context.nativeTokenLimit`（`windowSource: 'config'`）。
 - **1.6.5 的 npm 制品缺修复**：`dsh-layers-hippocampus@1.6.5` 的 `gitHead` 是 `28776c7`，
-  不含 Live Compact 那条修复；npm 版本不可覆盖，故修复只能走 1.6.6。
+  不含 Live Compact 那条修复；npm 版本不可覆盖，故该修复走 1.6.6。
   本地 `v1.6.5` tag 已重建并指向该提交，与 npm/GitHub 一致。
+- **1.6.6 的 npm 制品来自旧 checkout**：其 `gitHead` 是 `99a07cb`（旧 checkout 上只改版本号的
+  一次提交），**只含** Live Compact 修复，**不含** M3/M5。1.6.7 补上这两项；旧提交已并入
+  `main`，本地 `v1.6.6` tag 指向该提交，发布可追溯。
+- **发布时使用唯一样本**：`dsh-memory` 曾存在两份 checkout（旧 `C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory`
+  与新 `D:\86135\Documents\dsh\workspace\dsh-memory`）。发布前务必确认 `pwd`、`git log -1`、
+  `package.json` 版本号与 profile 中 `node_modules` 的 junction 目标一致；旧目录已不再作为发布源。
 - `v1.6.3` 从未发布（无 git push、无 npm publish），其全部内容已并入 1.6.4 起各版；
   本地 `v1.6.3` tag 在发版时删除。
 - 本次发布会把 `dsh-orchestrator` 作为独立包首次发布（建仓 + npm）。

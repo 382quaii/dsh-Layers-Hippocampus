@@ -4,24 +4,12 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.6.6] — 2026-11-16
+## [1.6.7] — 2026-11-17
 
-**发布修正版：1.6.5 在 npm 上发布的是「每轮请求都裁剪工具结果」的版本——那个把上下文
-从 10% 悄悄缩到 7% 的缺陷没有随任何已发布制品走出去。1.6.6 补上这条修复，并把
-M3（测试跨包解耦）与 M5（错误码边界）一起送出去。**
+**发布链完整性修正：1.6.6 在 npm 上的制品（`gitHead 99a07cb`）是从一份**旧 checkout**
+发布的，只带来 Live Compact 修复，**不含** M3（测试跨包解耦）与 M5（错误码边界）。
+1.6.7 把这两项送往 npm，并让仓库历史与已发布标签不再分叉。**
 
-> 1.6.5 已在 npm 上发布且不可覆盖（`gitHead 28776c7`），因此不再改动它的 tag 指向：
-> 本地 `v1.6.5` 已重建为 annotated 并指向那个提交，与 npm/GitHub 保持一致。
-
-- **Fixed — 上下文在每轮请求里被悄悄缩水（"从 10% 直接掉到 7%"）**。
-  `guardRequest` 曾在**每一次** `agent/request` 上调用宿主的 `toolResultPruner.pruneSession()`。
-  宿主的 `pruneContent()` 用的是**预设预算**（ptc 预设 `thresholdChars: 8192` → 4k 头 + 1k 尾），
-  而且它**只在 `compaction-basic` 的 `context-overflow` 分支里**才被调用——我们把「溢出时裁剪」
-  变成了「每轮都裁剪」，一次 pass 就能掉约 80k tokens。
-  现在 Live Compact **只跑本插件自己的保守策略**（`context.liveCompact`，默认 200,000 字符阈值 /
-  4,000 头 / 2,000 尾 / 每请求最多 4 个节点），不再委托宿主 pruner；
-  回归用例 `the guard never rewrites an ordinary tool result on a healthy request`
-  断言宿主 pruner 在健康请求上**一次都不被调用**。
 - **Changed — 测试与兄弟包解耦（M3）**。`test/orchestrator.js` 先按包名 `dsh-layers-orchestrator/src/*`
   解析、失败再退回同级 checkout（`via: 'package' | 'sibling'`）；22 个真正依赖多空间的用例改走
   `orchestratorTest()`，缺包时注册为 **skipped 并带原因**而不是 import 阶段崩掉整套测试。
@@ -36,6 +24,28 @@ M3（测试跨包解耦）与 M5（错误码边界）一起送出去。**
   **未列入的 `ORCH_E_*` 不会被拍平成 `MEM_E_IO`**，原始码保留在 `details.orchestratorCode` 里可审计。
   映射表同步写进 `dsh-orchestrator/README.md` 的「错误码边界」一节。
 - **Tests**：新增 `test/v166.errorContract.test.js`（7 例）。全量 **510/510**（81 个测试文件）。
+
+## [1.6.6] — 2026-11-16
+
+**发布修正版：1.6.5 在 npm 上发布的是「每轮请求都裁剪工具结果」的版本——那个把上下文
+从 10% 悄悄缩到 7% 的缺陷没有随任何已发布制品走出去。1.6.6 补上这条修复。**
+
+> **发布实况（事后核对）**：1.6.6 的 npm 制品 `gitHead 99a07cb` 来自旧 checkout，
+> **只含**下面的 Live Compact 修复——M3 与 M5 当时已在主线上、但没有进这个 tarball。
+> 那两项随 **1.6.7** 发出。本地 `v1.6.6` tag 已指向 `99a07cb`，与 npm/GitHub 一致；
+> `99a07cb` 也已并入 `main` 历史，发布可追溯。
+> 1.6.5 同理不可覆盖（`gitHead 28776c7`），其 tag 亦指向该提交。
+
+- **Fixed — 上下文在每轮请求里被悄悄缩水（"从 10% 直接掉到 7%"）**。
+  `guardRequest` 曾在**每一次** `agent/request` 上调用宿主的 `toolResultPruner.pruneSession()`。
+  宿主的 `pruneContent()` 用的是**预设预算**（ptc 预设 `thresholdChars: 8192` → 4k 头 + 1k 尾），
+  而且它**只在 `compaction-basic` 的 `context-overflow` 分支里**才被调用——我们把「溢出时裁剪」
+  变成了「每轮都裁剪」，一次 pass 就能掉约 80k tokens。
+  现在 Live Compact **只跑本插件自己的保守策略**（`context.liveCompact`，默认 200,000 字符阈值 /
+  4,000 头 / 2,000 尾 / 每请求最多 4 个节点），不再委托宿主 pruner；
+  回归用例 `the guard never rewrites an ordinary tool result on a healthy request`
+  断言宿主 pruner 在健康请求上**一次都不被调用**。
+- **Tests**：`test/v164.windowGuard.test.js` 增加上述回归用例（12 例）。全量 **503/503**（79 个测试文件）。
 
 ## [1.6.5] — 2026-11-15
 
@@ -94,7 +104,8 @@ M3（测试跨包解耦）与 M5（错误码边界）一起送出去。**
   `executeDream()`。全量 **502/502**（80 个测试文件）。
 
 > **发布说明**：1.6.5 发布到 npm 的制品（`gitHead 28776c7`）**不包含**上面那条 Live Compact
-> 修复——它是在 1.6.5 发布之后才提交的。该修复、M3 与 M5 一并进入 **1.6.6**。
+> 修复——它是在 1.6.5 发布之后才提交的。该修复进入 **1.6.6**；M3 与 M5 实际进入 **1.6.7**
+> （1.6.6 的制品同样来自旧 checkout，只含 Live Compact）。
 
 ## [1.6.4] — 2026-11-14
 
