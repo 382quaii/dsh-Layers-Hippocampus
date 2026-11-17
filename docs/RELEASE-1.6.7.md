@@ -2,11 +2,40 @@
 
 > 版本：**1.6.7**（2026-11-17：**索引式提示注入 M1** + **发布链完整性修正**——事后核对发现 1.6.6 的 npm 制品（`gitHead 99a07cb`）是从**另一份旧 checkout** 发布的，只含 Live Compact 修复，**不含** M3/M5。本版把这两项送出去，并把已发布提交并入 `main` 历史、让 `v1.6.6` tag 指向 npm 实际制品。累计 1.6.6 的 Live Compact 修复、1.6.5 的微内核回归、1.6.4 的 1M 溢出修复、以及 1.6.3 的配置迁移与启动降级）。
 
-> 状态：**代码与文档已提交；`main` 与 `v1.6.7` tag 已推送到 GitHub。**
-> 剩余 **npm publish** 未执行：本机 `~/.npmrc` 里的 token 已失效（`npm whoami` 返回
-> `E401 Unauthorized`），需要你重新登录或换一个新 token 后再发。**
+> 状态：**代码与文档已提交；`main` 与 `v1.6.7` tag 已推送到 GitHub（远端 `main = 36f0597`，
+> `v1.6.7 → 36f0597`）。**
+> 剩余 **npm publish** 未执行，且**不是本地命令的问题**：`npm whoami` 已能返回 `382quaii`，
+> `npm pack --dry-run` 也正常（71 files / 540.2 kB / shasum `ea78a800…`），但 `npm publish`
+> 被 registry 以 **`E403 Your account has been temporarily suspended due to a recent
+> security-sensitive action`** 拒绝（2026-11-17 13:35Z）。这是账号级封控，与 OTP、token、
+> 命令形态都无关——**必须等 npm 解封**（见下方「npm 账号封控」一节）。
 > 基线：`dsh-memory` 工作区，全量 **519/519 测试通过**（82 个测试文件；另有 `dsh-orchestrator` 31/31）。
-> 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；插件市场仍无条目（未发布 npm）。
+> 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；
+> 插件市场仍无条目（npm 上 `latest` 仍为 `1.6.6`）。
+
+### npm 账号封控（2026-11-17 实测）
+
+```text
+npm notice Publishing to https://registry.npmjs.org/ with tag latest and public access
+npm notice Your account has been temporarily suspended due to a recent security-sensitive action.
+npm error code E403
+npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocampus
+```
+
+排查已排除的项：`whoami` 正常、`pack --dry-run` 正常、`--cache` 已指向可写目录、
+OTP 流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`）。
+`registry` 侧确认 `1.6.7` **未发布**（`latest = 1.6.6`）。
+
+恢复路径（按顺序试）：
+1. 查 `382quaii` 的注册邮箱（含垃圾箱）里的 npm 安全通知，点其中的验证/申诉链接——
+   「recent security-sensitive action」通常是**改密码 / 换 token / 新设备登录**触发的自动冻结。
+2. 等 24 小时后重试 `npm publish --access public`（多数临时封控自动解除）。
+3. 仍未解除则走 <https://www.npmjs.com/support> 提交支持单，附上面这条 `E403` 原文与时间戳。
+4. **在解封前，用户可以改用 GitHub 安装**（tag 已在远端）：
+   ```powershell
+   pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.7"
+   ```
+   这与 npm 制品是同一份代码（`v1.6.7 → 36f0597`）。
 
 ## 本版内容
 

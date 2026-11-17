@@ -7,3 +7,6 @@ Thumbs.db
 coverage/
 .idea/
 .vscode/
+# npm writes its cache into a literal "%cache_dir%" folder when --cache is given a
+# value the shell fails to expand (seen on Windows cmd/PowerShell). Never publish it.
+%cache_dir%/

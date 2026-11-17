@@ -294,4 +294,10 @@ L2.5 趋势隔离 / 幽灵节点 / 上下文分页 / cron+dream 单一闸门 / �
 - **测试**：`dsh-memory` **519/519**（82 文件）；`dsh-orchestrator` **31/31**。
 - **M3/M4 状态更新**：M3 已落地（独立 `persona` section order=100）；M4 已改为通用 `customDecayRate`/`customHalfLifeDays`，由情感插件调用时传参，插件内不再判断 `emotion:` 前缀。
 - ✅ **版本冻结 1.5.7 + 本地发布卫生**（历史，2026-11-04）：`package.json` 升到 1.5.7；本地 commit `release: v1.5.7 …` + tag `v1.5.7`（**未 push**）。该冻结已于 2026-11-07 解除，当前 1.6.7。
-- **仍未完成**：`git push` → npm publish（两个包）→ 市场目录 PR（需 GitHub/npm 凭据）。
+- **仍未完成**：**npm publish 1.6.7** 被账号级封控挡住——`npm whoami` 正常（`382quaii`）、
+  `npm pack --dry-run` 正常（71 files / 540.2 kB），但 `npm publish` 返回
+  `E403 Your account has been temporarily suspended due to a recent security-sensitive action`
+  （2026-11-17，`registry` 侧确认 `latest` 仍为 `1.6.6`）。这不是 token/OTP/命令形态问题，
+  需查收 npm 安全邮件走申诉或等自动解封；解封前可用
+  `pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.7"` 安装同一份代码。
+  之后仍是：市场目录 PR（需 GitHub/npm 凭据）。`git push` 已完成（`main = 36f0597`、`v1.6.7 → 36f0597`）。
