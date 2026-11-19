@@ -2827,7 +2827,7 @@
        * here; the server ALSO refuses without confirm so a stray request cannot
        * mutate the profile.
        */
-      function OrchestratorInstallCard({ installed }) {
+      function OrchestratorInstallCard({ installed, reason = null }) {
         const [busy, setBusy] = React.useState(false);
         const [result, setResult] = React.useState(null);
         const install = async () => {
@@ -2877,6 +2877,15 @@
                   { type: 'button', style: smallButtonStyle, onClick: install, disabled: busy },
                   busy ? '安装中…' : '从 GitHub 安装 dsh-orchestrator',
                 ),
+            // v1.6.7 (M6): the three reasons are not the same problem, and only one of
+            // them is fixable by installing something.
+            !installed && reason === 'disabled-by-config'
+              ? h(
+                  'span',
+                  { style: { ...labelStyle, marginBottom: 0, color: palette.muted } },
+                  '当前被配置关闭：features.multiSpace=false（引擎按严格单空间运行）',
+                )
+              : null,
             h(
               'a',
               {
@@ -3336,6 +3345,13 @@
             ? null
             : h(OrchestratorInstallCard, {
                 installed: Boolean(state.payload && state.payload.capabilities && state.payload.capabilities.spaces === true),
+                // v1.6.7 (M6): render WHY it is off, so "I enabled multiSpace but nothing
+                // happened" is answered right here instead of looking like a silent bug.
+                reason:
+                  (state.payload && state.payload.capabilities && state.payload.capabilities.multiSpaceReason) ||
+                  (state.payload && state.payload.capabilities && state.payload.capabilities.spaces === true
+                    ? 'active'
+                    : 'orchestrator-missing'),
               }),
           h(
             Section,

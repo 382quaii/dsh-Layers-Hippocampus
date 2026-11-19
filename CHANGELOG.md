@@ -11,6 +11,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 与 M5（错误码边界）。1.6.7 把这两项送往 npm，并让仓库历史与已发布标签不再分叉；
 M1 则是本版的主线功能——每轮 Prompt 不再为记忆**正文**付费。**
 
+- **Changed — 多空间开关的语义澄清（M6）**。`features.multiSpace` 默认 `true`，但只有注入了
+  能创建空间适配器的 `orchestrator` 服务时才真正生效——以前这个差异是**静默**的：
+  用户以为开了多空间，实际在跑单空间。现在新增 `multiSpaceReason()`，返回
+  `'active'` / `'disabled-by-config'` / `'orchestrator-missing'` 三态，
+  通过 `capabilities.multiSpaceReason` + `capabilities.multiSpaceRequested` 与
+  `panel.spaces.{requested,reason}` 同时暴露，设置页在多空间卡片里直接写明
+  「当前被配置关闭：features.multiSpace=false」，不再把「没装适配器」和「你关了它」
+  混成一个 `spaces:false`。**开关本身没有改默认值**（改默认会静默改变已部署 profile 的行为），
+  改的是可观测性与文档；并有用例锁住「布尔值与理由不可能互相矛盾」。
 - **Changed — 索引式提示注入（M1）**。`context.injectMode` 新增两个取值：
   - `index`（**新默认**）：每个记忆块只注入一行指针
     `- [memory <eventId>] 标签 · 标签 · 标题`。正文不进 Prompt，需要细节时用
@@ -41,8 +50,10 @@ M1 则是本版的主线功能——每轮 Prompt 不再为记忆**正文**付�
 - **Tests**：新增 `test/v166.errorContract.test.js`（7 例）与 `test/v167.m1.test.js`（9 例：
   默认 index、指针行构成、index 计费 = 渲染行、full 保留旧渲染与旧计费、显式权重优先、
   briefing 不降级、标题截断与回退、`injectMode` 校验与可编辑、规则段只在 index 出现、
-  recall 命中把标签与标题带进窗口且正文尾巴不出现）。
-  全量 **519/519**（82 个测试文件）。
+  recall 命中把标签与标题带进窗口且正文尾巴不出现）；
+  `test/v156.features.test.js` 新增 M6 用例（`multiSpaceReason` 三态 + 显式关闭优先于
+  缺适配器 + 「布尔值与理由不可能矛盾」的交叉断言）。
+  全量 **520/520**（82 个测试文件）。
 
 ## [1.6.6] — 2026-11-16
 

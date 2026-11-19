@@ -11,7 +11,10 @@
  *   4. turning multiSpace off implies crossSpaceTransfer off (fail-fast if an
  *      operator explicitly asks for the impossible combination);
  *   5. `Memory.open('/abs/dir')` is the single-space form and `warmup()` is lazy
- *      and read-only.
+ *      and read-only;
+ *   6. (v1.6.7 / M6) `multiSpaceReason()` reports WHY the effective answer differs
+ *      from `features.multiSpace`, so an enabled-but-unavailable feature is never
+ *      presented as if it were running.
  */
 
 import assert from 'node:assert/strict';
@@ -22,7 +25,7 @@ import test from 'node:test';
 // installed; without it these cases are registered as skipped (with the reason).
 import { orchestratorTest } from './orchestrator.js';
 import { apply, getRuntime } from '../index.js';
-import { resolveConfig } from '../src/config.js';
+import { multiSpaceActive, multiSpaceReason, resolveConfig } from '../src/config.js';
 import { Memory } from '../src/memory.js';
 import { createOrchestratorStub, tempDir } from './helpers.js';
 
@@ -136,6 +139,12 @@ test('multiSpace=false: engine and capabilities refuse space operations', async 
     const payload = await runtime.uiPayload();
     assert.equal(payload.capabilities.multiSpace, false);
     assert.equal(payload.capabilities.spaces, false, 'the client hides the selector/create button');
+    // v1.6.7 (M6): "off because you asked" is distinguishable from "off because the
+    // adapter is missing" — both in the capability handshake and in the panel.
+    assert.equal(payload.capabilities.multiSpaceRequested, false);
+    assert.equal(payload.capabilities.multiSpaceReason, 'disabled-by-config');
+    assert.equal(payload.panel.spaces.requested, false);
+    assert.equal(payload.panel.spaces.reason, 'disabled-by-config');
     assert.deepEqual(runtime.spaceList(), ['default']);
   });
 });
@@ -163,6 +172,8 @@ orchestratorTest('defaults: space tools + capabilities stay on (no regression)',
     const payload = await runtime.uiPayload();
     assert.equal(payload.capabilities.multiSpace, true);
     assert.equal(payload.capabilities.spaces, true);
+    assert.equal(payload.capabilities.multiSpaceRequested, true);
+    assert.equal(payload.capabilities.multiSpaceReason, 'active');
     assert.deepEqual(runtime.spaceList(), ['default']);
   });
 });
@@ -185,5 +196,27 @@ test('Memory.open(string) is the single-space form; warmup is lazy and read-only
     memory.close();
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('multiSpaceReason names WHY multi-space is not running (not just false)', () => {
+  const enabled = resolveConfig({ features: { multiSpace: true } });
+  const disabled = resolveConfig({ features: { multiSpace: false } });
+
+  // The three states are mutually exclusive and cover every combination.
+  assert.equal(multiSpaceReason(enabled, true), 'active');
+  assert.equal(multiSpaceReason(enabled, false), 'orchestrator-missing');
+  assert.equal(multiSpaceReason(disabled, true), 'disabled-by-config');
+  assert.equal(multiSpaceReason(disabled, false), 'disabled-by-config', 'an explicit off wins over the missing adapter');
+
+  // The boolean and the reason can never disagree about the effective answer.
+  for (const config of [enabled, disabled]) {
+    for (const hasAdapter of [true, false]) {
+      assert.equal(
+        multiSpaceActive(config, hasAdapter),
+        multiSpaceReason(config, hasAdapter) === 'active',
+        `boolean and reason disagree for multiSpace=${config.features.multiSpace} hasAdapter=${hasAdapter}`,
+      );
+    }
   }
 });

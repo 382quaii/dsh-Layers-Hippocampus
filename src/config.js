@@ -537,6 +537,26 @@ export function multiSpaceActive(config, hasOrchestrator) {
 }
 
 /**
+ * v1.6.7 (M6): WHY multi-space is on or off, so a caller never has to guess whether
+ * `features.multiSpace: true` was honoured.
+ *
+ * Before this, the default `features.multiSpace: true` combined with
+ * `multiSpaceActive()` returning false whenever no adapter was injected meant a user
+ * who explicitly enabled the feature silently got single-space behaviour with no
+ * explanation. The flag now reports one of three states instead of a bare boolean.
+ *
+ * @param {object} config resolved config
+ * @param {boolean} hasOrchestrator true when an injected `orchestrator` service can
+ *   actually create a space adapter
+ * @returns {'active'|'disabled-by-config'|'orchestrator-missing'}
+ */
+export function multiSpaceReason(config, hasOrchestrator) {
+  if (config?.features?.multiSpace === false) return 'disabled-by-config';
+  if (hasOrchestrator !== true) return 'orchestrator-missing';
+  return 'active';
+}
+
+/**
  * Migrate a config object from any older schema to the current one.
  *
  * This runs BEFORE `normaliseRaw`/strict validation on purpose: it is the only

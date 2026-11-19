@@ -9,7 +9,7 @@
 > 被 registry 以 **`E403 Your account has been temporarily suspended due to a recent
 > security-sensitive action`** 拒绝（2026-11-17 13:35Z）。这是账号级封控，与 OTP、token、
 > 命令形态都无关——**必须等 npm 解封**（见下方「npm 账号封控」一节）。
-> 基线：`dsh-memory` 工作区，全量 **519/519 测试通过**（82 个测试文件；另有 `dsh-orchestrator` 31/31）。
+> 基线：`dsh-memory` 工作区，全量 **520/520 测试通过**（82 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；
 > 插件市场仍无条目（npm 上 `latest` 仍为 `1.6.6`）。
 
@@ -205,7 +205,7 @@ OTP 流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`
   `/memory` 全子命令返回纯文本且**网络调用数为 0**、静音真的不注入提示、`resume` 在无交接时
   明确报错且与服务接口同源、`executeDream()` 先跑月记并写入 `promoted`、`maintain()` 不再产
   月记、已晋升日记下一轮仍被排除、源码扫描无 UI/追加模式监听。
-  全量 **519/519**（82 个测试文件）。
+  全量 **520/520**（82 个测试文件）。
 
 完整历史见 [CHANGELOG.md](../CHANGELOG.md) 的 `[1.6.7]` / `[1.6.6]` / `[1.6.5]` / `[1.6.4]` / `[1.6.3]` / `[1.6.2]` / `[1.6.1]` 段。
 
@@ -222,7 +222,7 @@ OTP 流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`
 
 ```powershell
 cd D:\86135\Documents\dsh\workspace\dsh-memory
-node test/run.mjs                # 期望 519/519
+node test/run.mjs                # 期望 520/520
 cd ..\dsh-orchestrator
 node test/run.mjs                # 期望 31/31
 cd ..\dsh-memory

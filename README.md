@@ -104,6 +104,13 @@
   `context.injectMode = 'full'` 是旧行为的一键回退（正文直接进 Prompt，按整段计费）。
   `[Memory Blocks]` 标记名与缓存前缀语义保持不变；`briefing` 块（运营方钉死的策略）
   永不降级为指针。
+- **多空间开关会说明自己为什么没生效（1.6.7，M6）**：`features.multiSpace` 默认 `true`，
+  但只有注入了能创建空间适配器的 `orchestrator` 服务时才真正运行。以前两者的差异是静默的
+  ——「我开了多空间」和「我实际在单空间」可以同时为真。现在
+  `capabilities.multiSpaceRequested`（配置意图）与 `capabilities.multiSpaceReason`
+  （`active` / `disabled-by-config` / `orchestrator-missing`）一起返回，
+  `panel.spaces.{requested,reason}` 同样如此，设置页会直接写明是哪一种。
+  **默认值没有改动**：改默认会静默改变已部署 profile 的行为。
 
 ### `/memory` 指令集（0 Token）
 
@@ -264,7 +271,7 @@ node scripts/wait-for-routes.mjs
 ### 6. 验证
 
 ```bash
-npm test        # 进程内全量用例（519 个）
+npm test        # 进程内全量用例（520 个）
 npm run check   # 语法检查 + 全量测试
 ```
 

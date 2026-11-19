@@ -28,7 +28,7 @@
  */
 
 import path from 'node:path';
-import { resolveConfig, toMemoryOptions, DEFAULT_CONFIG, multiSpaceActive } from './src/config.js';
+import { resolveConfig, toMemoryOptions, DEFAULT_CONFIG, multiSpaceActive, multiSpaceReason } from './src/config.js';
 import { extractEntities } from './src/utils/RegexExtractor.js';
 import { migrateDataDir } from './src/migration.js';
 import { MigrationRunner } from './src/migrationRunner.js';
@@ -1197,7 +1197,18 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
         // v1.6.3: cold-start injection observability. Without it the only way to tell
         // "armed but never assembled" from "already injected" is to read the prompt.
         coldStart: runtime.coldStartView?.() ?? null,
-        panel: { ...status.panel, migration: runtime.migrationStatus() },
+        panel: {
+          ...status.panel,
+          // v1.6.7 (M6): the panel's `spaces` block is what the UI renders, so the
+          // configured intent and the reason travel with it instead of only living in
+          // the capability handshake (which the panel does not read).
+          spaces: {
+            ...(status.panel.spaces ?? {}),
+            requested: runtime.config.features.multiSpace !== false,
+            reason: runtime.multiSpaceReason(),
+          },
+          migration: runtime.migrationStatus(),
+        },
         briefing: memory.briefing(),
         config: uiConfig(runtime.config),
       };
@@ -1277,6 +1288,16 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
   };
 
   /**
+   * v1.6.7 (M6): the same answer as `multiSpaceAvailable()`, plus WHY. Exposed as a
+   * capability so a client/user can tell "I turned it off" from "the adapter is not
+   * installed" instead of seeing an unexplained `spaces:false`.
+   */
+  runtime.multiSpaceReason = () => {
+    const orchestrator = orchestratorService();
+    return multiSpaceReason(runtime.config, typeof orchestrator?.createSpaceAdapter === 'function');
+  };
+
+  /**
    * Capability handshake read by the client bundle (old host → new UI safety).
    * v1.5.6: function, not a constant — the feature flags can change live and the
    * client must see `spaces:false` / `multiSpace:false` instead of a dead route.
@@ -1285,6 +1306,11 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     ...CAPABILITIES,
     spaces: runtime.multiSpaceAvailable(),
     multiSpace: runtime.multiSpaceAvailable(),
+    // v1.6.7 (M6): the CONFIGURED intent and the reason the effective answer may
+    // differ. `multiSpaceRequested` mirrors `features.multiSpace`; `multiSpaceReason`
+    // is 'active' | 'disabled-by-config' | 'orchestrator-missing'.
+    multiSpaceRequested: runtime.config.features.multiSpace !== false,
+    multiSpaceReason: runtime.multiSpaceReason(),
     crossSpaceTransfer: runtime.multiSpaceAvailable() && runtime.config.features.crossSpaceTransfer !== false,
     // v1.5.6: opt-in cross-space recall aggregation (default false).
     crossSpaceRecall: runtime.multiSpaceAvailable() && runtime.config.features.crossSpaceRecall === true,
