@@ -11,6 +11,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 与 M5（错误码边界）。1.6.7 把这两项送往 npm，并让仓库历史与已发布标签不再分叉；
 M1 则是本版的主线功能——每轮 Prompt 不再为记忆**正文**付费。**
 
+- **Added — 外部价格 / 通知接缝（M2）**。`dsh-price-tip` / `dsh-peak-runner` /
+  `dsh-notify-plugin` 在本机**并不存在**，因此没有「接线真实 API」可做——凭空猜服务名
+  等于发明接口。本版只做**可验证的可选接缝**：
+  - `HostBridge.setNotifier(sink)` + `notify({title,text,kind,at})`：没有 sink 时返回
+    `{delivered:false, reason:'no-notifier'}` 并只记计数，**绝不发明投递通道、绝不抛错**；
+    sink 抛错也只记 `sink-error`，不会污染维护流程。
+  - `index.js` 探测一组**约定键**（`priceTip` / `notifier` / `peakRunner`，或 `notify` / `peak`），
+    并接受多种方法形状（`isLowValley|lowValley|isLow|price`、`notify|send|post`、
+    `isPeak|peak|isHigh`）。外部价格服务优先于内置时间窗；`DSH_DREAM_PRICE` 仍可强制覆盖。
+  - `capabilities.externalSeams` 报告**哪条接缝真的接上了**（`{wired, source}`），
+    所以「没装」是可见事实而不是静默降级。
+  - 一旦通知接缝可用，「Dream 因高峰被推迟」会通过它播报（内含 `dueAt`）；没有接缝时
+    这件事仍由持久化队列与 `dream-deferred` 事件表达，行为不变。
+  - **排队本来就是实装的**：`index.js` 的 `tick()` 在高峰把 LLM 蒸馏写入 `dreamQueue`
+    并在谷时唤醒（`reason: 'peak-hour'`），不是丢弃，本次未改动该逻辑。
 - **Changed — 多空间开关的语义澄清（M6）**。`features.multiSpace` 默认 `true`，但只有注入了
   能创建空间适配器的 `orchestrator` 服务时才真正生效——以前这个差异是**静默**的：
   用户以为开了多空间，实际在跑单空间。现在新增 `multiSpaceReason()`，返回
@@ -52,8 +67,12 @@ M1 则是本版的主线功能——每轮 Prompt 不再为记忆**正文**付�
   briefing 不降级、标题截断与回退、`injectMode` 校验与可编辑、规则段只在 index 出现、
   recall 命中把标签与标题带进窗口且正文尾巴不出现）；
   `test/v156.features.test.js` 新增 M6 用例（`multiSpaceReason` 三态 + 显式关闭优先于
-  缺适配器 + 「布尔值与理由不可能矛盾」的交叉断言）。
-  全量 **520/520**（82 个测试文件）。
+  缺适配器 + 「布尔值与理由不可能矛盾」的交叉断言）；
+  `test/v167.m2.test.js`（6 例）锁住 M2 接缝：无 sink 时为 `no-notifier` 的记账型空操作、
+  sink 收到 payload 且被计数、sink 抛错只记 `sink-error` 不外溢、`externalSeams()` 如实报告
+  「通知与高峰缺席、价格回退本地时间窗」、注入 `notifier` 服务后被自动发现并可用、
+  注入 `priceTip` 后外部价格**优先于**本地时钟窗口。
+  全量 **526/526**（83 个测试文件）。
 
 ## [1.6.6] — 2026-11-16
 

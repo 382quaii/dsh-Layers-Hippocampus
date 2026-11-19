@@ -19,6 +19,11 @@
  *   - unknown + an LLM-backed Dream ⇒ SKIP ("price-unknown"). Unknown + a local-only
  *     Dream ⇒ allowed (local recompute is cheap and the compensation is the point).
  *
+ * M2: notifications are injected the same way. `setNotifier(fn)` accepts an external
+ * `dsh-notify-plugin`-style sink; without one every notification is a recorded no-op
+ * (`{delivered: false, reason: 'no-notifier'}`), so the plugin never invents a
+ * delivery channel and never throws when nothing is wired.
+ *
  * Zero dependencies; the bus is a plain `{on, off}` seam so tests can mock the Host.
  */
 
@@ -66,6 +71,9 @@ export class HostBridge {
     this.onAgentPresetSelected = typeof onAgentPresetSelected === 'function' ? onAgentPresetSelected : null;
     this.env = env ?? {};
     this._priceProbe = null;
+    // M2: an INJECTED notification sink. Null means "nothing is wired", which is a
+    // normal state, not an error — every notify() then answers no-notifier.
+    this._notifier = null;
     this._bound = null;
     this._compensating = false;
     this.stats = {
@@ -76,6 +84,10 @@ export class HostBridge {
       skipped: 0,
       lastSkipReason: null,
       presetSelections: 0,
+      notifications: 0,
+      lastNotificationAt: null,
+      notifySkipped: 0,
+      lastNotifySkipReason: null,
     };
   }
 
@@ -136,6 +148,44 @@ export class HostBridge {
   setPriceProbe(probe) {
     this._priceProbe = typeof probe === 'function' ? probe : null;
     return this;
+  }
+
+  /**
+   * M2: inject a notification sink (`dsh-notify-plugin` style). Passing null clears it.
+   *
+   * The sink receives `{ title, text, kind, at }`. It may return anything; only a
+   * thrown error matters (it is caught, counted and never propagates).
+   */
+  setNotifier(sink) {
+    this._notifier = typeof sink === 'function' ? sink : null;
+    return this;
+  }
+
+  /** True when an external notification channel is wired. */
+  get notifierAttached() {
+    return this._notifier !== null;
+  }
+
+  /**
+   * Deliver one notification through the injected sink. NEVER throws and NEVER
+   * invents a channel: without a sink the call is a recorded no-op.
+   */
+  notify({ title, text, kind = 'info', at = this.clock() } = {}) {
+    const noop = (reason) => {
+      this.stats.notifySkipped += 1;
+      this.stats.lastNotifySkipReason = reason;
+      return { delivered: false, reason };
+    };
+    if (!this._notifier) return noop('no-notifier');
+    try {
+      const outcome = this._notifier({ title, text, kind, at });
+      this.stats.notifications += 1;
+      this.stats.lastNotificationAt = at;
+      return { delivered: true, outcome: outcome ?? null };
+    } catch (error) {
+      this.logger?.warn?.(`hippocampus: notification sink failed: ${error?.message ?? error}`);
+      return noop('sink-error');
+    }
   }
 
   /** `{known, low}` for one instant. Never guesses: unknown is reported as such. */
@@ -216,6 +266,7 @@ export class HostBridge {
       dreamDue: this.dreamDue(),
       compensateAfterHours: this.dreamPolicy().compensateAfterHours,
       attached: this._bound !== null,
+      notifierAttached: this.notifierAttached,
     };
   }
 }

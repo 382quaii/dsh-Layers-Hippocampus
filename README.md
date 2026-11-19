@@ -111,6 +111,13 @@
   （`active` / `disabled-by-config` / `orchestrator-missing`）一起返回，
   `panel.spaces.{requested,reason}` 同样如此，设置页会直接写明是哪一种。
   **默认值没有改动**：改默认会静默改变已部署 profile 的行为。
+- **外部价格 / 通知是可插接的，但不会假装接了（1.6.7，M2）**：
+  `dsh-price-tip` / `dsh-peak-runner` / `dsh-notify-plugin` 这类兄弟插件**不是依赖**。
+  引擎只探测约定服务键（`priceTip` / `notifier` / `peakRunner`，或 `notify` / `peak`），
+  探测不到就用本地时间窗（价格）或记账型空操作（通知）：`notify()` 返回
+  `{delivered:false, reason:'no-notifier'}`，既不发明投递通道，也不会因缺插件抛错。
+  `capabilities.externalSeams` 会如实报告 `{wired, source}`，所以「没装」是可见事实。
+  **高峰期不丢任务**：LLM 蒸馏在高峰只被写入持久化队列并在谷时唤醒，不是跳过。
 
 ### `/memory` 指令集（0 Token）
 
@@ -271,7 +278,7 @@ node scripts/wait-for-routes.mjs
 ### 6. 验证
 
 ```bash
-npm test        # 进程内全量用例（520 个）
+npm test        # 进程内全量用例（526 个）
 npm run check   # 语法检查 + 全量测试
 ```
 

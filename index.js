@@ -999,6 +999,14 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       runtime.dreamTimer?.schedule(now);
       results.push({ ran: false, skipped: true, reason: 'peak-hour', dueAt, source: 'dream' });
       emit({ type: 'dream-deferred', dueAt, window: windowInfo(now) });
+      // M2: if an external notifier is wired, say why the dream was postponed. Without
+      // one this is a recorded no-op — the queue still holds the work either way.
+      runtime.hostBridge.notify({
+        title: '海马体：整理任务推迟到谷时',
+        text: `LLM 蒸馏在高峰期不做，已排队到 ${new Date(dueAt).toISOString()}（窗口：${windowInfo(now).window ?? 'unknown'}）。`,
+        kind: 'dream-deferred',
+        at: now,
+      });
       return results;
     }
     results.push(await runtime.runMaintenance('dream'));
@@ -1311,6 +1319,9 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     // is 'active' | 'disabled-by-config' | 'orchestrator-missing'.
     multiSpaceRequested: runtime.config.features.multiSpace !== false,
     multiSpaceReason: runtime.multiSpaceReason(),
+    // M2: which optional external seams answered. Absence is reported, not hidden:
+    // `wired:false` means this engine fell back to its own local behaviour.
+    externalSeams: runtime.externalSeams?.() ?? null,
     crossSpaceTransfer: runtime.multiSpaceAvailable() && runtime.config.features.crossSpaceTransfer !== false,
     // v1.5.6: opt-in cross-space recall aggregation (default false).
     crossSpaceRecall: runtime.multiSpaceAvailable() && runtime.config.features.crossSpaceRecall === true,
@@ -1775,10 +1786,72 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
   });
   runtime.hostBridge.attach();
   runtime.hostStatus = () => runtime.hostBridge.status();
+  /**
+   * M2: optional external seams.
+   *
+   * The architecture note lists `dsh-price-tip` / `dsh-peak-runner` /
+   * `dsh-notify-plugin` as the plugins this engine should DELEGATE to — but none of
+   * them is installed here, and inventing their service names would be fiction. So we
+   * probe a small set of CONVENTIONAL keys, accept several plausible method shapes, and
+   * degrade to the local implementation (or a recorded no-op) when nothing answers.
+   * `runtime.externalSeams()` reports exactly what was found, so absence is visible
+   * instead of silently pretending.
+   */
+  const pickMethod = (service, names) => {
+    if (!service || typeof service !== 'object') return null;
+    for (const name of names) {
+      if (typeof service[name] === 'function') return service[name].bind(service);
+    }
+    return null;
+  };
+  const probeExternalSeams = () => {
+    const seams = { price: { wired: false, source: 'local-window' }, notifier: { wired: false, source: null }, peak: { wired: false, source: null } };
+    // Price: an external tip service wins over the built-in clock window.
+    try {
+      const priceService = ctx?.get?.('priceTip') ?? ctx?.get?.('priceTipService') ?? null;
+      const lowValley = pickMethod(priceService, ['isLowValley', 'lowValley', 'isLow', 'price']);
+      if (lowValley) {
+        seams.price = { wired: true, source: 'priceTip' };
+        if (!process.env.DSH_DREAM_PRICE) runtime.hostBridge.setPriceProbe((now) => lowValley(now));
+      }
+    } catch (error) {
+      runtime.logger?.warn?.(`hippocampus: price tip seam failed: ${error?.message ?? error}`);
+    }
+    // Notifications: no sink ⇒ every notify() is a recorded no-op.
+    try {
+      const notifyService = ctx?.get?.('notifier') ?? ctx?.get?.('notify') ?? null;
+      const send = pickMethod(notifyService, ['notify', 'send', 'post']);
+      if (send) {
+        seams.notifier = { wired: true, source: 'notifier' };
+        runtime.hostBridge.setNotifier(send);
+      }
+    } catch (error) {
+      runtime.logger?.warn?.(`hippocampus: notifier seam failed: ${error?.message ?? error}`);
+    }
+    // Peak runner: only used for reporting; the scheduler stays local.
+    try {
+      const peakService = ctx?.get?.('peakRunner') ?? ctx?.get?.('peak') ?? null;
+      const isPeak = pickMethod(peakService, ['isPeak', 'peak', 'isHigh']);
+      if (isPeak) seams.peak = { wired: true, source: 'peakRunner' };
+    } catch {
+      /* reporting-only seam */
+    }
+    return seams;
+  };
+  const externalSeamReport = probeExternalSeams();
+  // Snapshot, not a re-probe: calling the probes twice would re-register the sinks.
+  runtime.externalSeams = () => ({
+    price: {
+      wired: runtime.hostBridge._priceProbe !== null,
+      source: runtime.hostBridge._priceProbe !== null ? externalSeamReport.price.source : 'local-window',
+    },
+    notifier: { wired: runtime.hostBridge.notifierAttached, source: externalSeamReport.notifier.source },
+    peak: { wired: externalSeamReport.peak.wired, source: externalSeamReport.peak.source },
+  });
   // v1.5.6 local scheduler: the price window is computed from the clock, so a
   // compensating Dream obeys peak hours without any external price plugin. An
   // explicit DSH_DREAM_PRICE override wins (hostBridge reads it when no probe).
-  if (!process.env.DSH_DREAM_PRICE) {
+  if (!process.env.DSH_DREAM_PRICE && runtime.hostBridge._priceProbe === null) {
     runtime.hostBridge.setPriceProbe((now) => isLowValley(now ?? memory.clock.now()));
   }
   runtime.dreamWindow = () => windowInfo(memory.clock.now());

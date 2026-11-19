@@ -2,14 +2,14 @@
 
 > 版本：**1.6.7**（2026-11-17：**索引式提示注入 M1** + **发布链完整性修正**——事后核对发现 1.6.6 的 npm 制品（`gitHead 99a07cb`）是从**另一份旧 checkout** 发布的，只含 Live Compact 修复，**不含** M3/M5。本版把这两项送出去，并把已发布提交并入 `main` 历史、让 `v1.6.6` tag 指向 npm 实际制品。累计 1.6.6 的 Live Compact 修复、1.6.5 的微内核回归、1.6.4 的 1M 溢出修复、以及 1.6.3 的配置迁移与启动降级）。
 
-> 状态：**代码与文档已提交；`main` 与 `v1.6.7` tag 已推送到 GitHub（远端 `main = 36f0597`，
-> `v1.6.7 → 36f0597`）。**
+> 状态：**代码与文档已提交；`main` 与 `v1.6.7` tag 已推送到 GitHub（远端 `main = aa38876`，
+> `v1.6.7 → aa38876`）。**
 > 剩余 **npm publish** 未执行，且**不是本地命令的问题**：`npm whoami` 已能返回 `382quaii`，
 > `npm pack --dry-run` 也正常（71 files / 540.2 kB / shasum `ea78a800…`），但 `npm publish`
 > 被 registry 以 **`E403 Your account has been temporarily suspended due to a recent
 > security-sensitive action`** 拒绝（2026-11-17 13:35Z）。这是账号级封控，与 OTP、token、
 > 命令形态都无关——**必须等 npm 解封**（见下方「npm 账号封控」一节）。
-> 基线：`dsh-memory` 工作区，全量 **520/520 测试通过**（82 个测试文件；另有 `dsh-orchestrator` 31/31）。
+> 基线：`dsh-memory` 工作区，全量 **526/526 测试通过**（83 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；
 > 插件市场仍无条目（npm 上 `latest` 仍为 `1.6.6`）。
 
@@ -35,7 +35,7 @@ OTP 流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`
    ```powershell
    pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.7"
    ```
-   这与 npm 制品是同一份代码（`v1.6.7 → 36f0597`）。
+   这与 npm 制品是同一份代码（`v1.6.7 → aa38876`）。
 
 ## 本版内容
 
@@ -79,6 +79,27 @@ OTP 流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`
    映射表同步写进 `dsh-orchestrator/README.md`。7 例 `test/v166.errorContract.test.js`。
 4. **1.6.5 / 1.6.6 tag 归位**：`v1.6.5` 指向实际发布的 `28776c7`，`v1.6.6` 指向实际发布的
    `99a07cb`，两者都与 npm/GitHub 一致（npm 版本不可覆盖）。
+5. **M2 外部价格 / 通知接缝**：三个目标插件（`dsh-price-tip` / `dsh-peak-runner` /
+   `dsh-notify-plugin`）本机**并不存在**，凭空猜服务名等于发明接口，因此只做**可验证接缝**：
+   - `HostBridge.setNotifier(sink)` + `notify({title,text,kind,at})`；没有 sink 时返回
+     `{delivered:false, reason:'no-notifier'}` 并只记账，sink 抛错只记 `sink-error`，**绝不上抛**。
+   - `index.js` 探测约定键（`priceTip` / `notifier` / `peakRunner`，或 `notify` / `peak`），
+     兼容多种方法形状（`isLowValley|lowValley|isLow|price`、`notify|send|post`、`isPeak|peak|isHigh`）。
+     外部价格**优先于**内置时间窗；`DSH_DREAM_PRICE=low|high` 仍可强制覆盖。
+   - `capabilities.externalSeams` 报告 `{wired, source}`，让「没装」成为可见事实。
+   - 接缝可用时，「Dream 因高峰被推迟」会播报 `dueAt`；没有接缝时该事实仍由持久化队列
+     与 `dream-deferred` 事件表达，**行为不变**。
+   - **核查结论**：「高峰期排队」本来就已实装（`tick()` 把 LLM 蒸馏写入 `dreamQueue` 并在谷时
+     唤醒，`reason: 'peak-hour'`），不是跳过；本次未改动该逻辑。
+   6 例 `test/v167.m2.test.js` 锁住：无 sink 的记账型空操作、sink 收到 payload 并被计数、
+   sink 抛错只记 `sink-error`、`externalSeams()` 如实报告缺席、注入 `notifier` 后被自动发现、
+   注入 `priceTip` 后外部价格优先于本地时间窗。
+6. **M6 多空间开关语义**：`features.multiSpace` 默认 `true`，但只有注入了能创建空间适配器的
+   `orchestrator` 服务才真正生效——以前这个差异是静默的。**不改默认值**（会静默改变已部署
+   profile 的行为），改为新增 `multiSpaceReason()` 三态（`active` / `disabled-by-config` /
+   `orchestrator-missing`），经 `capabilities.multiSpaceRequested` + `capabilities.multiSpaceReason`
+   与 `panel.spaces.{requested,reason}` 暴露；设置页多空间卡片在「被配置关闭」时直接写明，
+   不再把「没装适配器」与「你关了它」混成一个 `spaces:false`。
 
 ### 主线三（1.6.6）
 
@@ -205,7 +226,7 @@ OTP 流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`
   `/memory` 全子命令返回纯文本且**网络调用数为 0**、静音真的不注入提示、`resume` 在无交接时
   明确报错且与服务接口同源、`executeDream()` 先跑月记并写入 `promoted`、`maintain()` 不再产
   月记、已晋升日记下一轮仍被排除、源码扫描无 UI/追加模式监听。
-  全量 **520/520**（82 个测试文件）。
+  全量 **526/526**（83 个测试文件）。
 
 完整历史见 [CHANGELOG.md](../CHANGELOG.md) 的 `[1.6.7]` / `[1.6.6]` / `[1.6.5]` / `[1.6.4]` / `[1.6.3]` / `[1.6.2]` / `[1.6.1]` 段。
 
@@ -222,7 +243,7 @@ OTP 流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`
 
 ```powershell
 cd D:\86135\Documents\dsh\workspace\dsh-memory
-node test/run.mjs                # 期望 520/520
+node test/run.mjs                # 期望 526/526
 cd ..\dsh-orchestrator
 node test/run.mjs                # 期望 31/31
 cd ..\dsh-memory
