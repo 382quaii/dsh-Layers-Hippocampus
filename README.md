@@ -7,7 +7,7 @@
 
 | | |
 | --- | --- |
-| 版本 | **1.6.7** |
+| 版本 | **1.6.8** |
 | 包名 | `dsh-layers-hippocampus` |
 | 仓库 | <https://github.com/382quaii/dsh-Layers-Hippocampus> |
 | 许可证 | MIT |
@@ -98,6 +98,11 @@
   中间压成一行指向 raw 日志的指针（带 `seq` / `call` / `tool` 坐标），原文仍可用
   `deep_raw` 取回。**只跑本插件自己的保守策略**，不委托宿主的 `toolResultPruner`
   （1.6.6：宿主的预算是预设自己的 8k 级阈值，每轮委托等于每轮偷偷掉几十 k tokens）。
+- **密文不写入（1.6.8）**：写侧（`raw` 捕获、`remember`、auto-capture）会检测高熵载荷，
+  命中 base64/hex 长串或 PEM 甲壳时抛 `MEM_E_ENCRYPTED_RAW_REJECTED` 并**零落盘**；
+  auto-capture 只降级成 `skipped: 'encrypted-blob'`，不刷警告。密文块永远无法被 recall、
+  蒸馏或打标，却会永久占用保留期与预算——所以在入口就拒绝，而不是留着当垃圾。
+  散文、源码、URL、路径与短 base64 片段不受影响。
 - **索引式注入（1.6.7，默认）**：`context.injectMode = 'index'` 时，每个记忆块只往 Prompt
   里放一行指针 `- [memory <eventId>] 标签 · 标题`，正文按需用 `recall` 取；
   8,000 字符的正文（≈2,000 tokens）变成通常不到 60 tokens 的指针行。
@@ -207,7 +212,7 @@ raw 层提供三档，覆盖从“只留关键”到“全留”：
 pnpm add dsh-layers-hippocampus
 
 # 或从 GitHub 指定 tag
-pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.7"
+pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.8"
 ```
 
 ### 2. 挂到 profile
@@ -278,7 +283,7 @@ node scripts/wait-for-routes.mjs
 ### 6. 验证
 
 ```bash
-npm test        # 进程内全量用例（526 个）
+npm test        # 进程内全量用例（534 个）
 npm run check   # 语法检查 + 全量测试
 ```
 

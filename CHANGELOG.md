@@ -4,6 +4,37 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.8] — 2026-11-20
+
+**写侧护栏：拒绝高熵密文 / 加密载荷。** raw 日志与 L1 事件日志是本插件承诺「永远保留」
+的两样东西，而密文块恰恰是唯一无法被召回（没有可搜索的子串）、无法被蒸馏（没有可说的
+语义）、也无法被打标的载荷——它只会永久占用保留期与存储预算。这是审计项 A4，自
+1.5.7 起挂着「文档已规划但代码未实现」，本版补上。
+
+- **Added — `src/entropy.js`**：纯函数检测器，零依赖。
+  - `shannonEntropy(text)`：香农熵（保留 3 位小数）。
+  - `detectCiphertext(text, { minRunChars })` → `null` 或
+    `{ reason: 'pem'|'base64'|'hex', runLength, entropy, at, sample }`。
+  - 三条判据各自有下限：base64 连续 ≥512 字符且熵 ≥4.5；hex 连续 ≥512 字符且熵 ≥3.5；
+    PEM 甲壳（`-----BEGIN PGP MESSAGE-----` 等 5 种标记）**即使很短**也拒绝。
+  - 保守优先：散文、源码、URL、Windows 路径、低熵长串、短 base64 data URI 全部放行。
+- **Added — `MEM_E_ENCRYPTED_RAW_REJECTED`**（`src/errors.js`），details 带
+  `{ reason, runLength, entropy, at }`，调用方不必解析消息文本。
+- **Changed — 三条写路径统一护栏**：
+  - `src/rawStore.js#capture`：在非空校验之后、门槛判定之前检测，**拒绝且零落盘**
+    （不入队、不刷盘、分片里不会出现该载荷）。
+  - `src/memory.js#remember`：同规则，且**先于**旧的 base64-media 守卫——对一个密文块，
+    叫调用方「改用 media_url」是错误建议，正确诊断是「这是密文」。
+  - `src/memory.js#captureSessionEvent`：auto-capture 遇到密文时返回
+    `{ stored: false, skipped: 'encrypted-blob', reason }`，**不作为 capture 失败刷警告**
+    （会话里粘一段密钥不该让日志被 warn 淹没），其他错误仍照旧上抛。
+- **Tests**：新增 `test/v168.encrypted.test.js`（8 例）：熵函数基准、7 类正常内容零误判、
+  base64/hex/PEM 三判据各自的拒绝理由、raw store 拒绝且磁盘无残留、auto-capture 的 skip
+  语义、`remember()` 同规则且普通写入不受影响。全量 **534/534**（84 个测试文件）。
+- **Docs**：`记忆插件-未完成表.md` 从「2026-11-05 待办审计」重写为「当前状态表」——
+  A1–A21 逐项给出关闭依据，13 项关闭、2 项 superseded、2 项并入 M3/M6、4 项明确不做
+  （并写明为什么不做），另列仍需外部动作的四项（npm 账号封控等）。
+
 ## [1.6.7] — 2026-11-17
 
 **发布链完整性修正 + 索引式提示注入（M1）。1.6.6 在 npm 上的制品（`gitHead 99a07cb`）
@@ -72,7 +103,7 @@ M1 则是本版的主线功能——每轮 Prompt 不再为记忆**正文**付�
   sink 收到 payload 且被计数、sink 抛错只记 `sink-error` 不外溢、`externalSeams()` 如实报告
   「通知与高峰缺席、价格回退本地时间窗」、注入 `notifier` 服务后被自动发现并可用、
   注入 `priceTip` 后外部价格**优先于**本地时钟窗口。
-  全量 **526/526**（83 个测试文件）。
+  全量 **526/526**（84 个测试文件）。
 
 ## [1.6.6] — 2026-11-16
 

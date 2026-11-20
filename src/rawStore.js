@@ -29,6 +29,7 @@ import { dayKey, ensureDir, sha256 } from './util.js';
 import { RawArchive, archiveMonthOf, isArchiveName, scanGzipArchive } from './rawArchive.js';
 import { engineForArchive } from './compression.js';
 import { buildIndex, indexFileFor, isIndexFile, readIndex, shardOverlapsWindow, writeIndex } from './rawIndex.js';
+import { detectCiphertext } from './entropy.js';
 
 export const RAW_DIR = 'raw';
 /** Records queued before a forced flush. */
@@ -296,6 +297,19 @@ export class RawStore {
     const config = this.config();
     const text = typeof turn.content === 'string' ? turn.content : '';
     if (!text.trim()) throw new MemoryError(ErrorCodes.INVALID_INPUT, 'raw turn content must be a non-empty string');
+    // A4: refuse ciphertext / high-entropy blobs BEFORE they reach the black box. The
+    // raw log is the one artefact promised to survive forever; a blob that can never be
+    // searched, summarised or distilled would be a permanent liability, so the write is
+    // rejected with an explicit code instead of being stored and forgotten.
+    const cipher = detectCiphertext(text);
+    if (cipher) {
+      throw new MemoryError(
+        ErrorCodes.ENCRYPTED_RAW_REJECTED,
+        `raw turn carries a ${cipher.reason} blob (${cipher.runLength} chars, entropy ${cipher.entropy ?? 'n/a'}); ` +
+          'ciphertext/high-entropy payloads are not stored in the append-only log',
+        { reason: cipher.reason, runLength: cipher.runLength, entropy: cipher.entropy, at: cipher.at },
+      );
+    }
     const decision = this.gate({ mode: config.mode, salience: turn.salience, kind: turn.kind, text, force: turn.force });
     if (!decision.store) return { stored: false, reason: decision.reason };
 

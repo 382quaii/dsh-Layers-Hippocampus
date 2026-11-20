@@ -112,6 +112,7 @@ function validateRoutedNewSpaceId(value) {
   return id;
 }
 import { ensureDir, dayKey, genNumber, sha256, readJson, writeJsonAtomic, snippet } from './util.js';
+import { detectCiphertext } from './entropy.js';
 
 /** Recursive byte size of a directory tree (symlinks count as their target size). */
 function diskUsage(dir) {
@@ -731,6 +732,18 @@ export class Memory {
     mediaType = null,
   } = {}) {
     this.assertOpen();
+    // A4: ciphertext is checked FIRST, before the generic base64-media guard, because
+    // "this looks like ciphertext" is the more useful diagnosis: the media guard would
+    // tell the caller to pass media_url, which is exactly wrong for a secret blob.
+    const cipher = detectCiphertext(content);
+    if (cipher) {
+      throw new MemoryError(
+        ErrorCodes.ENCRYPTED_RAW_REJECTED,
+        `content carries a ${cipher.reason} blob (${cipher.runLength} chars, entropy ${cipher.entropy ?? 'n/a'}); ` +
+          'ciphertext/high-entropy payloads are not stored as memories',
+        { reason: cipher.reason, runLength: cipher.runLength, entropy: cipher.entropy, at: cipher.at },
+      );
+    }
     ensureNoEmbeddedBase64(content);
     const media = validateMedia(mediaUrl, mediaType);
     const requestedTags = [
@@ -1590,16 +1603,26 @@ export class Memory {
       const bucket = parseInt(sha256(turnId + ':' + turn.text).slice(0, 8), 16) % 2;
       if (bucket !== 0) return { skipped: 'capture-ratio-sample' };
     }
-    return this.raw.capture({
-      content: turn.text,
-      role: turn.role,
-      kind: event?.type === 'tool/result' && isError ? 'error' : turn.kind,
-      sessionId: session?.id ?? session?.sessionId ?? null,
-      turnId: `turn_${event?.seq ?? 'x'}_${turn.role}`,
-      at: Number.isFinite(event?.time) ? event.time : undefined,
-      salience: 1,
-      force: true,
-    });
+    try {
+      return await this.raw.capture({
+        content: turn.text,
+        role: turn.role,
+        kind: event?.type === 'tool/result' && isError ? 'error' : turn.kind,
+        sessionId: session?.id ?? session?.sessionId ?? null,
+        turnId: `turn_${event?.seq ?? 'x'}_${turn.role}`,
+        at: Number.isFinite(event?.time) ? event.time : undefined,
+        salience: 1,
+        force: true,
+      });
+    } catch (error) {
+      // A4: a ciphertext blob is a normal, expected refusal — not a capture failure.
+      // Returning it as a skip keeps the listener quiet while still leaving a trace in
+      // the turn's own result (and never writes the blob anywhere).
+      if (error?.code === ErrorCodes.ENCRYPTED_RAW_REJECTED) {
+        return { stored: false, skipped: 'encrypted-blob', reason: error?.details?.reason ?? 'ciphertext' };
+      }
+      throw error;
+    }
   }
 
   /**

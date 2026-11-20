@@ -63,7 +63,7 @@ export { resolveConfig, DEFAULT_CONFIG };
  * of letting a raw 404 reach the user.
  */
 export const CAPABILITIES = Object.freeze({
-  version: '1.6.7',
+  version: '1.6.8',
   spaces: true,
   memories: true,
   transferConsent: true,

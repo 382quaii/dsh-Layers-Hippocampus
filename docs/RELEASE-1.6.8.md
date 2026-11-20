@@ -1,15 +1,14 @@
-# Release 1.6.7 — 发布准备（本地）
+# Release 1.6.8 — 发布准备（本地）
 
-> 版本：**1.6.7**（2026-11-17：**索引式提示注入 M1** + **发布链完整性修正**——事后核对发现 1.6.6 的 npm 制品（`gitHead 99a07cb`）是从**另一份旧 checkout** 发布的，只含 Live Compact 修复，**不含** M3/M5。本版把这两项送出去，并把已发布提交并入 `main` 历史、让 `v1.6.6` tag 指向 npm 实际制品。累计 1.6.6 的 Live Compact 修复、1.6.5 的微内核回归、1.6.4 的 1M 溢出修复、以及 1.6.3 的配置迁移与启动降级）。
+> 版本：**1.6.8**（2026-11-20：**写侧密文护栏**（审计项 A4）+ 把 `记忆插件-未完成表.md` 从待办审计重写为当前状态表。累计 1.6.7 的索引式注入 M1 与发布链修正、1.6.6 的 Live Compact 修复、1.6.5 的微内核回归、1.6.4 的 1M 溢出修复、1.6.3 的配置迁移与启动降级）。
 
-> 状态：**代码与文档已提交；`main` 与 `v1.6.7` tag 已推送到 GitHub（远端 `main = aa38876`，
-> `v1.6.7 → aa38876`）。**
+> 状态：**代码与文档已提交，GitHub 侧由发布步骤推送；npm 侧仍被账号封控挡住。**
 > 剩余 **npm publish** 未执行，且**不是本地命令的问题**：`npm whoami` 已能返回 `382quaii`，
-> `npm pack --dry-run` 也正常（71 files / 540.2 kB / shasum `ea78a800…`），但 `npm publish`
-> 被 registry 以 **`E403 Your account has been temporarily suspended due to a recent
-> security-sensitive action`** 拒绝（2026-11-17 13:35Z）。这是账号级封控，与 OTP、token、
+> `npm pack --dry-run` 也正常，但 `npm publish` 被 registry 以
+> **`E403 Your account has been temporarily suspended due to a recent
+> security-sensitive action`** 拒绝（2026-11-17 13:35Z 首测）。这是账号级封控，与 OTP、token、
 > 命令形态都无关——**必须等 npm 解封**（见下方「npm 账号封控」一节）。
-> 基线：`dsh-memory` 工作区，全量 **526/526 测试通过**（83 个测试文件；另有 `dsh-orchestrator` 31/31）。
+> 基线：`dsh-memory` 工作区，全量 **534/534 测试通过**（84 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；
 > 插件市场仍无条目（npm 上 `latest` 仍为 `1.6.6`）。
 
@@ -24,27 +23,42 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 
 排查已排除的项：`whoami` 正常、`pack --dry-run` 正常、`--cache` 已指向可写目录、
 OTP 流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`）。
-`registry` 侧确认 `1.6.7` **未发布**（`latest = 1.6.6`）。
+`registry` 侧确认 `1.6.7` / `1.6.8` **均未发布**（`latest = 1.6.6`）。
 
 恢复路径（按顺序试）：
 1. 查 `382quaii` 的注册邮箱（含垃圾箱）里的 npm 安全通知，点其中的验证/申诉链接——
    「recent security-sensitive action」通常是**改密码 / 换 token / 新设备登录**触发的自动冻结。
 2. 等 24 小时后重试 `npm publish --access public`（多数临时封控自动解除）。
 3. 仍未解除则走 <https://www.npmjs.com/support> 提交支持单，附上面这条 `E403` 原文与时间戳。
-4. **在解封前，用户可以改用 GitHub 安装**（tag 已在远端）：
+4. **在解封前，用户可以改用 GitHub 安装**（tag 在远端）：
    ```powershell
-   pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.7"
+   pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.8"
    ```
-   这与 npm 制品是同一份代码（`v1.6.7 → aa38876`）。
 
 ## 本版内容
 
-**主线一：索引式提示注入（M1）——每轮 Prompt 不再为记忆正文付费。**
-**主线二：发布链完整性——把 1.6.6 漏发的 M3（测试跨包解耦）与 M5（错误码边界）送往 npm，并修复发布历史分叉。**
-**主线三：Live Compact 不再委托宿主 pruner（「10%→7%」的真凶，1.6.6，已发布）。**
-**主线四：回归微内核——指令集 0 Token、蒸馏单一调度器、原子服务接口（1.6.5，已发布）。**
+**主线一：写侧密文护栏（1.6.8 · A4）——密文不是记忆，必须在写入前就拒绝。**
+**主线二：索引式提示注入（M1，1.6.7）——每轮 Prompt 不再为记忆正文付费。**
+**主线三：发布链完整性（1.6.7）——把 1.6.6 漏发的 M3 与 M5 送往 npm，并修复发布历史分叉。**
+**主线四：Live Compact 不再委托宿主 pruner（「10%→7%」的真凶，1.6.6，已发布）。**
+**主线五：回归微内核——指令集 0 Token、蒸馏单一调度器、原子服务接口（1.6.5，已发布）。**
 
-### 主线一（1.6.7 · M1）
+### 主线一（1.6.8 · A4 密文护栏）
+
+1. **`src/entropy.js`**（新增，纯函数、零依赖）：`shannonEntropy()` 与
+   `detectCiphertext()` 三条判据——base64 连续 ≥512 字符且熵 ≥4.5；hex 连续 ≥512 字符
+   且熵 ≥3.5；PEM 甲壳（5 种标记）即使很短也拒绝。
+2. **保守优先**：散文、源码、URL、Windows 路径、低熵长串、短 base64 data URI 全部放行，
+   误判代价（丢掉一条真记忆）远高于漏判代价（多存一块垃圾）。
+3. **`MEM_E_ENCRYPTED_RAW_REJECTED`**：details 带 `{ reason, runLength, entropy, at }`，
+   调用方不必解析消息文本。
+4. **三条写路径统一护栏**：`rawStore.capture` **拒绝且零落盘**；`remember()` 同规则且
+   **先于**旧的 base64-media 守卫（对密文块叫调用方「改用 media_url」是错误建议）；
+   auto-capture 降级为 `{ stored: false, skipped: 'encrypted-blob' }`，不当作失败刷警告。
+5. **`记忆插件-未完成表.md` 重写**：A1–A21 逐项给关闭依据——13 关闭、2 superseded、
+   2 并入 M3/M6、4 明确不做（并写明为什么不做），另列仍需外部动作的四项。
+
+### 主线二（1.6.7 · M1）
 
 1. **`context.injectMode`（默认 `index`）**：每个记忆块只注入一行指针
    `- [memory <eventId>] 标签 · 标签 · 标题`；正文不进 Prompt，需要细节时用 `memory_recall`
@@ -57,7 +71,7 @@ OTP 流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`
 4. **可配置**：`context.injectMode` 进 `EDITABLE_CONFIG_KEYS`，设置页「上下文窗口」卡片新增下拉，
    简洁模式下同样可见可存。9 例 `test/v167.m1.test.js`。
 
-### 主线二（1.6.7 · 发布链）
+### 主线三（1.6.7 · 发布链）
 
 1. **发布历史分叉修复**。1.6.6 的 npm 制品 `gitHead 99a07cb` 来自旧 checkout
    （`C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory`），
@@ -101,7 +115,7 @@ OTP 流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`
    与 `panel.spaces.{requested,reason}` 暴露；设置页多空间卡片在「被配置关闭」时直接写明，
    不再把「没装适配器」与「你关了它」混成一个 `spaces:false`。
 
-### 主线三（1.6.6）
+### 主线四（1.6.6）
 
 1. **不再每轮委托宿主 `toolResultPruner`**。旧实现里 `guardRequest` 在**每一次**
    `agent/request` 上都 `await hostPruner.pruneSession(session)`。两处都错：
@@ -112,7 +126,7 @@ OTP 流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`
    4,000 头 / 2,000 尾 / 每请求最多 4 个节点），健康对话**永不被改写**。
    回归用例断言：注入假 pruner 后健康请求上 `pruneSession` 调用次数 **0**。
 
-### 主线四（1.6.5）
+### 主线五（1.6.5）
 
 1. **`/memory` 指令集（0 Token）**：`resume` / `maintain` / `status` / `mute` / `unmute` 经宿主
    `commands` 服务注册。`commands.execute()` 的语义是「执行已知命令、**不发给模型**」，
@@ -133,7 +147,7 @@ OTP 流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`
    `startSession(` / `sessionStorage` / `appendMode` / `onSlot(` / `slots.register(` /
    `ctx.slots =`。会话控制归外部路由插件。
 
-### 主线五（1.6.4）
+### 主线六（1.6.4）
 
 事故回顾（1.6.4 主线）：一次请求携带 **854,668 prompt tokens + 预留 256,000 completion tokens**
 = 1,110,668 > 模型真实窗口 **1,048,576**，被 provider 以 `CONTEXT_WINDOW_EXCEEDED` 拒绝；
@@ -226,13 +240,13 @@ OTP 流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`
   `/memory` 全子命令返回纯文本且**网络调用数为 0**、静音真的不注入提示、`resume` 在无交接时
   明确报错且与服务接口同源、`executeDream()` 先跑月记并写入 `promoted`、`maintain()` 不再产
   月记、已晋升日记下一轮仍被排除、源码扫描无 UI/追加模式监听。
-  全量 **526/526**（83 个测试文件）。
+  全量 **534/534**（84 个测试文件）。
 
 完整历史见 [CHANGELOG.md](../CHANGELOG.md) 的 `[1.6.7]` / `[1.6.6]` / `[1.6.5]` / `[1.6.4]` / `[1.6.3]` / `[1.6.2]` / `[1.6.1]` 段。
 
 ## 发布步骤（需要你执行）
 
-> 两个包：`dsh-layers-hippocampus@1.6.7`（已有 git remote）与
+> 两个包：`dsh-layers-hippocampus@1.6.8`（已有 git remote）与
 > `dsh-layers-orchestrator@0.1.0`（**目前不是 git 仓库**，需先 init/建远端）。
 > 全部命令在 PowerShell 下执行；`node`/`npm`/`pnpm` 用 DSH runtime 自带的绝对路径。
 > **本机网络注意**：证书链校验被中间打断，`git` 需 `GIT_SSL_NO_VERIFY=1` 才能访问 origin；
@@ -243,7 +257,7 @@ OTP 流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`
 
 ```powershell
 cd D:\86135\Documents\dsh\workspace\dsh-memory
-node test/run.mjs                # 期望 526/526
+node test/run.mjs                # 期望 534/534
 cd ..\dsh-orchestrator
 node test/run.mjs                # 期望 31/31
 cd ..\dsh-memory
@@ -258,12 +272,12 @@ npm pack --dry-run               # 预检实际发布内容（含/不含不该�
 cd D:\86135\Documents\dsh\workspace\dsh-memory
 git add -A
 git status --short                 # 最后确认没有 node_modules / state / 测试临时目录
-git commit -m "chore(release): v1.6.7 - ship M3 + M5 that the 1.6.6 npm bundle missed; merge the published commit"
+git commit -m "chore(release): v1.6.8 - refuse ciphertext on the write path (A4); refresh the open-items table"
 
 # 历史 tag：v1.5.5 / v1.5.7 / v1.6.0 / v1.6.1 / v1.6.2 / v1.6.4 / v1.6.5 / v1.6.6。
 # v1.6.5 已指向实际发布的 28776c7、v1.6.6 已指向实际发布的 99a07cb（均为 annotated），不要动它们。
-# 本次只新增 v1.6.7，不需要删任何 tag。
-git tag -a v1.6.7 -m "v1.6.7: test/orchestrator bridge (M3); ORCH_E_* boundary (M5)"
+# 本次只新增 v1.6.8，不需要删任何 tag。
+git tag -a v1.6.8 -m "v1.6.8: write-side ciphertext guard (A4)"
 $env:GIT_SSL_NO_VERIFY="1"         # 本机证书链校验被中间打断，git 需要它才能连 origin
 git push origin main --follow-tags
 Remove-Item Env:GIT_SSL_NO_VERIFY
@@ -315,7 +329,7 @@ npm view dsh-layers-orchestrator version
 ```powershell
 cd C:\Users\86135\.dsh\profiles\desktop
 # 编辑 package.json：
-#   "dsh-layers-hippocampus": "1.6.7"
+#   "dsh-layers-hippocampus": "1.6.8"
 #   "dsh-layers-orchestrator": "0.1.0"
 pnpm install
 # 重启 DSH

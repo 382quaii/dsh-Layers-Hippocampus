@@ -33,6 +33,12 @@ export const ErrorCodes = Object.freeze({
   FEDERATION_FAILED: 'MEM_E_FEDERATION_FAILED',
   /** A cold raw archive could not be decompressed; the shard is skipped. */
   CORRUPTED_ARCHIVE: 'MEM_E_CORRUPTED_ARCHIVE',
+  /**
+   * The write carried a ciphertext / high-entropy blob (A4). Rejecting it keeps the
+   * append-only log searchable: an encrypted blob could never be recalled, summarised
+   * or distilled, yet it would be retained forever.
+   */
+  ENCRYPTED_RAW_REJECTED: 'MEM_E_ENCRYPTED_RAW_REJECTED',
 
   // ---- configuration (fail-fast at boot; never silently downgraded) ---------
   CONFIG_DEPRECATED: 'MEM_E_CONFIG_DEPRECATED',
