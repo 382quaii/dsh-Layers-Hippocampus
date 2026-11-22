@@ -247,6 +247,9 @@ test('the memory-state prompt is composed live: stable rules + map + volatile bl
       maintenanceCron: '0 */6 * * *',
       autoMaintainOnBoot: false,
       policy: { activeSet: { minEvents: 1, minMass: 0.01 } },
+      // v1.6.9: this case is about the RECALLED block appearing in the tail. Pointer
+      // injection is a separate automatic channel and must not confound the assertion.
+      context: { autoInjectIndex: false },
     });
     await getRuntime(ctx).ready;
     await ctx.call('memory_remember', {

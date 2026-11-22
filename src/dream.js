@@ -22,6 +22,7 @@
 import path from 'node:path';
 import { ensureDir, readJson, writeJsonAtomic, snippet } from './util.js';
 import { ErrorCodes, MemoryError } from './errors.js';
+import { aliasPrompt, parseAliasReply, sanitiseAliasPairs, isEntityTag, entityWord } from './entityAlias.js';
 
 /** Tag carried by every distilled record; also the re-merge guard. */
 export const DREAM_TAG = 'status:dream';
@@ -360,7 +361,12 @@ export class DreamEngine {
     return groups;
   }
 
-  async _callLlm({ tag, sources, config, now }) {
+  /**
+   * v1.6.9: one JSON chat completion. Extracted from `_callLlm` so the entity-alias
+   * pass reuses the SAME timeout, abort, auth and fallback code instead of growing
+   * a second network path that would drift.
+   */
+  async _chat({ system, user, config, maxTokens }) {
     const llm = config.llm;
     if (!isLlmConfigured(llm)) {
       throw new MemoryError(DREAM_FALLBACK_CODE, 'dream LLM is not configured (baseUrl/model missing)', { phase: 'config' });
@@ -395,11 +401,11 @@ export class DreamEngine {
         body: JSON.stringify({
           model: llm.model,
           temperature: 0,
-          max_tokens: Math.max(64, Math.ceil(config.maxSummaryChars * 2) + 64),
+          max_tokens: maxTokens,
           response_format: { type: 'json_object' },
           messages: [
-            { role: 'system', content: systemPrompt(config) },
-            { role: 'user', content: userPrompt(tag, sources, config) },
+            { role: 'system', content: system },
+            { role: 'user', content: user },
           ],
         }),
         signal: controller.signal,
@@ -418,11 +424,21 @@ export class DreamEngine {
       return content;
     })();
     try {
-      const content = await Promise.race([request, timeout]);
-      return parseDistillation(content, { maxSummaryChars: config.maxSummaryChars });
+      return await Promise.race([request, timeout]);
     } finally {
       if (timer) clearTimeout(timer);
     }
+  }
+
+  /** Distil one tag group through the shared chat call. */
+  async _callLlm({ tag, sources, config }) {
+    const content = await this._chat({
+      system: systemPrompt(config),
+      user: userPrompt(tag, sources, config),
+      config,
+      maxTokens: Math.max(64, Math.ceil(config.maxSummaryChars * 2) + 64),
+    });
+    return parseDistillation(content, { maxSummaryChars: config.maxSummaryChars });
   }
 
   async _distillGroup({ tag, events }, { config, now, logger }) {
@@ -509,6 +525,60 @@ export class DreamEngine {
       fallbackReason,
       errorCode: failure?.code ?? null,
     };
+  }
+
+  /**
+   * v1.6.9 (module 1.3): learn entity synonyms from the last 24h of writes.
+   *
+   * This is a SMALL request by design: only entity words, only those written today,
+   * and only when there are at least two of them (a single word has nothing to be
+   * merged with). Failure is not an error: the local substring/edit-distance merge
+   * already ran at write time, so nothing is lost by skipping the LLM pass.
+   *
+   * @returns {Promise<{skipped?: string, checked: number, added: object, total: number}>}
+   */
+  async learnAliases({ now = this.clock.now(), logger = undefined, windowMs = 24 * 60 * 60 * 1000, fetchImpl = null } = {}) {
+    const config = this.config();
+    const store = this.memory?.entityAliases;
+    if (!store) return { skipped: 'no-store', checked: 0, added: {}, total: 0 };
+    if (config.useLlm !== true || !isLlmConfigured(config.llm) || !this._circuitAllows(now)) {
+      return { skipped: 'llm-unavailable', checked: 0, added: {}, total: store.map().size };
+    }
+    const cutoff = now - Math.max(1, Number(windowMs) || 0);
+    const words = new Set();
+    const view = this.memory.indexManager?.snapshot?.();
+    for (const event of view?.events ?? []) {
+      const anchor = Number(event.anchorTime ?? event.eventTime) || 0;
+      if (anchor < cutoff) continue;
+      for (const tag of event.tags ?? []) {
+        const name = typeof tag === 'string' ? tag : tag?.tag;
+        if (isEntityTag(name)) words.add(entityWord(name));
+      }
+    }
+    const known = [...words].filter(Boolean).sort();
+    // Nothing to compare against: one word cannot be a synonym of anything.
+    if (known.length < 2) return { skipped: 'not-enough-words', checked: known.length, added: {}, total: store.map().size };
+    const prompt = aliasPrompt(known);
+    const previousFetch = this.fetchImpl;
+    if (fetchImpl) this.fetchImpl = fetchImpl;
+    try {
+      const content = await this._chat({
+        system: prompt.system,
+        user: prompt.user,
+        config,
+        maxTokens: Math.max(128, Math.ceil(known.length * 8) + 64),
+      });
+      const pairs = sanitiseAliasPairs(parseAliasReply(content), { known });
+      const learned = store.learn(pairs);
+      this._recordLlmSuccess();
+      return { checked: known.length, added: learned.added, changed: learned.changed, total: learned.total };
+    } catch (error) {
+      this._recordLlmFailure(now, config);
+      this._warn(logger ?? this.logger, { tag: 'entity-alias', reason: 'llm-error', at: now, error });
+      return { skipped: 'llm-error', checked: known.length, added: {}, total: store.map().size, errorCode: error?.code ?? null };
+    } finally {
+      this.fetchImpl = previousFetch;
+    }
   }
 
   /**

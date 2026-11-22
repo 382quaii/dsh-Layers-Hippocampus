@@ -34,8 +34,9 @@ export class IndexManager {
    * @param {{now: () => number}} opts.clock
    * @param {() => Set<string>} opts.getTombstones tombstone ids (registry ∪ log)
    * @param {() => number} [opts.getMaxPostingsPerTag] live cap on postings per tag
+   * @param {() => object|null} [opts.getEntityAliases] v1.6.9 learned entity alias pairs
    */
-  constructor({ store, logStore, getPolicy, clock, getTombstones, getMaxPostingsPerTag = () => 500 }) {
+  constructor({ store, logStore, getPolicy, clock, getTombstones, getMaxPostingsPerTag = () => 500, getEntityAliases = null }) {
     this.store = store;
     this.logStore = logStore;
     this.getPolicy = getPolicy;
@@ -44,6 +45,8 @@ export class IndexManager {
     // Read on EVERY build (never captured once): config/profiles can change at
     // runtime, and a rebuild must honour the cap in force at build time.
     this.getMaxPostingsPerTag = getMaxPostingsPerTag;
+    // v1.6.9: learned entity aliases are folded at BUILD time (never by rewriting the log).
+    this.getEntityAliases = getEntityAliases;
     /** @type {object|null} */ this._active = null;
     /** @type {object|null} */ this._standby = null;
     /** @type {object[]} */ this._records = [];
@@ -85,6 +88,7 @@ export class IndexManager {
       sourceLogGen: this._active.sourceLogGen ?? null,
       previous: this._active,
       maxPostingsPerTag: this._maxPostingsPerTag(),
+      entityAliases: this._entityAliases(),
     });
     built.generation = this._active.generation ?? this._pendingGen ?? null;
     built.revision = this._swaps + 1;
@@ -154,6 +158,7 @@ export class IndexManager {
         sourceLogGen: opened.gen,
         previous: this._active,
         maxPostingsPerTag: this._maxPostingsPerTag(),
+        entityAliases: this._entityAliases(),
       });
       await onPhase?.({ phase: 'build', records: records.length, events: built.stats.events });
 
@@ -171,6 +176,7 @@ export class IndexManager {
           sourceLogGen: tail.gen ?? opened.gen,
           previous: this._active,
           maxPostingsPerTag: this._maxPostingsPerTag(),
+          entityAliases: this._entityAliases(),
         });
         await onPhase?.({ phase: 'catch-up', pass, records: records.length });
       }
@@ -224,6 +230,28 @@ export class IndexManager {
     this._standby = null;
     this._records = [];
     this._dirty = false;
+  }
+
+  /**
+   * v1.6.9: force the next `snapshot()` to re-fold pending records. Used after an
+   * offline entity-alias merge so an old entity node drains into the canonical one
+   * without waiting for the next maintenance pass.
+   */
+  markDirty() {
+    this._dirty = true;
+  }
+
+  /**
+   * v1.6.9: alias pairs from the entity dictionary, or null. A throwing provider is
+   * "no aliases" — a bad merge must never take the index build down.
+   */
+  _entityAliases() {
+    try {
+      const value = this.getEntityAliases?.();
+      return value && typeof value === 'object' ? value : null;
+    } catch {
+      return null;
+    }
   }
 
   /** Adopt a view that was built elsewhere (used by maintenance with its own clock). */
@@ -285,6 +313,7 @@ export class IndexManager {
       sourceLogGen: view?.sourceLogGen ?? null,
       // The cap in force, so the panel can explain why postingsTruncated > 0.
       maxPostingsPerTag: this._maxPostingsPerTag(),
+      entityAliases: this._entityAliases(),
       stats: view?.stats ?? {},
       pendingRecords: this._dirty ? Math.max(0, this._records.length - (view?.stats?.recordCount ?? 0)) : 0,
     };

@@ -208,6 +208,11 @@ export const DEFAULT_CONFIG = Object.freeze({
     // host now CONTINUES the same conversation after the marker instead of opening a
     // second one, so a client-side "start a fresh session" controller only spawned a
     // useless empty conversation. Legacy keys are stripped by `migrateConfig`.
+    // v1.6.9 (module 3): automatically point the model at the hottest memories.
+    // This is an INDEX injection (eventId + tags + title), never a body, and it is
+    // rate-limited by user turns so a long session cannot accumulate hundreds of
+    // lines. `true`/`false` is accepted as a shorthand for `{ enabled }`.
+    autoInjectIndex: { enabled: true, everyNTurns: 3, maxPointers: 3, maxChars: 300 },
     // v1.6.0 cold-start injection switches (user request 2026-11-06):
     //  - summary: inject the previous handoff summary so the first turn inherits context
     //  - recentTurns: inject the last few turns of the handed-off conversation
@@ -901,6 +906,42 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
     'context.requireExplicitConsentForTransfer',
   );
 
+  // v1.6.9 (module 3): auto pointer injection. Boolean shorthand first, because
+  // the most common override is a plain on/off, then the three bounds.
+  const autoInjectRaw = contextIn.autoInjectIndex === undefined ? defaults.context.autoInjectIndex : contextIn.autoInjectIndex;
+  let autoInjectGroup;
+  if (typeof autoInjectRaw === 'boolean') {
+    autoInjectGroup = { ...defaults.context.autoInjectIndex, enabled: autoInjectRaw };
+  } else if (autoInjectRaw && typeof autoInjectRaw === 'object' && !Array.isArray(autoInjectRaw)) {
+    autoInjectGroup = autoInjectRaw;
+  } else {
+    throw configError(ErrorCodes.CONFIG_INVALID_TYPE, 'config.context.autoInjectIndex must be a boolean or an object', {
+      key: 'context.autoInjectIndex',
+      got: autoInjectRaw,
+    });
+  }
+  const autoInjectEnabled = requireBoolean(
+    autoInjectGroup.enabled === undefined ? defaults.context.autoInjectIndex.enabled : autoInjectGroup.enabled,
+    'context.autoInjectIndex.enabled',
+  );
+  const autoInjectEveryNTurns = requireInteger(
+    autoInjectGroup.everyNTurns === undefined
+      ? defaults.context.autoInjectIndex.everyNTurns
+      : autoInjectGroup.everyNTurns,
+    'context.autoInjectIndex.everyNTurns',
+    { min: 1, max: 100 },
+  );
+  const autoInjectMaxPointers = requireInteger(
+    autoInjectGroup.maxPointers === undefined ? defaults.context.autoInjectIndex.maxPointers : autoInjectGroup.maxPointers,
+    'context.autoInjectIndex.maxPointers',
+    { min: 1, max: 10 },
+  );
+  const autoInjectMaxChars = requireInteger(
+    autoInjectGroup.maxChars === undefined ? defaults.context.autoInjectIndex.maxChars : autoInjectGroup.maxChars,
+    'context.autoInjectIndex.maxChars',
+    { min: 40, max: 2000 },
+  );
+
   // ---- inverted-index physical limits (v1.5.0) -----------------------------
   const indexIn = input.index ?? {};
   const indexMaxPostingsPerTag = requireInteger(
@@ -1418,6 +1459,13 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
       target: contextTarget,
       injectPrompt: contextInjectPrompt,
       injectMode: contextInjectMode,
+      // v1.6.9 auto pointer injection (module 3).
+      autoInjectIndex: {
+        enabled: autoInjectEnabled,
+        everyNTurns: autoInjectEveryNTurns,
+        maxPointers: autoInjectMaxPointers,
+        maxChars: autoInjectMaxChars,
+      },
       // v1.6.3 cold-start injection switches (independent booleans).
       coldStartInjectSummary: contextColdStartInjectSummary,
       coldStartInjectRecentTurns: contextColdStartInjectRecentTurns,

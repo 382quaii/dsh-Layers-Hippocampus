@@ -17,15 +17,28 @@
  */
 
 import { decayFactor } from './decay.js';
+import { ErrorCodes, MemoryError } from './errors.js';
 import { normaliseTagToken } from './policy.js';
 import { classifyHit, parseTagPath, DAY_MS } from './tagTreeRebuild.js';
+import { assertAssociativeHops } from './tagGraph.js';
 import { clamp, round, snippet } from './util.js';
 
 const TOKEN_RE = /[a-z0-9]{2,}|[\u4e00-\u9fff]{1,}/gi;
 /** Default penalty for an event reached through a graph neighbour. */
 const ASSOCIATION_PENALTY = 0.5;
-/** v1.7.0: hard upper bound factor for per-record score (tagAffinity≤3 × timeBoost≤1.3). */
-const PRUNE_BOUND_FACTOR = 3.9;
+/**
+ * v1.7.0: hard upper bound factor for per-record score. Every factor is bounded:
+ *   tagAffinity ≤ 3, lexicalBoost ≤ 1, association ≤ 1, handoff ≤ 1, decay ≤ 1,
+ *   salience ≤ 1, timeBoost ≤ 1.5 (v1.6.9 raised it from 1.3 for the recent-window
+ *   boost), so `salience × 4.5` is the true upper bound. Raising the boost without
+ *   this constant would let the bound-based early exit drop real hits.
+ */
+const PRUNE_BOUND_FACTOR = 4.5;
+/** v1.6.9 recent-window boost: inside the window, 1.2× … 1.5× by recency. */
+const RECENT_BOOST_MIN = 1.2;
+const RECENT_BOOST_MAX = 1.5;
+/** Hard bound on the entity-tag scan done to find associative seeds (module 2). */
+export const ASSOCIATIVE_SEED_SCAN_CAP = 200;
 /** Monthly memos never decay, and win ties on fuzzy historical queries. */
 const MONTHLY_TAG = 'status:monthly';
 /**
@@ -256,6 +269,23 @@ export function degradeGhostHits(hits = [], ghosts = [], { now = 0, queryTags = 
  * a range that actually contains data. Postings store the anchor time (recency
  * coordinate), matching what decay uses.
  */
+/** Entity tags whose word appears in the query text (bounded scan, module 2). */
+function entitySeedsMentioned({ index, text }) {
+  const haystack = String(text ?? '').toLowerCase();
+  if (!haystack) return [];
+  const tags = index?.tags && typeof index.tags === 'object' ? Object.keys(index.tags) : [];
+  const seeds = [];
+  let scanned = 0;
+  for (const tag of tags) {
+    if (!tag.startsWith('entity:')) continue;
+    if (scanned >= ASSOCIATIVE_SEED_SCAN_CAP) break;
+    scanned += 1;
+    const word = tag.slice(7).toLowerCase();
+    if (word.length >= 2 && haystack.includes(word)) seeds.push(tag);
+  }
+  return seeds;
+}
+
 function postingsWindow(postings) {
   if (!Array.isArray(postings) || postings.length === 0) return null;
   let start = Infinity;
@@ -303,7 +333,24 @@ function recentEventsForTag(events, tag, limit) {
   return matches.slice(0, limit);
 }
 
-export function recall({ index, query = {}, policy, now, semantic = [], tempSemantic = [], associations = [] }) {
+export function recall({
+  index,
+  query = {},
+  policy,
+  now,
+  semantic = [],
+  tempSemantic = [],
+  associations = [],
+  // v1.6.9 (module 2): O(1) one-hop expansion. `adjacency` is a Map produced by
+  // `buildAdjacency()`; `maxAssociativeHops` is validated here so every caller —
+  // HTTP, tool, tests — gets the same refusal for a graph walk.
+  adjacency = null,
+  maxAssociativeHops = undefined,
+  associativeLimit = 2,
+  // v1.6.9 (module 2.2): `{start, end}` epoch ms of the recent-turn window.
+  recentWindow = null,
+}) {
+  const hops = assertAssociativeHops(maxAssociativeHops);
   const topK = Math.round(clamp(Number(query.topK) || policy.candidates.topK, 1, policy.candidates.maxTopK));
   const text = typeof query.text === 'string' ? query.text.trim() : '';
   const rawTags = Array.isArray(query.tags) ? query.tags : query.tags ? [query.tags] : [];
@@ -424,9 +471,44 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
   // Neighbours of a matched tag enter the pool with a fixed penalty. An event
   // reached ONLY through a neighbour is marked and charged the penalty again at
   // scoring time, so an associative hit can never outrank a direct one.
+  //
+  // v1.6.9: two sources feed this, in order of trust:
+  //   1. `associations` — pre-resolved pairs handed in by the caller (unchanged);
+  //   2. `adjacency`    — the O(1) lookup table, expanded here for ONE hop only.
+  // The expansion is a single `Map.get` per query tag; there is no queue, no
+  // visited set and no walk, which is why `maxAssociativeHops > 1` throws above.
   const associationOf = new Map(); // eventId -> { via, penalty }
+  // v1.6.9: work on a copy — the caller's array is an INPUT, not scratch space.
+  const associationSeeds = Array.isArray(associations) ? [...associations] : [];
   const directCandidates = new Set(affinity.keys());
-  for (const association of associations) {
+  const associativeSeeds = uniqueSorted([
+    ...queryTags,
+    ...(text ? tokenize(text).filter((token) => index.tags[token]) : []),
+    // v1.6.9 (module 2): an entity NAMED in the incoming message is the most natural
+    // seed of all ("今天吃了红薯" carries no tag but means entity:红薯). Entity tags
+    // are a small subset, so this scan stays far below the cost of a graph walk.
+    ...(text ? entitySeedsMentioned({ index, text }) : []),
+  ]);
+  const associativeTags = new Set();
+  if (hops >= 1) {
+    for (const seed of associativeSeeds) {
+      // A seed that is itself rejected by the oversized guard must not smuggle its
+      // hub neighbours in either — that guard is only as strong as its weakest path.
+      if (oversizedTags.has(seed)) continue;
+      const neighbours = adjacency instanceof Map ? adjacency.get(seed) : null; // O(1)
+      if (!neighbours || neighbours.length === 0) continue;
+      for (const neighbour of neighbours) {
+        const tag = neighbour?.tag;
+        if (!tag || !index.tags[tag]) continue;
+        if (oversizedTags.has(tag) || Number(index.tags[tag].eventCount) > TAG_OVERFLOW_THRESHOLD) continue;
+        if (associativeTags.has(tag)) continue;
+        associativeTags.add(tag);
+        associationSeeds.push({ tag, via: seed, weight: neighbour.weight ?? 0, penalty: ASSOCIATION_PENALTY, hops: 1 });
+        break; // ONE hop: the strongest neighbour of this seed, then stop.
+      }
+    }
+  }
+  for (const association of associationSeeds) {
     const tag = association?.tag;
     if (!tag || !index.tags[tag]) continue;
     // The graph must not smuggle an oversized tag's postings back into the pool:
@@ -441,6 +523,29 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
       }
     }
     tagHits.set(tag, Math.max(tagHits.get(tag) ?? 0, penalty));
+  }
+
+  // v1.6.9 (module 2.1): an associated tag's strongest SUMMARIES come along as
+  // "associative memory" — lower weight, clearly labelled, never at the cost of a
+  // direct hit. Bounded by `associativeLimit` (default 2) and by the same penalty.
+  const associativeSemantic = [];
+  if (associativeTags.size > 0 && Array.isArray(semantic) && semantic.length > 0) {
+    const ranked = rankSemantic({
+      semantic,
+      queryTags: [...associativeTags],
+      text: '',
+      now,
+      policy,
+      limit: Math.max(1, Math.trunc(associativeLimit) || 2),
+    });
+    for (const hit of ranked) {
+      if (associativeSemantic.length >= (Math.max(1, Math.trunc(associativeLimit) || 2))) break;
+      associativeSemantic.push({
+        ...hit,
+        score: (Number(hit.score) || 0) * ASSOCIATION_PENALTY,
+        association: { via: [...associativeTags][0] ?? null, penalty: ASSOCIATION_PENALTY, hops: 1 },
+      });
+    }
   }
 
   const blocks = index.diary?.blocks ?? [];
@@ -545,7 +650,20 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
     const lexicalBoost = text ? 0.6 + 0.4 * lexical : 1;
     const association = associationOf.get(eventId) ?? null;
     const associationFactor = association ? association.penalty : 1;
-    const timeBoost = monthly && text && FUZZY_TIME_RE.test(text) ? 1.3 : 1;
+    // v1.6.9 (module 2.2): a recent-window boost. Under fixed salience/decay a
+    // week-old fact and a turn-old fact score the same; the caller passes the epoch
+    // range of the last N turns, and everything inside it earns 1.2×–1.5× by how
+    // close to "now" it sits. Outside the window nothing changes, and the monthly
+    // fuzzy-time boost is combined with `max` so no record can stack two boosts.
+    let timeBoost = monthly && text && FUZZY_TIME_RE.test(text) ? 1.3 : 1;
+    if (recentWindow && Number.isFinite(recentWindow.start) && Number.isFinite(recentWindow.end)) {
+      const anchor = Number(event.anchorTime ?? event.eventTime);
+      const span = recentWindow.end - recentWindow.start;
+      if (Number.isFinite(anchor) && anchor >= recentWindow.start && span > 0) {
+        const closeness = clamp((anchor - recentWindow.start) / span, 0, 1);
+        timeBoost = Math.max(timeBoost, RECENT_BOOST_MIN + (RECENT_BOOST_MAX - RECENT_BOOST_MIN) * closeness);
+      }
+    }
     const score = event.salience * decay * tagAffinity * lexicalBoost * associationFactor * timeBoost * handoffFactor;
     return {
       eventId,
@@ -631,12 +749,24 @@ export function recall({ index, query = {}, policy, now, semantic = [], tempSema
     semantic: semanticHits,
     tempSemantic: tempHits,
     oversizedTagHints,
+    // v1.6.9: the 1-hop projection. `hits` keeps its shape; this is the extra,
+    // explicitly-labelled associative material (tag summaries + the seed that pulled
+    // them in), so a caller that ignores it loses nothing.
+    associative: {
+      hops,
+      tags: [...associativeTags].sort(),
+      // v1.6.9: `associativeSeeds` holds TAGS (strings), so the neighbours are checked
+    // against the tag itself — reading `entry.via` here silently reported no seeds.
+    seeds: hops >= 1 ? associativeSeeds.filter((tag) => adjacency instanceof Map && adjacency.has(tag)) : [],
+      semantic: associativeSemantic,
+    },
+    ...(recentWindow ? { recentWindow } : {}),
     scanned: {
       blocks: blocks.length,
       candidates: candidates.size,
       scored: scored.length,
       tagHits: tagHits.size,
-      associations: associations.length,
+      associations: associationSeeds.length,
       monthly: scored.filter((hit) => hit.monthly).length,
     },
     candidateTags: [...tagHits.keys()].sort(),

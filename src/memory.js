@@ -36,6 +36,8 @@ import { RawStore } from './rawStore.js';
 import { DreamEngine } from './dream.js';
 import { L2MergeEngine } from './l2Merge.js';
 import { extractTags } from './tagging.js';
+import { EntityAliasStore, ENTITY_PREFIX, isEntityTag, mergeEntityTags, entityWord } from './entityAlias.js';
+import { assertAssociativeHops, buildAdjacency, adjacencyStatus } from './tagGraph.js';
 import { ReviewSchedule } from './schedule.js';
 import { PendingDeletes } from './pendingDelete.js';
 import { foldRecords } from './index/buildIndex.js';
@@ -408,8 +410,14 @@ export class Memory {
       // v1.5.0 tag-explosion defence: the cap is live config, read per build so an
       // operator edit takes effect on the next maintenance/lazy fold.
       getMaxPostingsPerTag: () => this.config?.index?.maxPostingsPerTag ?? 500,
+      // v1.6.9: alias pairs learned offline are folded at BUILD time, so the log is
+      // never rewritten and a wrong merge is undone by editing one JSON file.
+      getEntityAliases: () => this.entityAliases.list(),
     });
 
+    // v1.6.9 (module 1): the entity dictionary. It is a CACHE of merge decisions:
+    // deleting state/entity_alias.json re-splits the tags but never loses an event.
+    this.entityAliases = new EntityAliasStore({ file: path.join(this.paths.state, 'entity_alias.json'), clock: this.clock });
     this.semanticStore = new SemanticStore({ root: this.paths.semantic });
     // Offline graph projection: rebuilt by maintain(), read as a slice by the API.
     this.graph = new GraphCache({ dataDir: this.dataDir, clock: this.clock });
@@ -746,9 +754,35 @@ export class Memory {
     }
     ensureNoEmbeddedBase64(content);
     const media = validateMedia(mediaUrl, mediaType);
-    const requestedTags = [
+    let requestedTags = [
       ...new Set((Array.isArray(tags) ? tags : []).map((tag) => normaliseTagToken(tag)).filter(Boolean)),
     ];
+    // v1.6.9 (module 1): ONE entity must not become five tags. The dictionary wins,
+    // then substring containment, then edit distance — all local, all free.
+    let entityMerged = null;
+    if (requestedTags.some(isEntityTag)) {
+      const mergedTags = mergeEntityTags(requestedTags, {
+        known: this.knownEntityTags(),
+        aliasMap: this.entityAliases.map(),
+      });
+      requestedTags = mergedTags.tags;
+      if (mergedTags.merged.length > 0) entityMerged = mergedTags.merged;
+      // Remember the FINAL words (post-merge) so the next write in this turn can merge
+      // against them without waiting for an index build. Bounded: this is a hint, and
+      // the index remains the authority once it catches up.
+      if (!(this._recentEntityWords instanceof Set)) this._recentEntityWords = new Set();
+      for (const tag of requestedTags) {
+        if (!isEntityTag(tag)) continue;
+        const word = entityWord(tag);
+        if (!word) continue;
+        this._recentEntityWords.add(word);
+      }
+      const cap = 500;
+      while (this._recentEntityWords.size > cap) {
+        const oldest = this._recentEntityWords.values().next().value;
+        this._recentEntityWords.delete(oldest);
+      }
+    }
     // v1.5.6: pinning promises this memory stays retrievable forever; it is only
     // meaningful if something can trigger it. Refuse the write outright.
     if (pinned === true && requestedTags.length === 0) {
@@ -758,19 +792,25 @@ export class Memory {
         { key: 'tags', pinned: true },
       );
     }
-    const tagInfo = pinned === true ? { tags: requestedTags, auto: false } : this._resolveTags(content, tags);
+    // v1.6.9: hand the MERGED list on. Passing the caller's raw `tags` here would
+    // resolve them again and silently undo every entity merge above.
+    const tagInfo =
+      pinned === true ? { tags: requestedTags, auto: false } : this._resolveTags(content, requestedTags);
     let payloadMeta = tagInfo.auto
       ? { ...(meta && typeof meta === 'object' ? meta : {}), auto_tagged: true, auto_tags: tagInfo.tags }
       : meta;
     if (pinned === true) {
       payloadMeta = { ...(payloadMeta && typeof payloadMeta === 'object' ? payloadMeta : {}), pinned: true };
     }
+    if (entityMerged) {
+      payloadMeta = { ...(payloadMeta && typeof payloadMeta === 'object' ? payloadMeta : {}), entity_merged: entityMerged };
+    }
     const payload = {
       content,
       tags: tagInfo.tags,
       salience,
       meta: payloadMeta,
-      entity,
+      entity: entity === null || entity === undefined ? entity : this.normaliseEntityField(entity),
       event_time: eventTime ?? happenedAt,
       ...(media ? { media } : {}),
     };
@@ -1279,9 +1319,12 @@ export class Memory {
   }
 
   /** The space-local read path. */
-  async _recallLocal({ text = '', tags = [], topK } = {}, { mergeRecall = true } = {}) {
+  async _recallLocal({ text = '', tags = [], topK, maxAssociativeHops } = {}, { mergeRecall = true } = {}) {
     this.assertOpen();
     const now = this.clock.now();
+    // v1.6.9: validated BEFORE any work (and before the empty-index shortcut) so an
+    // disallowed hop count is refused the same way whether or not an index exists.
+    const recallOptions = { maxAssociativeHops: assertAssociativeHops(maxAssociativeHops) };
     const view = this.indexManager.snapshot();
     if (!view) {
       return {
@@ -1314,6 +1357,14 @@ export class Memory {
     const semantic = this.semanticSummaries();
     const tempSemantic = this.tempStore.list({ status: 'temp', now });
     const associations = this.graphAssociations({ tags, text });
+    // v1.6.9 (module 2): the O(1) neighbour table + the recent-turn window. Both are
+    // optional: a store with no graph yet, or a caller that passes
+    // `maxAssociativeHops: 0`, behaves exactly as it did before this version.
+    const adjacency = recallOptions.maxAssociativeHops === 0 ? null : this.graphAdjacency();
+    const recentWindow =
+      this.policy?.retrieval?.recentWindowTurns > 0
+        ? this.recentWindow(this.policy.retrieval.recentWindowTurns, now)
+        : null;
     const result = runRecall({
       index: view,
       query: { text, tags, topK, allowOversizedTags: insist },
@@ -1322,6 +1373,9 @@ export class Memory {
       semantic,
       tempSemantic,
       associations,
+      adjacency,
+      maxAssociativeHops: recallOptions.maxAssociativeHops,
+      recentWindow,
     });
     for (const hint of result.oversizedTagHints ?? []) this._oversizedHintTags.add(hint.tag);
     // Anti-hallucination: a hit reached only through a mid inside its grace window
@@ -1631,6 +1685,114 @@ export class Memory {
    * candidate pool with a 0.5 penalty (retrieval applies it), so an associative
    * hit can never outrank a direct one.
    */
+  /**
+   * v1.6.9 (module 1): the entity vocabulary currently in the index.
+   *
+   * Read from the canonical tag table, so it follows merges automatically. Bounded
+   * by the number of entity tags (a handful in practice); cached per index
+   * generation because the write path calls this on every entity-tagged write.
+   */
+  knownEntityTags() {
+    const view = this.indexManager.snapshot();
+    const generation = view?.generation ?? null;
+    let indexed = this._entityVocab && this._entityVocab.generation === generation ? this._entityVocab.words : null;
+    if (!indexed) {
+      const words = [];
+      for (const tag of Object.keys(view?.tags ?? {})) {
+        if (isEntityTag(tag)) words.push(entityWord(tag));
+      }
+      indexed = [...new Set(words.filter(Boolean))].sort();
+      this._entityVocab = { generation, words: indexed };
+    }
+    // Writes that have not reached the index yet MUST still count: two memories
+    // written back-to-back in one turn would otherwise both miss the merge, which is
+    // exactly when "红薯" and "烤红薯" get created together.
+    const recent = this._recentEntityWords instanceof Set ? [...this._recentEntityWords] : [];
+    if (recent.length === 0) return indexed;
+    return [...new Set([...indexed, ...recent])].sort();
+  }
+
+  /** Normalise the `entity` FIELD through the same dictionary (module 1.2). */
+  normaliseEntityField(entity) {
+    const raw = String(entity ?? '').trim();
+    if (!raw) return entity;
+    const word = entityWord(raw);
+    if (!word) return entity;
+    const canonical = this.entityAliases.resolve(word);
+    return canonical && canonical !== word ? canonical : raw;
+  }
+
+  /**
+   * v1.6.9 (module 2): the O(1) adjacency table for 1-hop recall.
+   *
+   * Built from the cached graph edges ONCE per graph/index generation — building it
+   * per query would be the very O(E) scan this feature exists to avoid. Returns
+   * `null` (not an empty Map) when there is no graph yet, so callers can tell
+   * "no associations" from "associations not built".
+   */
+  graphAdjacency() {
+    let graph = null;
+    try {
+      graph = this.graph.read();
+    } catch {
+      return null;
+    }
+    if (!graph || !Array.isArray(graph.edges) || graph.edges.length === 0) return null;
+    const key = [
+      graph.sourceIndexGeneration ?? 'none',
+      graph.builtAt ?? 0,
+      graph.edges.length,
+      this._adjacencyCache?.stamp ?? 0,
+    ].join('|');
+    if (this._adjacencyCache && this._adjacencyCache.key === key) return this._adjacencyCache.map;
+    const map = buildAdjacency(graph.edges);
+    this._adjacencyCache = { key, map, stamp: this._adjacencyCache?.stamp ?? 0 };
+    return map;
+  }
+
+  /** Drop the adjacency table (called after an alias merge changes the graph). */
+  invalidateAdjacency() {
+    const stamp = (this._adjacencyCache?.stamp ?? 0) + 1;
+    this._adjacencyCache = { key: null, map: null, stamp };
+  }
+
+  /**
+   * v1.6.9 (module 2.2): the epoch window covered by the last `turns` events.
+   *
+   * Recall scores do not know what a "turn" is, so the translation happens here:
+   * the N-th newest event time is the window start, now is the end. Fewer events
+   * than N means the whole history is "recent", which is honest for a young store.
+   */
+  recentWindow(turns = 50, now = this.clock.now()) {
+    const view = this.indexManager.snapshot();
+    const events = view?.events;
+    if (!Array.isArray(events) || events.length === 0) return null;
+    const limit = Math.max(1, Math.trunc(Number(turns) || 50));
+    const times = events
+      .map((event) => Number(event.anchorTime ?? event.eventTime))
+      .filter((time) => Number.isFinite(time))
+      .sort((left, right) => right - left);
+    if (times.length === 0) return null;
+    const start = times[Math.min(limit, times.length) - 1];
+    if (!Number.isFinite(start)) return null;
+    return { start, end: now, turns: Math.min(limit, times.length) };
+  }
+
+  /** Panel summary of the alias dictionary + adjacency size (module 1/2 observability). */
+  entityAliasStatus() {
+    return { ...this.entityAliases.status(), vocabulary: this.knownEntityTags().length };
+  }
+
+  associativeStatus() {
+    let adjacency = null;
+    try {
+      adjacency = this.graphAdjacency();
+    } catch {
+      adjacency = null;
+    }
+    return adjacencyStatus(adjacency);
+  }
+
   graphAssociations({ tags = [], text = '' } = {}, { limit = GRAPH_ASSOCIATIONS } = {}) {
     const graph = this.graph.read();
     if (!graph || !Array.isArray(graph.edges) || graph.edges.length === 0) return [];
@@ -2371,7 +2533,26 @@ export class Memory {
       run.monthlyError = error instanceof Error ? error.message : String(error);
     }
     const report = await this.dream.run(options);
-    return { ...report, monthly: run.monthly, monthlyError: run.monthlyError };
+    // v1.6.9 (module 1.3): synonym clustering is part of the SAME offline scheduler —
+    // one night, one pass, one place to look. A failure here never fails the run.
+    let entityAliases = null;
+    let entityAliasError = null;
+    try {
+      entityAliases = await this.dream.learnAliases({
+        now: options.now ?? this.clock.now(),
+        logger: options.logger,
+        fetchImpl: options.fetchImpl ?? null,
+      });
+      if (entityAliases?.changed === true && entityAliases.added && Object.keys(entityAliases.added).length > 0) {
+        // The alias map feeds the index build, so an existing entity node must be
+        // allowed to drain into the canonical one on the next fold.
+        this.indexManager.markDirty?.();
+        this.invalidateAdjacency();
+      }
+    } catch (error) {
+      entityAliasError = error instanceof Error ? error.message : String(error);
+    }
+    return { ...report, monthly: run.monthly, monthlyError: run.monthlyError, entityAliases, entityAliasError };
   }
 
   /** Circuit + last-run snapshot for the panel / admin surface. */

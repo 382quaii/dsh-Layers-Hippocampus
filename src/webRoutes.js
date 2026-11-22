@@ -91,6 +91,11 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   // v1.6.3: `context.autoNewSession*` was REMOVED (a handoff continues the same
   // conversation; opening a second one wasted the user's context). The keys are no
   // longer editable — a stale client sending them gets the normal unknown-key error.
+  // v1.6.9 auto pointer injection (module 3).
+  'context.autoInjectIndex.enabled',
+  'context.autoInjectIndex.everyNTurns',
+  'context.autoInjectIndex.maxPointers',
+  'context.autoInjectIndex.maxChars',
   // v1.6.0 cold-start injection switches (independent; both default on since 1.6.3).
   'context.coldStartInjectSummary',
   'context.coldStartInjectRecentTurns',

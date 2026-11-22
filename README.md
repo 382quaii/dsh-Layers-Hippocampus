@@ -7,7 +7,7 @@
 
 | | |
 | --- | --- |
-| 版本 | **1.6.8** |
+| 版本 | **1.6.9** |
 | 包名 | `dsh-layers-hippocampus` |
 | 仓库 | <https://github.com/382quaii/dsh-Layers-Hippocampus> |
 | 许可证 | MIT |
@@ -124,6 +124,26 @@
   `capabilities.externalSeams` 会如实报告 `{wired, source}`，所以「没装」是可见事实。
   **高峰期不丢任务**：LLM 蒸馏在高峰只被写入持久化队列并在谷时唤醒，不是跳过。
 
+### 全链路记忆：写入归并 / 检索联想 / 自动指针（1.6.9）
+
+- **写入时归并实体**：`entity:` 标签先查别名字典，再按**子串包含**（已有 `entity:红薯`，写入
+  `entity:烤红薯` 直接折向短词）与**编辑距离**（相似度 ≥0.8 且长度差 ≤2）合并。
+  折名记在事件的 `meta.entity_merged` 里，日志本身不改写——「旧节点消失」是索引重建的结果，
+  原始记录仍可 `deep_raw` 取回。
+- **Dream 学同义词**：后台蒸馏时额外取 24h 内新增的实体词，让模型给出
+  `{"aliases":{"地瓜":"红薯"}}` 这样的映射写入 `state/entity_alias.json`；
+  **只允许折向已存在的规范词**，避免模型凭空造节点。
+- **1 跳联想**：`recall` 命中 `entity:红薯` 后，从共现图谱的邻接表里**一次 `Map.get()`** 取最强
+  邻居（如 `topic:吃饭`），把该标签下最多 2 条语义摘要以 `score × 0.5` 一并返回，
+  并在 `associative` 里写明来源。没有图遍历：`maxAssociativeHops` 只接受 `0` 或 `1`，
+  `>1` 直接抛错。
+- **时间窗加成**：最近 `policy.retrieval.recentWindowTurns`（默认 50）个事件内，
+  越新越接近 **1.2x–1.5x** 加成（旧记忆不会被删除，只是不再抢先）。
+- **自动指针注入**：不再指望模型主动 `recall`。插件就绪或会话切换时立即布防，
+  每 `everyNTurns`（默认 3）个 user turn 输出一段 `[Memory Index]`：
+  `- [memory ev_xxx] lesson:npm-publish · 标题`——**只有 eventId + 标签 + 标题，没有正文**，
+  整段硬限 `maxChars`（默认 300）。注入过的 id 进去重池，标签签名不变时不重复注入。
+  `context.autoInjectIndex: false` 可整体关闭。
 ### `/memory` 指令集（0 Token）
 
 引擎半侧不驱动对话：它只提供存储、检索、蒸馏和纯文本指令。四条子命令通过宿主的
@@ -212,7 +232,7 @@ raw 层提供三档，覆盖从“只留关键”到“全留”：
 pnpm add dsh-layers-hippocampus
 
 # 或从 GitHub 指定 tag
-pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.8"
+pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.9"
 ```
 
 ### 2. 挂到 profile
@@ -283,7 +303,7 @@ node scripts/wait-for-routes.mjs
 ### 6. 验证
 
 ```bash
-npm test        # 进程内全量用例（535 个）
+npm test        # 进程内全量用例（541 个）
 npm run check   # 语法检查 + 全量测试
 ```
 

@@ -67,11 +67,29 @@ export function foldRecords(records) {
   return { episodes, reinforcements, tombstones, unknownTypes: [...unknownTypes] };
 }
 
-/** Canonical tag resolution through the synonym map. */
-export function canonicalTag(aliases, tag) {
+/** v1.6.9: owner of the learned entity dictionary (see src/entityAlias.js). */
+export const ENTITY_TAG_PREFIX = 'entity:';
+
+/**
+ * Canonical tag resolution: policy synonyms first, then the LEARNED entity
+ * dictionary (v1.6.9 module 1).
+ *
+ * The entity dictionary is a word-level map (for example 地瓜 -> 红薯) rather than a
+ * map of full tags, because entity words also appear in the `entity` field. Folding
+ * here - at index build time - is what makes a merge drain an old node into the
+ * canonical one without rewriting a single log line.
+ */
+export function canonicalTag(aliases, tag, entityAliases = null) {
   const token = normaliseTagToken(tag);
   if (!token) return '';
-  return aliases.get(token) ?? token;
+  const resolved = aliases.get(token) ?? token;
+  if (!entityAliases || typeof entityAliases !== 'object') return resolved;
+  if (!resolved.startsWith(ENTITY_TAG_PREFIX)) return resolved;
+  const word = resolved.slice(ENTITY_TAG_PREFIX.length).toLowerCase();
+  const canonical = entityAliases[word];
+  if (typeof canonical !== 'string' || !canonical) return resolved;
+  const folded = String(canonical).trim().toLowerCase();
+  return folded && folded !== word ? ENTITY_TAG_PREFIX + folded : resolved;
 }
 
 /**
@@ -84,10 +102,10 @@ export function canonicalTag(aliases, tag) {
  * @param {Map<string,string>} input.aliases
  * @param {{count:number,lastLogTime:number}|null} [input.reinforcement]
  */
-export function projectEpisode({ episode, aliases, reinforcement = null }) {
+export function projectEpisode({ episode, aliases, reinforcement = null, entityAliases = null }) {
   const strengthByTag = new Map();
   for (const tag of episode.tags ?? []) {
-    const canonical = canonicalTag(aliases, tag.tag);
+    const canonical = canonicalTag(aliases, tag.tag, entityAliases);
     if (!canonical) continue;
     const strength = Number.isFinite(tag.strength) ? clamp01(tag.strength) : 0.7;
     strengthByTag.set(canonical, Math.max(strength, strengthByTag.get(canonical) ?? 0));
@@ -153,6 +171,7 @@ export function buildIndex({
   previous = null,
   tombstones = null,
   maxPostingsPerTag = 500,
+  entityAliases = null,
 }) {
   if (!Array.isArray(records)) throw new MemoryError(ErrorCodes.INVALID_INPUT, 'records must be an array');
   if (!Number.isFinite(now)) throw new MemoryError(ErrorCodes.INVALID_INPUT, 'now must be epoch ms');
@@ -173,7 +192,9 @@ export function buildIndex({
       suppressed += 1;
       continue;
     }
-    events.push(projectEpisode({ episode, aliases, reinforcement: reinforcements.get(eventId) ?? null }));
+    events.push(
+      projectEpisode({ episode, aliases, reinforcement: reinforcements.get(eventId) ?? null, entityAliases }),
+    );
   }
   // Deterministic order: newest first, ties broken by id. Index files must hash
   // identically across rebuilds, so no insertion-order dependence is allowed.

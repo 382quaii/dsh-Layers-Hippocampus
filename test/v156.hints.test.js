@@ -112,6 +112,9 @@ test('prompt tail carries only relevance hints and leaves the prefix stable', as
       maintenanceCron: '0 */6 * * *',
       autoMaintainOnBoot: false,
       policy: { activeSet: { minEvents: 1, minMass: 0.01 } },
+      // v1.6.9: this case is about HINT relevance. Pointer injection is a different
+      // automatic channel (module 3) and would add its own tag lines to the tail.
+      context: { autoInjectIndex: false },
     });
     const runtime = getRuntime(ctx);
     await runtime.ready;

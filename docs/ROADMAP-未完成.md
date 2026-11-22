@@ -273,8 +273,30 @@ L2.5 趋势隔离 / 幽灵节点 / 上下文分页 / cron+dream 单一闸门 / �
 - ✅ **冷启动防呆与注入开关（1.6.0，2026-11-06；1.6.3 改为按会话注入）**：`memory:policy` 静态前缀新增【状态唤醒】（禁止客服腔、先回看 L3 再 recall、自然接续）；新会话首轮附加 `[Cold-Start Detected: Active Space=…, Recent Topic=…]`，按两个独立开关注入 `[Cold-Start Summary]`（`context.coldStartInjectSummary`，默认 true；交接摘要优先、回退 L3 top3，≤800 字）与 `[Previous Context Tail]`（`context.coldStartInjectRecentTurns`，**1.6.3 起默认 true**；优先回放交接标记里的 `tailTurns`——最后 ≤5 轮原话，无则回退最近 ≤5 条业务事件，每条 ≤200 字）。双关时不注入任何历史块，静态防呆仍在。**注入按会话幂等**（键 `session|交接批次`，`runtime.coldStart.pending/injected`），兄弟 agent 先装配不会再吞掉用户新对话的注入；匹配到的 pending 即使开关全关也会被消费，不遗留到无关会话。7 个用例 `test/v160.coldStart.test.js`。
 - ✅ **检索上限剪枝（1.6.1，2026-11-07，性能审计 A）**：每个命中分数 = `salience × decay × tagAffinity(≤3) × lexicalBoost(≤1) × association(≤1) × timeBoost(≤1.3) × handoff(≤1)`，故 `salience × 3.9` 是硬上界；候选按 salience 降序访问，一旦上界打不过当前第 k 名分数即停止评分（严格 `<` 保证并列仍被访问）。pinned 命中绕过剪枝，best-k 窗口保证上界精确；结果带 `pruned` 与 `notes: pruned:<n>`。最坏复杂度仍为 O(K log K)（排序），但长尾候选的 decay/similarity 计算被跳过。4 个用例 `test/v170.pruning.test.js`。
 - ✅ **段记 Token 审计（1.6.1，2026-11-07）**：`docs/AUDIT-2026-11-07-segment-token.md` — 无 P0 重复注入；6 个注入面分别有会话级/标签级去重；记录 2 个 P3 优化点（Active Task 跨面去重、Persona 按 L3 版本 memo）。
-- ✅ **版本解冻（2026-11-07）**：移除 1.5.7 的“版本冻结/不再升版本号”表述，自 1.6.0 起恢复语义化版本节奏；当前 **1.6.8**。
-- ✅ **1.6.8 写侧密文护栏 A4（2026-11-20）**：新增 `src/entropy.js`（`shannonEntropy()` / `detectCiphertext()` 三判据：base64 连续 ≥512 且熵 ≥4.5、hex 连续 ≥512 且熵 ≥3.5、PEM 甲壳 5 种标记即使很短也拒绝）+ 错误码 `MEM_E_ENCRYPTED_RAW_REJECTED`（details `{reason, runLength, entropy, at}`）。三条写路径统一护栏：`rawStore.capture` 在门槛判定前检测并**拒绝且零落盘**（不入队、不刷盘）；`remember()` 同规则且**先于**旧的 base64-media 守卫（对密文块叫调用方「改用 media_url」是错误建议）；`captureSessionEvent` 的 auto-capture 降级为 `{stored:false, skipped:'encrypted-blob'}`，不当作 capture 失败刷警告。保守优先：散文/源码/URL/Windows 路径/低熵长串/短 base64 data URI 零误判。8 例 `test/v168.encrypted.test.js`，全量 **535/535**（84 文件）。同时把 `记忆插件-未完成表.md` 重写为当前状态表（A1–A21 逐项关闭依据；13 关闭 / 2 superseded / 2 并入 M3+M6 / 4 明确不做）。
+- ✅ **版本解冻（2026-11-07）**：移除 1.5.7 的“版本冻结/不再升版本号”表述，自 1.6.0 起恢复语义化版本节奏；当前 **1.6.9**。
+- ✅ **1.6.9 全链路记忆机制（2026-11-22）**：三处漏点一起补。
+  ① **写入归并**——新增 `src/entityAlias.js`，`entity:` 标签在 `stage()` 里先折名：别名字典 →
+  子串包含（已有 `entity:红薯` 时 `entity:烤红薯` 折向短词）→ 编辑距离（≥0.8 且长度差 ≤2）；
+  折名记 `meta.entity_merged`，`entity` 字段同步规范化。**修掉真根因**：`_resolveTags()` 原先用原始
+  tags 覆盖合并结果，导致合并看似生效实则照旧分裂。字典落 `state/entity_alias.json`（schema 1），
+  索引构建期 `buildIndex()` 再折一次（新增 `entityAliases` 入参），故**日志永不改写**。
+  ② **Dream 学同义词**——`DreamEngine.learnAliases()` 取 24h 内新增 `entity:` 词，JSON 小请求产出
+  `{aliases:{地瓜:红薯}}`，经 `sanitiseAliasPairs(pairs,{known})` 只允许折向**已存在**的规范词；
+  成功后 `markDirty()` + `invalidateAdjacency()`，失败只记 `executeDream().entityAliasError`。
+  ③ **1 跳联想**——新增 `src/tagGraph.js`：`buildAdjacency()` 把 `state/graph.json` 共现边折成
+  `Map<tag,[{tag,weight}]>`（对称/降序/每点 ≤8），`recall()` 每种子只做**一次 `Map.get()`**取最强邻居，
+  联想语义条目 `score × 0.5` 并标 `association:{via,penalty,hops:1}`，报告带
+  `associative.{hops,tags,seeds,semantic}`；`entitySeedsMentioned()` 让查询文本里出现的 entity 词
+  无需显式标签也能当种子。**禁止 BFS/DFS**：`assertAssociativeHops()` 在最早处校验，`>1` 抛
+  `MEM_E_INVALID_INPUT`，`0` 可关。④ **时间窗加成**——`recentWindowTurns`（默认 50）内按贴近度
+  拿 1.2x–1.5x；`timeBoost` 上限升到 1.5，剪枝上界 `PRUNE_BOUND_FACTOR` 同步 **3.9 → 4.5**。
+  ⑤ **自动指针注入**——`context.autoInjectIndex`（默认 `{enabled:true,everyNTurns:3,maxPointers:3,
+  maxChars:300}`，接受布尔简写）：就绪/会话切换即布防，**第一轮就**输出 `[Memory Index]`，之后每 N 个
+  user turn 重新布防；行格式 `- [memory <eventId>] <tag> · <title>`，**只有指针没有正文**、整段 ≤300 字符；
+  注入过的 id 进 `runtime.injection.ids`，标签签名未变不重复注入。四个键进 `EDITABLE_CONFIG_KEYS`；
+  `memory.status()` 暴露 `entityAliasStatus()` 与 `associativeStatus()`。
+  6 例 `test/v169.fullchain.test.js`，全量 **541/541**（85 文件）。
+- ✅ **1.6.8 写侧密文护栏 A4（2026-11-20）**：新增 `src/entropy.js`（`shannonEntropy()` / `detectCiphertext()` 三判据：base64 连续 ≥512 且熵 ≥4.5、hex 连续 ≥512 且熵 ≥3.5、PEM 甲壳 5 种标记即使很短也拒绝）+ 错误码 `MEM_E_ENCRYPTED_RAW_REJECTED`（details `{reason, runLength, entropy, at}`）。三条写路径统一护栏：`rawStore.capture` 在门槛判定前检测并**拒绝且零落盘**（不入队、不刷盘）；`remember()` 同规则且**先于**旧的 base64-media 守卫（对密文块叫调用方「改用 media_url」是错误建议）；`captureSessionEvent` 的 auto-capture 降级为 `{stored:false, skipped:'encrypted-blob'}`，不当作 capture 失败刷警告。保守优先：散文/源码/URL/Windows 路径/低熵长串/短 base64 data URI 零误判。8 例 `test/v168.encrypted.test.js`，全量 **541/541**（85 文件）。同时把 `记忆插件-未完成表.md` 重写为当前状态表（A1–A21 逐项关闭依据；13 关闭 / 2 superseded / 2 并入 M3+M6 / 4 明确不做）。
 - ✅ **1.6.7 索引式提示注入 M1 + 发布链完整性修正（2026-11-17）**：**M1**——`context.injectMode` 默认 `index`，每个记忆块只注入 `- [memory <eventId>] 标签 · 标题` 一行指针，正文按需 `recall`，`full` 保留旧渲染/旧计费可一键回退；`ContextEngine.tokensOf()` 按渲染形态计费（显式 `tokens` 永远优先），`briefing` 块永不降级，规则段仅在 index 下多一行「这是索引指针」；`[Memory Blocks]` 标记名不变以保持缓存前缀语义。**发布链修正**：M7 联网复核发现 **1.6.6 的 npm 制品（`gitHead 99a07cb`）是从旧 checkout 发布的**——只含 Live Compact 修复，**不含** M3/M5。已把 `99a07cb` fetch 进新仓库并 `merge` 成 `4a463b2`（使发布提交进入 `main` 历史、可追溯），本地 `v1.6.6` tag 重建为指向该已发布提交，`git push --force` 让远端 tag 与 npm 一致；版本号升 **1.6.7**，把 M3（`test/orchestrator.js` 桥接 + 22 例 `orchestratorTest()`，两包在位 510/510、单包 454 pass / 0 fail / 56 skipped）与 M5（`fromOrchestratorError()` + `ORCHESTRATOR_CODE_MAP` 七条映射，未列入码不拍平、原始码留在 `details.orchestratorCode`）送出去。同时修正 `CHANGELOG` 的 `[1.6.6]` 段（移除误记的 M3/M5，只留 Live Compact，并加「发布实况」引用块）与 `docs/RELEASE-1.6.6.md` → `RELEASE-1.6.7.md`。7 例 `test/v166.errorContract.test.js` + 9 例 `test/v167.m1.test.js`。
 - ✅ **1.6.3 配置迁移与启动安全降级（2026-11-13）**：把 1.6.2 的“旧配置启动阻断”事故固化为引擎能力。`src/config.js` 新增 `CONFIG_SCHEMA_VERSION = 3` 与 `migrateConfig()`，加载顺序改为 **迁移 → 严格校验**：缺少 `configVersion` 的旧配置按 legacy 补齐版本号与新增默认值（`archiveAfterDays` 缺失且 `retentionDays <= 90` 时派生为 `retentionDays - 1`，30 → 29），每条迁移都 `console.warn` 并进入 `config.warnings`，迁移**从不抛错、不覆盖显式值**。新增 `strictStartup`（默认 `true`）：显式 `false` 时，`MEM_E_CONFIG_OUT_OF_RANGE` 触发安全降级——丢弃越界键、回退安全值、置 `startup.degraded` 与 `degradedReason`、输出 `hippocampus/config-degraded:` 警告后继续启动；类型错误与未知键仍 fail-fast。启动状态进入 `CAPABILITIES.startup` / `panel.startup` / `panel.configVersion` / `panel.configWarnings`，配置再也不会“静默地以与你写的不一样的方式运行”。9 个用例 `test/v163.migration.test.js`。
 - ✅ **1.6.2 补丁版（2026-11-11）**：`CAPABILITIES.version` 与测试断言对齐 1.6.2；冷归档保留期修复（`archiveAfterDays=90` / `retentionDays=365` / 新增 `coldAccessWindowDays=90`，三者同时满足才归档）；多档保留策略（`off` 遗忘性不保存 / `salience` 高价值 / `all` 全保存）+ `distillPrune` 蒸馏后经 Tombstone 清理 raw；长窗口压缩默认 Brotli 11（`.jsonl.br`）与索引层 `templates.json` + `contentRef` 高频引用去重；L3 `semantic.maxEntries=100` LRU。9 个用例 `test/v162.nonlinear.test.js`。
@@ -294,13 +316,13 @@ L2.5 趋势隔离 / 幽灵节点 / 上下文分页 / cron+dream 单一闸门 / �
 - ✅ **M2 外部价格/通知接缝（2026-11-19）**：`dsh-price-tip` / `dsh-peak-runner` / `dsh-notify-plugin` 本机**不存在**，凭空猜服务名就是发明接口。本版只做**可验证的可选接缝**：`HostBridge.setNotifier(sink)` + `notify({title,text,kind,at})`（无 sink 返回 `{delivered:false,reason:'no-notifier'}` 并只记账，sink 抛错只记 `sink-error`、绝不上抛）；`index.js` 探测约定键（`priceTip`/`notifier`/`peakRunner`，或 `notify`/`peak`）并接受多种方法形状（`isLowValley|lowValley|isLow|price`、`notify|send|post`、`isPeak|peak|isHigh`），外部价格优先于内置时间窗、`DSH_DREAM_PRICE` 仍可强制覆盖；`capabilities.externalSeams` 如实报告 `{wired, source}`，让「没装」成为可见事实。接缝可用时「Dream 因高峰被推迟」会播报 `dueAt`。**「高峰期排队」本来就是实装的**（`tick()` 把 LLM 蒸馏写入 `dreamQueue` 并在谷时唤醒，`reason: 'peak-hour'`），本次未改该逻辑。6 例 `test/v167.m2.test.js`。
 - ✅ **M6 多空间开关语义（2026-11-19）**：`features.multiSpace` 默认 `true`，但只在注入了能创建空间适配器的 `orchestrator` 服务时才真正运行——两者曾经静默不一致。**不改默认值**（会静默改变已部署 profile 的行为），改为新增 `multiSpaceReason()` 三态（`active` / `disabled-by-config` / `orchestrator-missing`），经 `capabilities.multiSpaceRequested` + `capabilities.multiSpaceReason` 与 `panel.spaces.{requested,reason}` 暴露；设置页多空间卡片在「被配置关闭」时直接写明，不再与「没装适配器」混为一个 `spaces:false`。用例锁住三态互斥、显式关闭优先于缺适配器、以及「布尔值与理由不可能互相矛盾」。
 - ✅ **1.6.6 发布修正（2026-11-16）**：M7 联网复核发现 **1.6.5 的 npm 制品（`gitHead 28776c7`）里没有 Live Compact 修复**——`guardRequest` 仍在每次 `agent/request` 上委托宿主 `toolResultPruner.pruneSession()`，而宿主用的预算是预设自己的（ptc `thresholdChars 8192` → 4k 头 + 1k 尾）、且只在本机 compaction-basic 的 `context-overflow` 分支里调用它，等于把「溢出时裁剪」变成「每轮都裁剪」，一次 pass 可掉约 80k tokens（用户报的「10% 直接掉到 7%」）。本版改为**只跑自己的保守裁剪**（`context.liveCompact` 默认 200,000 / 4,000 / 2,000 / 每请求 4 节点），并加回归用例断言健康请求上宿主 pruner **零调用**、一条 20k 字符的正常结果不产生任何 surface 改写。本地 `v1.6.5` tag 重建为 annotated 并指向已发布的 `28776c7`，不再与 npm/GitHub 矛盾（npm 版本不可覆盖，故修复必须走新版本号）。**事后核对：1.6.6 的 npm 制品 `gitHead 99a07cb` 同样来自旧 checkout，只含这一条修复，M3/M5 实际随 1.6.7 发出。**
-- **测试**：`dsh-memory` **535/535**（84 文件）；`dsh-orchestrator` **31/31**。
+- **测试**：`dsh-memory` **541/541**（84 文件）；`dsh-orchestrator` **31/31**。
 - **M3/M4 状态更新**：M3 已落地（独立 `persona` section order=100）；M4 已改为通用 `customDecayRate`/`customHalfLifeDays`，由情感插件调用时传参，插件内不再判断 `emotion:` 前缀。
-- ✅ **版本冻结 1.5.7 + 本地发布卫生**（历史，2026-11-04）：`package.json` 升到 1.5.7；本地 commit `release: v1.5.7 …` + tag `v1.5.7`（**未 push**）。该冻结已于 2026-11-07 解除，当前 1.6.8。
-- **仍未完成**：**npm publish 1.6.7 / 1.6.8** 被账号级封控挡住——`npm whoami` 正常（`382quaii`）、
+- ✅ **版本冻结 1.5.7 + 本地发布卫生**（历史，2026-11-04）：`package.json` 升到 1.5.7；本地 commit `release: v1.5.7 …` + tag `v1.5.7`（**未 push**）。该冻结已于 2026-11-07 解除，当前 1.6.9。
+- **仍未完成**：**npm publish 1.6.7 / 1.6.8 / 1.6.9** 被账号级封控挡住——`npm whoami` 正常（`382quaii`）、
   `npm pack --dry-run` 正常（71 files / 540.2 kB），但 `npm publish` 返回
   `E403 Your account has been temporarily suspended due to a recent security-sensitive action`
   （2026-11-17，`registry` 侧确认 `latest` 仍为 `1.6.6`）。这不是 token/OTP/命令形态问题，
   需查收 npm 安全邮件走申诉或等自动解封；解封前可用
-  `pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.8"` 安装同一份代码。
-  之后仍是：市场目录 PR（需 GitHub/npm 凭据）。`git push` 已完成（`main = aa38876` 起的 release 链、`v1.6.7` tag）；1.6.8 的推送在发布步骤里执行。
+  `pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.9"` 安装同一份代码。
+  之后仍是：市场目录 PR（需 GitHub/npm 凭据）。`git push` 已完成（`main = aa38876` 起的 release 链、`v1.6.7` tag）；1.6.9 的推送在发布步骤里执行。

@@ -1,6 +1,6 @@
-# Release 1.6.8 — 发布准备（本地）
+# Release 1.6.9 — 发布准备（本地）
 
-> 版本：**1.6.8**（2026-11-20：**写侧密文护栏**（审计项 A4）+ 把 `记忆插件-未完成表.md` 从待办审计重写为当前状态表。累计 1.6.7 的索引式注入 M1 与发布链修正、1.6.6 的 Live Compact 修复、1.6.5 的微内核回归、1.6.4 的 1M 溢出修复、1.6.3 的配置迁移与启动降级）。
+> 版本：**1.6.9**（2026-11-22：**全链路记忆机制**——实体模糊归并 + 别名字典、1 跳共现联想 + 时间窗加成、自动指针注入 + 重启重新布防。累计 1.6.8 的写侧密文护栏 A4 与未完成表重写、1.6.7 的索引式注入 M1 与发布链修正、1.6.6 的 Live Compact 修复、1.6.5 的微内核回归、1.6.4 的 1M 溢出修复、1.6.3 的配置迁移与启动降级）。
 
 > 状态：**代码与文档已提交，GitHub 侧由发布步骤推送；npm 侧仍被账号封控挡住。**
 > 剩余 **npm publish** 未执行，且**不是本地命令的问题**：`npm whoami` 已能返回 `382quaii`，
@@ -8,7 +8,7 @@
 > **`E403 Your account has been temporarily suspended due to a recent
 > security-sensitive action`** 拒绝（2026-11-17 13:35Z 首测）。这是账号级封控，与 token/命令形态无关。
 > 命令形态都无关——**必须等 npm 解封**（见下方「npm 账号封控」一节）。
-> 基线：`dsh-memory` 工作区，全量 **535/535 测试通过**（84 个测试文件；另有 `dsh-orchestrator` 31/31）。
+> 基线：`dsh-memory` 工作区，全量 **541/541 测试通过**（85 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；
 > 插件市场仍无条目（npm 上 `latest` 仍为 `1.6.6`）。
 
@@ -23,7 +23,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 
 排查已排除的项：`whoami` 正常、`pack --dry-run` 正常、`--cache` 已指向可写目录、
 两步验证流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`）。
-`registry` 侧确认 `1.6.7` / `1.6.8` **均未发布**（`latest = 1.6.6`）。
+`registry` 侧确认 `1.6.7` / `1.6.8` / `1.6.9` **均未发布**（`latest = 1.6.6`）。
 
 恢复路径（按顺序试）：
 1. 查 `382quaii` 的注册邮箱（含垃圾箱）里的 npm 安全通知，点其中的验证/申诉链接——
@@ -32,18 +32,60 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 3. 仍未解除则走 <https://www.npmjs.com/support> 提交支持单，附上面这条 `E403` 原文与时间戳。
 4. **在解封前，用户可以改用 GitHub 安装**（tag 在远端）：
    ```powershell
-   pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.8"
+   pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.9"
    ```
 
 ## 本版内容
 
-**主线一：写侧密文护栏（1.6.8 · A4）——密文不是记忆，必须在写入前就拒绝。**
-**主线二：索引式提示注入（M1，1.6.7）——每轮 Prompt 不再为记忆正文付费。**
-**主线三：发布链完整性（1.6.7）——把 1.6.6 漏发的 M3 与 M5 送往 npm，并修复发布历史分叉。**
-**主线四：Live Compact 不再委托宿主 pruner（「10%→7%」的真凶，1.6.6，已发布）。**
-**主线五：回归微内核——指令集 0 Token、蒸馏单一调度器、原子服务接口（1.6.5，已发布）。**
+**主线一：全链路记忆机制（1.6.9）——写入时归并、检索时联想、装配时只给指针。**
+**主线二：写侧密文护栏（1.6.8 · A4）——密文不是记忆，必须在写入前就拒绝。**
+**主线三：索引式提示注入（M1，1.6.7）——每轮 Prompt 不再为记忆正文付费。**
+**主线四：发布链完整性（1.6.7）——把 1.6.6 漏发的 M3 与 M5 送往 npm，并修复发布历史分叉。**
+**主线五：Live Compact 不再委托宿主 pruner（「10%→7%」的真凶，1.6.6，已发布）。**
+**主线六：回归微内核——指令集 0 Token、蒸馏单一调度器、原子服务接口（1.6.5，已发布）。**
 
-### 主线一（1.6.8 · A4 密文护栏）
+### 主线一（1.6.9 · 全链路记忆机制）
+
+1. **本地实体归并（零 Token，写入时）**：新增 `src/entityAlias.js`。`entity:` 标签在
+   `stage()` 里先走 `mergeEntityTags()`——① 别名字典命中即换规范词；② 子串包含（既有
+   `entity:红薯`，写入 `entity:烤红薯` 直接折向短词）；③ 编辑距离（相似度 ≥0.8 且长度差 ≤2，
+   收拾拼写错误）。折名结果写进 `payloadMeta.entity_merged`，`entity` 字段同步规范化。
+   关键修复：`_resolveTags()` 原先用**原始** tags 覆盖合并结果（这是「`烤红薯` 仍分裂成新节点」
+   的真根因），现改为传入合并后的词表。
+2. **别名字典落盘**：`state/entity_alias.json`（schema 1，原子写）。`EntityAliasStore` 提供
+   `load/map/list/resolve/learn/status`；索引构建期 `buildIndex()` 通过 `canonicalTag()` 再折一次
+   （`src/index/buildIndex.js` 新增 `entityAliases` 入参），因此**日志永不改写**，
+   「转移旧节点事件、删除空节点」表现为索引重建后自然收敛。
+3. **Dream 学同义词**：`DreamEngine.learnAliases()` 取过去 24h 新增的 `entity:` 词，用一个
+   JSON 小请求让模型输出 `{"aliases":{"地瓜":"红薯"}}`，经 `sanitiseAliasPairs(pairs, {known})`
+   过滤后写入字典——**只能折向已存在的规范词**，否则等于让模型凭空造节点。
+   学完置 `indexManager.markDirty()` 并 `invalidateAdjacency()`，下一次读取即生效。
+   `executeDream()` 把它排在月记与 Dream 之后，失败只记 `entityAliasError`，不影响蒸馏。
+4. **1 跳共现联想（严格 O(1)）**：新增 `src/tagGraph.js`。`buildAdjacency()` 把 `state/graph.json`
+   的共现边折成 `Map<tag,[{tag,weight}]>`（对称、权重降序、每点最多 8 邻居）；`recall()` 命中
+   查询标签后只做一次 `Map.get()` 取最强邻居，不建队列、不记 visited——**没有 BFS/DFS**。
+   联想语义条目按 `score × 0.5` 返回并标注 `association:{via,penalty,hops:1}`，
+   报告里的 `associative.{hops,tags,seeds,semantic}` 让「为什么带回了这条」可审计。
+   `entitySeedsMentioned()` 还会把「查询文本里直接出现的 entity 词」当种子（`entity:红薯` 无需
+   用户手写标签也能触发联想）。
+5. **`maxAssociativeHops` 硬上限 1**：`assertAssociativeHops()` 在 `recall()`、`_recallLocal()`
+   与工具入口**最先**执行（空索引也照样校验）；`>1` 直接抛 `MEM_E_INVALID_INPUT`：
+   「associative recall is a single O(1) lookup, not a graph walk」。`0` 可关掉联想。
+6. **时间窗加成**：`policy.retrieval.recentWindowTurns`（默认 50）把最近 N 个事件的时间范围作为
+   窗口，窗口内事件按贴近程度拿 `1.2x–1.5x`（`RECENT_BOOST_MIN/MAX`）。
+   因 `timeBoost` 上限从 1.3 提到 1.5，剪枝上界 `PRUNE_BOUND_FACTOR` 同步 3.9 → **4.5**
+   （否则硬上界不再成立，早停会剪错）。
+7. **自动指针注入（模块三）**：`context.autoInjectIndex`（默认 `{enabled:true, everyNTurns:3,
+   maxPointers:3, maxChars:300}`，也接受布尔简写）。插件就绪 / 会话切换即布防，**第一轮就**
+   输出 `[Memory Index]` 段；此后每 N 个 user turn 重新布防。行格式
+   `- [memory <eventId>] <tag> · <title>`——**只有指针，没有正文**，整段 ≤300 字符。
+   注入过的 eventId 进入 `runtime.injection.ids` 去重池；活跃标签签名不变时不再重复注入
+   （报告 `runtime.pointers`）。`enabled:false` 即完全关闭。
+8. **可配置 / 可观测**：`context.autoInjectIndex.*` 四个键进 `EDITABLE_CONFIG_KEYS`；
+   `recall` 结果带 `associative` 与 `recentWindow`；`memory.status()` 暴露
+   `entityAliasStatus()` 与 `associativeStatus()`。
+
+### 主线二（1.6.8 · A4 密文护栏）
 
 1. **`src/entropy.js`**（新增，纯函数、零依赖）：`shannonEntropy()` 与
    `detectCiphertext()` 三条判据——base64 连续 ≥512 字符且熵 ≥4.5；hex 连续 ≥512 字符
@@ -58,7 +100,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 5. **`记忆插件-未完成表.md` 重写**：A1–A21 逐项给关闭依据——13 关闭、2 superseded、
    2 并入 M3/M6、4 明确不做（并写明为什么不做），另列仍需外部动作的四项。
 
-### 主线二（1.6.7 · M1）
+### 主线三（1.6.7 · M1）
 
 1. **`context.injectMode`（默认 `index`）**：每个记忆块只注入一行指针
    `- [memory <eventId>] 标签 · 标签 · 标题`；正文不进 Prompt，需要细节时用 `memory_recall`
@@ -71,7 +113,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 4. **可配置**：`context.injectMode` 进 `EDITABLE_CONFIG_KEYS`，设置页「上下文窗口」卡片新增下拉，
    简洁模式下同样可见可存。9 例 `test/v167.m1.test.js`。
 
-### 主线三（1.6.7 · 发布链）
+### 主线四（1.6.7 · 发布链）
 
 1. **发布历史分叉修复**。1.6.6 的 npm 制品 `gitHead 99a07cb` 来自旧 checkout
    （`C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory`），
@@ -115,7 +157,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
    与 `panel.spaces.{requested,reason}` 暴露；设置页多空间卡片在「被配置关闭」时直接写明，
    不再把「没装适配器」与「你关了它」混成一个 `spaces:false`。
 
-### 主线四（1.6.6）
+### 主线五（1.6.6）
 
 1. **不再每轮委托宿主 `toolResultPruner`**。旧实现里 `guardRequest` 在**每一次**
    `agent/request` 上都 `await hostPruner.pruneSession(session)`。两处都错：
@@ -126,7 +168,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
    4,000 头 / 2,000 尾 / 每请求最多 4 个节点），健康对话**永不被改写**。
    回归用例断言：注入假 pruner 后健康请求上 `pruneSession` 调用次数 **0**。
 
-### 主线五（1.6.5）
+### 主线六（1.6.5）
 
 1. **`/memory` 指令集（0 Token）**：`resume` / `maintain` / `status` / `mute` / `unmute` 经宿主
    `commands` 服务注册。`commands.execute()` 的语义是「执行已知命令、**不发给模型**」，
@@ -240,13 +282,13 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
   `/memory` 全子命令返回纯文本且**网络调用数为 0**、静音真的不注入提示、`resume` 在无交接时
   明确报错且与服务接口同源、`executeDream()` 先跑月记并写入 `promoted`、`maintain()` 不再产
   月记、已晋升日记下一轮仍被排除、源码扫描无 UI/追加模式监听。
-  全量 **535/535**（84 个测试文件）。
+  全量 **541/541**（85 个测试文件）。
 
 完整历史见 [CHANGELOG.md](../CHANGELOG.md) 的 `[1.6.7]` / `[1.6.6]` / `[1.6.5]` / `[1.6.4]` / `[1.6.3]` / `[1.6.2]` / `[1.6.1]` 段。
 
 ## 发布步骤（需要你执行）
 
-> 两个包：`dsh-layers-hippocampus@1.6.8`（已有 git remote）与
+> 两个包：`dsh-layers-hippocampus@1.6.9`（已有 git remote）与
 > `dsh-layers-orchestrator@0.1.0`（**目前不是 git 仓库**，需先 init/建远端）。
 > git 命令在 PowerShell 下执行（本机证书链校验被中间打断，需 `GIT_SSL_NO_VERIFY=1` 才能访问 origin）。
 > npm 发布在 **cmd** 里执行，直接用 `npm`（凭证来自默认的 `%USERPROFILE%\.npmrc`），
@@ -256,7 +298,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 
 ```powershell
 cd D:\86135\Documents\dsh\workspace\dsh-memory
-node test/run.mjs                # 期望 535/535
+node test/run.mjs                # 期望 541/541
 cd ..\dsh-orchestrator
 node test/run.mjs                # 期望 31/31
 cd ..\dsh-memory
@@ -271,12 +313,12 @@ npm pack --dry-run               # 预检实际发布内容（含/不含不该�
 cd D:\86135\Documents\dsh\workspace\dsh-memory
 git add -A
 git status --short                 # 最后确认没有 node_modules / state / 测试临时目录
-git commit -m "chore(release): v1.6.8 - refuse ciphertext on the write path (A4); refresh the open-items table"
+git commit -m "chore(release): v1.6.9 - entity merging, 1-hop recall, auto pointer injection"
 
 # 历史 tag：v1.5.5 / v1.5.7 / v1.6.0 / v1.6.1 / v1.6.2 / v1.6.4 / v1.6.5 / v1.6.6。
 # v1.6.5 已指向实际发布的 28776c7、v1.6.6 已指向实际发布的 99a07cb（均为 annotated），不要动它们。
-# 本次只新增 v1.6.8，不需要删任何 tag。
-git tag -a v1.6.8 -m "v1.6.8: write-side ciphertext guard (A4)"
+# 本次只新增 v1.6.9，不需要删任何 tag。
+git tag -a v1.6.9 -m "v1.6.9: entity merging, 1-hop recall, auto pointer injection"
 $env:GIT_SSL_NO_VERIFY="1"         # 本机证书链校验被中间打断，git 需要它才能连 origin
 git push origin main --follow-tags
 Remove-Item Env:GIT_SSL_NO_VERIFY
@@ -324,7 +366,7 @@ npm view dsh-layers-orchestrator version
 ```powershell
 cd C:\Users\86135\.dsh\profiles\desktop
 # 编辑 package.json：
-#   "dsh-layers-hippocampus": "1.6.8"
+#   "dsh-layers-hippocampus": "1.6.9"
 #   "dsh-layers-orchestrator": "0.1.0"
 pnpm install
 # 重启 DSH

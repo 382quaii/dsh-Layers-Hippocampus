@@ -90,6 +90,14 @@ export const DEFAULT_POLICY = Object.freeze({
     maxScannedEvents: 5000,
     /** Candidate queue size before scoring truncation, as a multiple of topK. */
     prefilterFactor: 4,
+    /**
+     * v1.6.9 (module 2.2): how many recent EVENTS count as "recent" for the
+     * recency boost. Recall does not know what a turn is, so the window is the
+     * epoch span covered by the newest N events; 0 disables the boost entirely.
+     */
+    recentWindowTurns: 50,
+    /** v1.6.9: how many 1-hop associative summaries may join one recall result. */
+    associativeLimit: 2,
   },
 
   // ---- Delete pipeline ----------------------------------------------------
@@ -268,6 +276,12 @@ export function validatePolicy(policy) {
   requirePositiveInt(policy.retrieval.degradedRecentBlocks, 'retrieval.degradedRecentBlocks');
   requirePositiveInt(policy.retrieval.maxScannedEvents, 'retrieval.maxScannedEvents');
   requirePositiveNumber(policy.retrieval.prefilterFactor, 'retrieval.prefilterFactor');
+  if (!Number.isInteger(policy.retrieval.recentWindowTurns) || policy.retrieval.recentWindowTurns < 0) {
+    throw new MemoryError(ErrorCodes.INVALID_POLICY, 'retrieval.recentWindowTurns must be a non-negative integer');
+  }
+  if (!Number.isInteger(policy.retrieval.associativeLimit) || policy.retrieval.associativeLimit < 0) {
+    throw new MemoryError(ErrorCodes.INVALID_POLICY, 'retrieval.associativeLimit must be a non-negative integer');
+  }
 
   if (policy.delete.consolidateSalience < 0 || policy.delete.consolidateSalience > 1) {
     throw new MemoryError(ErrorCodes.INVALID_POLICY, 'delete.consolidateSalience must be within [0,1]');

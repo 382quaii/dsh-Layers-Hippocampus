@@ -4,6 +4,59 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.9] — 2026-11-22
+
+**全链路记忆机制：写入时归并、检索时联想、装配时只给指针。**
+在 1.6.8 的「密文不写入」之后，这一版补上另外三处漏点——
+**标签会分裂**（`entity:红薯` 与 `entity:烤红薯` 各自成节点）、
+**联想靠自觉**（模型不主动 `recall` 就不会碰到相关记忆）、
+**上下文靠运气**（同一件事从不跨轮次自动进入 Prompt）。
+
+- **Added — 本地实体归并（零 Token，写侧）**：新增 `src/entityAlias.js`。`entity:` 标签在
+  `stage()` 写入前先折名，三条判据按顺序：① 别名字典命中（`state/entity_alias.json`）；
+  ② **子串包含**——已有 `entity:红薯` 时写入 `entity:烤红薯` 直接折向较短的既有词；
+  ③ **编辑距离**——相似度 ≥0.8 且长度差 ≤2 时归并（收拾拼写错误）。
+  折名记录写进事件的 `meta.entity_merged`（`{from,to,reason:'alias'|'substring'|'fuzzy'}`），
+  `entity` 字段同步规范化。**修掉一个真根因**：`_resolveTags()` 原先用原始 tags 覆盖合并结果，
+  导致合并看似生效、实际仍分裂出新标签。
+- **Added — 别名字典（`state/entity_alias.json`，schema 1，原子写）**：`EntityAliasStore` 提供
+  `load/map/list/resolve/learn/status`。索引构建期 `buildIndex()` 通过 `canonicalTag()` 再折一次，
+  所以**日志永远不被改写**：所谓「转移旧节点事件、删除空节点」，是索引重建后自然收敛，
+  原始记录仍在 `raw/` 与 `log/` 里可查。
+- **Added — Dream 学同义词**：`DreamEngine.learnAliases()` 取过去 24h 新增的 `entity:` 词，
+  发一个小的 JSON 请求让模型输出 `{"aliases":{"地瓜":"红薯"}}`，经
+  `sanitiseAliasPairs(pairs, { known })` 过滤后写入字典——**只允许折向已存在的规范词**，
+  否则等于让模型凭空造节点。学完置 `markDirty()` + `invalidateAdjacency()`，下轮读取即生效；
+  它排在月记与 Dream **之后**，失败只记 `executeDream().entityAliasError`，绝不拖垮蒸馏。
+- **Added — 1 跳共现联想（严格 O(1)）**：新增 `src/tagGraph.js`。`buildAdjacency()` 把
+  `state/graph.json` 的共现边折成 `Map<tag,[{tag,weight}]>`（对称、权重降序、每点最多 8 邻居）；
+  `recall()` 命中查询标签后只做一次 `Map.get()` 取最强邻居——**不建队列、不记 visited，没有 BFS/DFS**。
+  联想语义条目按 `score × 0.5` 返回并标注 `association:{via,penalty,hops:1}`，
+  `recall` 结果里的 `associative.{hops,tags,seeds,semantic}` 让「为什么带回了这条」可审计。
+  `entitySeedsMentioned()` 会把**查询文本里直接出现的 entity 词**当种子，
+  所以 `entity:红薯` 不需要用户显式写标签也能触发联想。
+- **Added — `maxAssociativeHops` 硬上限 1**：`assertAssociativeHops()` 在 `recall()`、
+  `_recallLocal()` 与工具入口**最先**执行（空索引也照样校验）；`>1` 直接抛
+  `MEM_E_INVALID_INPUT`（「associative recall is a single O(1) lookup, not a graph walk」）；
+  `0` 可关掉联想。**性能是契约，不是建议。**
+- **Added — 时间窗加成**：`policy.retrieval.recentWindowTurns`（默认 50）取最近 N 个事件的时间范围，
+  窗口内事件按贴近程度拿 **1.2x–1.5x**（`RECENT_BOOST_MIN/MAX`）。
+  因为 `timeBoost` 上限由 1.3 提到 1.5，剪枝上界 `PRUNE_BOUND_FACTOR` 同步 **3.9 → 4.5**
+  （否则 `salience × 3.9` 不再是硬上界，早停会剪错）。
+- **Added — 自动指针注入（`context.autoInjectIndex`）**：默认
+  `{ enabled: true, everyNTurns: 3, maxPointers: 3, maxChars: 300 }`（也接受布尔简写）。
+  插件就绪 / 会话切换即布防，**第一轮就**输出 `[Memory Index]` 段；此后每 N 个 user turn 重新布防。
+  行格式 `- [memory <eventId>] <tag> · <title>`——**只有指针，没有正文**，整段硬限 300 字符。
+  注入过的 eventId 进 `runtime.injection.ids` 去重池；活跃标签签名没变就不再重复注入。
+  这是「模型不会主动 recall 怎么办」的答案：不逼它调用工具，只把索引放到它眼前。
+- **Changed — 可配置 / 可观测**：`context.autoInjectIndex.{enabled,everyNTurns,maxPointers,maxChars}`
+  四个键进 `EDITABLE_CONFIG_KEYS`；`recall` 结果带 `associative` 与 `recentWindow`；
+  `memory.status()` 暴露 `entityAliasStatus()` 与 `associativeStatus()`。
+- **Tests**：新增 `test/v169.fullchain.test.js`（6 例）——`烤红薯` 因子串包含折进 `红薯`；
+  Dream 识别 `地瓜 → 红薯` 且重定向到索引、日志未被改写；查 `红薯` 带回 `吃饭` 的联想摘要且仅 1 跳；
+  近期记忆得分高于同权重旧记忆；`maxAssociativeHops > 1` 抛错、`0` 关闭；
+  首轮即注入指针、同会话不重复、标签未变仍不重复。
+  全量 **541/541**（85 个测试文件）。
 ## [1.6.8] — 2026-11-20
 
 **写侧护栏：拒绝高熵密文 / 加密载荷。** raw 日志与 L1 事件日志是本插件承诺「永远保留」
@@ -30,7 +83,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     （会话里粘一段密钥不该让日志被 warn 淹没），其他错误仍照旧上抛。
 - **Tests**：新增 `test/v168.encrypted.test.js`（8 例）：熵函数基准、7 类正常内容零误判、
   base64/hex/PEM 三判据各自的拒绝理由、raw store 拒绝且磁盘无残留、auto-capture 的 skip
-  语义、`remember()` 同规则且普通写入不受影响。全量 **535/535**（84 个测试文件）。
+  语义、`remember()` 同规则且普通写入不受影响。全量 **541/541**（85 个测试文件）。
 - **Fixed — `/memory maintain` 的计数全是空的**：该命令把 `report.rawArchive.archived`
   与 `report.rawPrune.removed` 当数字插值，而它们其实是**数组**，于是输出成了
   `维护完成：；L2 合并 0 组；冷归档  个。`（分段用空数组拼出来就是空串）。现在统一走
@@ -109,7 +162,7 @@ M1 则是本版的主线功能——每轮 Prompt 不再为记忆**正文**付�
   sink 收到 payload 且被计数、sink 抛错只记 `sink-error` 不外溢、`externalSeams()` 如实报告
   「通知与高峰缺席、价格回退本地时间窗」、注入 `notifier` 服务后被自动发现并可用、
   注入 `priceTip` 后外部价格**优先于**本地时钟窗口。
-  全量 **526/526**（84 个测试文件）。
+  全量 **541/541**（85 个测试文件）。
 
 ## [1.6.6] — 2026-11-16
 

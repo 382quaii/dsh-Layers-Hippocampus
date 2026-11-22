@@ -35,7 +35,7 @@ import { MigrationRunner } from './src/migrationRunner.js';
 import { CronScheduler } from './src/scheduler.js';
 import { asMemoryError, ErrorCodes, MemoryError } from './src/errors.js';
 import { Memory, turnFromSessionEvent } from './src/memory.js';
-import { composePrompt, renderActiveTask } from './src/utils/promptLayout.js';
+import { composePrompt, renderActiveTask, renderPointers } from './src/utils/promptLayout.js';
 import { renderMemoryHints, selectRelevantTags } from './src/utils/memoryHints.js';
 import { HostBridge } from './src/hostBridge.js';
 import { isLowValley, nextLowValleyStart, windowInfo } from './src/priceWindow.js';
@@ -63,7 +63,7 @@ export { resolveConfig, DEFAULT_CONFIG };
  * of letting a raw 404 reach the user.
  */
 export const CAPABILITIES = Object.freeze({
-  version: '1.6.8',
+  version: '1.6.9',
   spaces: true,
   memories: true,
   transferConsent: true,
@@ -437,6 +437,15 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
    */
   runtime.injection = { sessionId: null, ids: new Set(), tags: new Set(), handoffAt: null };
   /**
+   * v1.6.9 (module 3): automatic INDEX pointer injection state.
+   *
+   * `armed` starts true on purpose: the first request after a plugin restart gets one
+   * pointer block, which is the whole point of the feature (a model that never calls
+   * recall would otherwise never learn the memories exist). After that it is re-armed
+   * by the turn counter, never by a timer.
+   */
+  runtime.pointers = { armed: true, userTurns: 0, lastSignature: null, lastAt: null, injected: 0 };
+  /**
    * v1.6.3 cold-start state (replaces the v1.6.0 boolean `coldStartPending`).
    *
    * The boolean was consumed by the FIRST prompt assembly of the whole process, so
@@ -608,6 +617,82 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     return !pending.sessionId && !pending.agentId && !sessionId && !agentId;
   };
 
+  /** The hottest N tags, by the priority the maintenance pass computed. */
+  runtime.pointerEntries = () => {
+    const settings = runtime.config?.context?.autoInjectIndex ?? {};
+    const limit = Math.max(1, Math.min(10, Number(settings.maxPointers) || 3));
+    const view = memory.indexManager?.snapshot?.();
+    const entries = view?.activeSet?.entries ?? [];
+    const ranked = [...entries]
+      .filter((entry) => entry && typeof entry.tag === 'string' && !/^(?:status:|month:)/.test(entry.tag))
+      .sort((left, right) => (right.priority ?? right.eventCount ?? 0) - (left.priority ?? left.eventCount ?? 0))
+      .slice(0, limit);
+    if (ranked.length === 0) return [];
+    // One pass over the events for ALL candidate ids (a per-tag scan would be O(tags x events)).
+    const wanted = new Set();
+    for (const entry of ranked) {
+      for (const posting of view?.tags?.[entry.tag]?.postings ?? []) wanted.add(posting.eventId);
+    }
+    if (wanted.size === 0) return [];
+    const byId = new Map();
+    for (const event of view?.events ?? []) {
+      if (wanted.has(event.eventId)) byId.set(event.eventId, event);
+    }
+    const picked = [];
+    for (const entry of ranked) {
+      const postings = [...(view?.tags?.[entry.tag]?.postings ?? [])].sort(
+        (left, right) => (right.strength ?? 0) - (left.strength ?? 0),
+      );
+      const best = postings.find((posting) => byId.has(posting.eventId));
+      if (!best) continue;
+      const event = byId.get(best.eventId);
+      // A pointer already delivered in this session is never repeated.
+      if (runtime.injection.ids.has(event.eventId)) continue;
+      const title = snippet(String(event.content ?? ''), 60);
+      picked.push({ eventId: event.eventId, tags: [entry.tag], title });
+    }
+    return picked;
+  };
+
+  /**
+   * v1.6.9: the pointer block for THIS prompt, or ''. Consumes the arm flag.
+   *
+   * Guard rails, all deliberate:
+   *   - disabled config -> never renders (and never clears the arm);
+   *   - unchanged hot-tag signature -> nothing new to say, so nothing is injected;
+   *   - every emitted id joins `runtime.injection.ids`, so one memory cannot be
+   *     injected twice (as a pointer or later as a full block).
+   */
+  runtime.pointerText = () => {
+    const settings = runtime.config?.context?.autoInjectIndex ?? {};
+    if (runtime.phase !== 'ready' || settings.enabled !== true) return '';
+    if (runtime.pointers.armed !== true) return '';
+    try {
+      const entries = runtime.pointerEntries();
+      runtime.pointers.armed = false;
+      runtime.pointers.lastAt = memory.clock.now();
+      const signature = entries.map((entry) => `${entry.tags.join(',')}:${entry.eventId}`).join('|');
+      if (entries.length === 0 || signature === runtime.pointers.lastSignature) return '';
+      const text = renderPointers(entries, { maxChars: settings.maxChars });
+      if (!text) return '';
+      runtime.pointers.lastSignature = signature;
+      runtime.pointers.injected += 1;
+      for (const entry of entries) runtime.injection.ids.add(entry.eventId);
+      return text;
+    } catch {
+      return '';
+    }
+  };
+
+  /** Called for every captured USER turn: the only clock this feature uses. */
+  runtime.noteUserTurn = () => {
+    const settings = runtime.config?.context?.autoInjectIndex ?? {};
+    if (settings.enabled !== true) return;
+    runtime.pointers.userTurns += 1;
+    const every = Math.max(1, Number(settings.everyNTurns) || 3);
+    if (runtime.pointers.userTurns % every === 0) runtime.pointers.armed = true;
+  };
+
   /**
    * v1.6.0 / v1.6.3: one-shot cold-start block for a conversation that just started
    * after a handoff.
@@ -738,6 +823,9 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       for (const tag of freshTags) runtime.injection.tags.add(tag);
       if (selected.length > 0) runtime.lastHintTags = selected;
       const hints = hintsMuted ? '' : renderMemoryHints(freshTags, { toolName: `${config.toolPrefix}_recall` });
+      // v1.6.9 (module 3): computed AFTER hints (the most volatile of all) and rendered
+      // below them, so the cacheable prefix never moves.
+      const pointers = runtime.pointerText();
 
       // v1.5.6: [Active Task] is unconditional when a handoff summary or a `task:`
       // event exists — injected once per session.
@@ -781,7 +869,7 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       // must say so — otherwise the model reads a title as if it were the memory.
       const rules = memory.context.injectMode === 'full' ? PROMPT_STATE_RULES : PROMPT_STATE_RULES_INDEX;
       return (
-        composePrompt({ rules, activeTask: activeTaskBlock, blocks, hints }) +
+        composePrompt({ rules, activeTask: activeTaskBlock, blocks, hints, pointers }) +
         marker +
         (coldStart ? `\n${coldStart}` : '')
       );
@@ -2127,13 +2215,20 @@ export async function apply(ctx, rawConfig = {}) {
       if (sessionId && sessionId !== runtime.coldStart.lastSessionId) {
         runtime.coldStart.lastSessionId = sessionId;
         runtime.noteColdStart({ sessionId, source: 'session-switch' });
+        // v1.6.9: a new conversation is exactly when a pointer block is worth its
+        // tokens — the "re-arm after restart / new session" half of module 3.
+        runtime.pointers.armed = true;
+        runtime.pointers.userTurns = 0;
       }
       // v1.5.6: remember the latest USER turn as the relevance input for
       // `[Memory Hints]`. This is the only place the current input is available:
       // prompt assembly receives no message text.
       try {
         const turn = turnFromSessionEvent(event);
-        if (turn && turn.role === 'user' && turn.text && turn.contextOnly !== true) runtime.lastUserText = turn.text;
+        if (turn && turn.role === 'user' && turn.text && turn.contextOnly !== true) {
+          runtime.lastUserText = turn.text;
+          runtime.noteUserTurn();
+        }
       } catch {
         /* hint relevance must never affect capture */
       }
