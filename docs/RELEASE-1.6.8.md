@@ -6,7 +6,7 @@
 > 剩余 **npm publish** 未执行，且**不是本地命令的问题**：`npm whoami` 已能返回 `382quaii`，
 > `npm pack --dry-run` 也正常，但 `npm publish` 被 registry 以
 > **`E403 Your account has been temporarily suspended due to a recent
-> security-sensitive action`** 拒绝（2026-11-17 13:35Z 首测）。这是账号级封控，与 OTP、token、
+> security-sensitive action`** 拒绝（2026-11-17 13:35Z 首测）。这是账号级封控，与 token/命令形态无关。
 > 命令形态都无关——**必须等 npm 解封**（见下方「npm 账号封控」一节）。
 > 基线：`dsh-memory` 工作区，全量 **535/535 测试通过**（84 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；
@@ -22,7 +22,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 ```
 
 排查已排除的项：`whoami` 正常、`pack --dry-run` 正常、`--cache` 已指向可写目录、
-OTP 流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`）。
+两步验证流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`）。
 `registry` 侧确认 `1.6.7` / `1.6.8` **均未发布**（`latest = 1.6.6`）。
 
 恢复路径（按顺序试）：
@@ -244,35 +244,13 @@ OTP 流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`
 
 完整历史见 [CHANGELOG.md](../CHANGELOG.md) 的 `[1.6.7]` / `[1.6.6]` / `[1.6.5]` / `[1.6.4]` / `[1.6.3]` / `[1.6.2]` / `[1.6.1]` 段。
 
-## 发布命令（用户环境的正确形态，2026-11-22 纠正）
-
-以前写过的几条「发布指引」是错的，记在这里免得再犯：
-
-| 别这么写 | 为什么错 |
-|---|---|
-| `--otp=123456` | 用户用 **Security key**（指纹/浏览器验证），不是 6 位动态码。占位 OTP 会被校验拒绝，连续失败还有风控风险。 |
-| `set NPM_CONFIG_CACHE=...` / `--cache ...` | 登录凭证在默认位置 `C:\Users\86135\.npmrc`；改缓存目录会让 npm 去别处找 token，直接 `E401`。 |
-| `node "D:\Program Files\node.js\node_modules\npm\bin\npm-cli.js"` | 那是 `npm.ps1` 被执行策略拦时的一次性绕法；用户在 cmd 里跑，`npm` 就在 PATH。 |
-| 发布后立刻 `npm view ... version` | npm 走 CDN 缓存，几分钟内可能仍是旧版本号——这不代表发布失败。 |
-
-正确形态只有两行：
-
-```bat
-cd /d D:\86135\Documents\dsh\workspace\dsh-memory
-npm publish --access public
-```
-
-浏览器会弹出 Security key 验证，确认即可。校验时等几分钟，或直接开
-<https://www.npmjs.com/package/dsh-layers-hippocampus> 强刷。
-
 ## 发布步骤（需要你执行）
 
 > 两个包：`dsh-layers-hippocampus@1.6.8`（已有 git remote）与
 > `dsh-layers-orchestrator@0.1.0`（**目前不是 git 仓库**，需先 init/建远端）。
-> 全部命令在 PowerShell 下执行；`node`/`npm`/`pnpm` 用 DSH runtime 自带的绝对路径。
-> **本机网络注意**：证书链校验被中间打断，`git` 需 `GIT_SSL_NO_VERIFY=1` 才能访问 origin；
-> `npm` 在 PowerShell 下被 ExecutionPolicy 拦，且默认缓存目录不可写会 `EPERM`，
-> 需用 `node <npm-cli.js> --cache <可写目录>` 的形式。
+> git 命令在 PowerShell 下执行（本机证书链校验被中间打断，需 `GIT_SSL_NO_VERIFY=1` 才能访问 origin）。
+> npm 发布在 **cmd** 里执行，直接用 `npm`（凭证来自默认的 `%USERPROFILE%\.npmrc`），
+> 验证走浏览器的 Security key。
 
 ### 0. 预检（不发布，先确认干净）
 
@@ -308,19 +286,15 @@ Remove-Item Env:GIT_SSL_NO_VERIFY
 > 这两步已在本地完成并推送）。本次 release 提交在其之上；`v1.6.5` / `v1.6.6` 两个 tag
 > 已在远端与 npm 对齐，无需再动。
 
-### 2. dsh-memory：npm 发布
+### 2. dsh-memory：npm 发布（cmd）
 
-```powershell
-# PowerShell 下 npm.ps1 被 ExecutionPolicy 拦；且默认缓存目录不可写会 EPERM。
-# 用 node 直调 npm-cli.js，并把缓存放到工作区：
-$npm = "D:\Program Files\node.js\node_modules\npm\bin\npm-cli.js"
-$node = "C:\Users\86135\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe"
-& $node $npm --cache D:\86135\Documents\dsh\workspace\_npmcache whoami   # 应输出 382quaii
-& $node $npm --cache D:\86135\Documents\dsh\workspace\_npmcache publish --access public
-# 校验
-& $node $npm --cache D:\86135\Documents\dsh\workspace\_npmcache view dsh-layers-hippocampus version
-Remove-Item -Recurse -Force D:\86135\Documents\dsh\workspace\_npmcache
+```bat
+cd /d D:\86135\Documents\dsh\workspace\dsh-memory
+npm publish --access public
 ```
+
+浏览器会弹出 Security key 验证，确认即可。校验时等几分钟，或直接开
+<https://www.npmjs.com/package/dsh-layers-hippocampus> 强刷（npm 有 CDN 缓存）。
 
 ### 3. dsh-orchestrator：建仓 + 提交 + tag + push
 
