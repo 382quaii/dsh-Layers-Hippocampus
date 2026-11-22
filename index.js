@@ -2919,13 +2919,20 @@ export async function apply(ctx, rawConfig = {}) {
         if (runtime.maintenanceInFlight) return fail('维护已在运行中，本次请求被忽略。');
         const result = await runtime.runMaintenance('manual');
         const report = result?.report ?? {};
-        const parts = ['维护完成：'];
-        if (report.logGen) parts.push(`日志代 ${report.logGen} / 索引代 ${report.indexGen}`);
-        if (report.monthly) parts.push(`月记 ${report.monthly.generated} 条`);
-        if (report.l2Merge) parts.push(`L2 合并 ${report.l2Merge.merged ?? 0} 组`);
-        if (report.dream) parts.push(`Dream ${report.dream.merged ?? 0} 条`);
-        if (report.rawArchive) parts.push(`冷归档 ${report.rawArchive.archived ?? 0} 个`);
-        return ok(parts.join('；'));
+        // Every counter below is optional and several are ARRAYS (`rawArchive.archived`,
+        // `rawPrune.removed`): interpolating an array prints "" or the element, never a
+        // count. Build segments defensively and never emit an empty one — the first
+        // version printed `维护完成：；L2 合并 0 组；冷归档  个`.
+        const count = (value) => (Array.isArray(value) ? value.length : Number(value) || 0);
+        const parts = [];
+        if (report.logGen) parts.push(`日志代 ${report.logGen}`);
+        if (report.indexGen) parts.push(`索引代 ${report.indexGen}`);
+        if (report.l2Merge) parts.push(`L2 合并 ${count(report.l2Merge.merged)} 组`);
+        if (report.dream) parts.push(`Dream ${count(report.dream.merged)} 条`);
+        if (report.rawArchive) parts.push(`冷归档 ${count(report.rawArchive.archived)} 个`);
+        if (report.rawPrune) parts.push(`raw 清理 ${count(report.rawPrune.removed)} 个分片`);
+        if (report.reviewConsume) parts.push(`复习消费 ${count(report.reviewConsume.consumed)} 条`);
+        return ok(parts.length > 0 ? `维护完成：${parts.join('；')}。` : '维护完成：本轮无变更。');
       }
 
       if (verb === 'status') {

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * v1.6.5 — the microkernel contract (user directive 2026-11-15).
  *
  * The hippocampus is a MEMORY KERNEL: it owns storage, retrieval and distillation.
@@ -258,5 +258,41 @@ test('the host half contains no UI or append-mode listener', () => {
     for (const pattern of forbidden) {
       assert.ok(!pattern.test(source), `${path.basename(file)} must not match ${pattern}`);
     }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 4. `/memory maintain` reports real counters, not empty interpolations
+//    (2026-11-22: the first version printed `维护完成：；L2 合并 0 组；冷归档  个`
+//    because the report's archived/removed fields are ARRAYS, not numbers.)
+// ---------------------------------------------------------------------------
+
+test('/memory maintain prints counters for every phase it ran', async () => {
+  const dir = tempDir('micokernel-maintain-text');
+  const fixture = fakeCtx();
+  try {
+    await apply(fixture.ctx, {
+      dataDir: dir,
+      maintenanceCron: '0 */6 * * *',
+      autoMaintainOnBoot: false,
+      enableDream: false,
+    });
+    const runtime = getRuntime(fixture.ctx);
+    await runtime.ready;
+
+    const result = await fixture.commands.execute(null, '/memory maintain');
+    assert.equal(result.kind, 'success');
+    const text = result.text;
+    assert.ok(text.startsWith('维护完成：'), text);
+    // No empty segment: the header must not be followed straight by a separator, and
+    // two separators must never meet.
+    assert.ok(!text.includes('：；'), `no empty first segment: ${text}`);
+    assert.ok(!text.includes('；；'), `no empty middle segment: ${text}`);
+    // It must actually report the archive phase with a NUMBER.
+    assert.match(text, /冷归档 \d+ 个/, text);
+    assert.match(text, /L2 合并 \d+ 组/, text);
+  } finally {
+    fixture.dispose();
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

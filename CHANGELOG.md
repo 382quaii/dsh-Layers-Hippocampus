@@ -30,7 +30,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     （会话里粘一段密钥不该让日志被 warn 淹没），其他错误仍照旧上抛。
 - **Tests**：新增 `test/v168.encrypted.test.js`（8 例）：熵函数基准、7 类正常内容零误判、
   base64/hex/PEM 三判据各自的拒绝理由、raw store 拒绝且磁盘无残留、auto-capture 的 skip
-  语义、`remember()` 同规则且普通写入不受影响。全量 **534/534**（84 个测试文件）。
+  语义、`remember()` 同规则且普通写入不受影响。全量 **535/535**（84 个测试文件）。
+- **Fixed — `/memory maintain` 的计数全是空的**：该命令把 `report.rawArchive.archived`
+  与 `report.rawPrune.removed` 当数字插值，而它们其实是**数组**，于是输出成了
+  `维护完成：；L2 合并 0 组；冷归档  个。`（分段用空数组拼出来就是空串）。现在统一走
+  `count()`（数组取 length、数字取原值），并且只推入有内容的分段；本轮真的什么都没做时
+  明确回答「本轮无变更」。新增回归用例（`test/v165.micokernel.test.js` 第 9 例）锁住
+  「无空分段 + 冷归档必须带数字」。
 - **Docs**：`记忆插件-未完成表.md` 从「2026-11-05 待办审计」重写为「当前状态表」——
   A1–A21 逐项给出关闭依据，13 项关闭、2 项 superseded、2 项并入 M3/M6、4 项明确不做
   （并写明为什么不做），另列仍需外部动作的四项（npm 账号封控等）。

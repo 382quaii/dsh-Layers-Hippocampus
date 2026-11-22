@@ -8,7 +8,7 @@
 > **`E403 Your account has been temporarily suspended due to a recent
 > security-sensitive action`** 拒绝（2026-11-17 13:35Z 首测）。这是账号级封控，与 OTP、token、
 > 命令形态都无关——**必须等 npm 解封**（见下方「npm 账号封控」一节）。
-> 基线：`dsh-memory` 工作区，全量 **534/534 测试通过**（84 个测试文件；另有 `dsh-orchestrator` 31/31）。
+> 基线：`dsh-memory` 工作区，全量 **535/535 测试通过**（84 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；
 > 插件市场仍无条目（npm 上 `latest` 仍为 `1.6.6`）。
 
@@ -240,9 +240,30 @@ OTP 流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`
   `/memory` 全子命令返回纯文本且**网络调用数为 0**、静音真的不注入提示、`resume` 在无交接时
   明确报错且与服务接口同源、`executeDream()` 先跑月记并写入 `promoted`、`maintain()` 不再产
   月记、已晋升日记下一轮仍被排除、源码扫描无 UI/追加模式监听。
-  全量 **534/534**（84 个测试文件）。
+  全量 **535/535**（84 个测试文件）。
 
 完整历史见 [CHANGELOG.md](../CHANGELOG.md) 的 `[1.6.7]` / `[1.6.6]` / `[1.6.5]` / `[1.6.4]` / `[1.6.3]` / `[1.6.2]` / `[1.6.1]` 段。
+
+## 发布命令（用户环境的正确形态，2026-11-22 纠正）
+
+以前写过的几条「发布指引」是错的，记在这里免得再犯：
+
+| 别这么写 | 为什么错 |
+|---|---|
+| `--otp=123456` | 用户用 **Security key**（指纹/浏览器验证），不是 6 位动态码。占位 OTP 会被校验拒绝，连续失败还有风控风险。 |
+| `set NPM_CONFIG_CACHE=...` / `--cache ...` | 登录凭证在默认位置 `C:\Users\86135\.npmrc`；改缓存目录会让 npm 去别处找 token，直接 `E401`。 |
+| `node "D:\Program Files\node.js\node_modules\npm\bin\npm-cli.js"` | 那是 `npm.ps1` 被执行策略拦时的一次性绕法；用户在 cmd 里跑，`npm` 就在 PATH。 |
+| 发布后立刻 `npm view ... version` | npm 走 CDN 缓存，几分钟内可能仍是旧版本号——这不代表发布失败。 |
+
+正确形态只有两行：
+
+```bat
+cd /d D:\86135\Documents\dsh\workspace\dsh-memory
+npm publish --access public
+```
+
+浏览器会弹出 Security key 验证，确认即可。校验时等几分钟，或直接开
+<https://www.npmjs.com/package/dsh-layers-hippocampus> 强刷。
 
 ## 发布步骤（需要你执行）
 
@@ -257,7 +278,7 @@ OTP 流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`
 
 ```powershell
 cd D:\86135\Documents\dsh\workspace\dsh-memory
-node test/run.mjs                # 期望 534/534
+node test/run.mjs                # 期望 535/535
 cd ..\dsh-orchestrator
 node test/run.mjs                # 期望 31/31
 cd ..\dsh-memory

@@ -1,7 +1,7 @@
 # dsh-layers-hippocampus · 功能 / 实现 / 版本演进
 
 > 版本基线：**v1.6.8（2026-11-20：发布链完整性修正——1.6.6 的 npm 制品从旧 checkout 发布，只含 Live Compact 修复；本版把 M3 测试跨包解耦与 M5 错误码边界送往 npm，并把已发布 commit 并入 main 历史。累计 1.6.5 的微内核回归：`/memory` 指令集、蒸馏唯一调度器与月记防重复咀嚼、原子服务接口 `getLatestHandoffSummary()`）**
-> 验证状态：**534 / 534 测试通过**（84 个测试文件 · 52 个源码文件 · 零运行时依赖）
+> 验证状态：**535 / 535 测试通过**（84 个测试文件 · 52 个源码文件 · 零运行时依赖）
 > 数据位置（本机当前）：`D:\Users\86135\memory`（本地 JSONL，可迁移）
 > 本文与 `README.md`、`docs/ARCHITECTURE.zh.md`、`CHANGELOG.md`、`docs/RELEASE-1.6.8.md` 配套。
 
@@ -170,13 +170,13 @@ DeepSeek Harness（DSH）的**本地优先长期记忆 Host 插件**。它不把
 | **1.6.5** | **回归微内核**：`/memory` 指令集（`resume` / `maintain` / `status` / `mute` / `unmute`）经宿主 `commands` 服务注册，`commands.execute()` 不发给模型 → **0 Token**（测试以 `fetch` 计数为 0 断言）；`resume` 绕过 `session\|epoch` 去重强制重放交接摘要；`mute` 只压 `[Memory Hints]` 且不消费标签；**蒸馏唯一调度器** `executeDream()`：先跑月记（L2.5）再蒸馏，被月记吸收的日记记入 `state/months.json#promoted`（`promoted_to_monthly`），`DreamEngine.collectGroups()` 跳过并在报告给出 `skippedPromoted`；raw 日志仍不可改写；新增原子服务接口 `hippocampus.getLatestHandoffSummary()`（纯读，不装配 prompt、不消费 marker）；源码扫描锁死「引擎半侧无 UI / 追加模式监听」。8 例 `test/v165.micokernel.test.js` |
 | **1.6.6** | **发布修正版（只含 Live Compact 修复）**：1.6.5 的 npm 制品（`gitHead 28776c7`）**缺 Live Compact 修复**——`guardRequest` 曾在每次 `agent/request` 上委托宿主 `toolResultPruner.pruneSession()`，而宿主用的是预设预算（ptc `thresholdChars 8192` → 4k 头 + 1k 尾）且只在 `compaction-basic` 的 `context-overflow` 分支调用，等于把「溢出时裁剪」变成「每轮都裁剪」，一次 pass 可掉约 80k tokens（用户看到的「10% 直接掉到 7%」）。本版只跑自己的保守裁剪（`context.liveCompact`，默认 200,000 / 4,000 / 2,000 / 每请求 4 节点）+ 回归用例断言宿主 pruner 在健康请求上零调用。**事后核对**：npm 制品 `gitHead 99a07cb` 来自旧 checkout，**不含** M3/M5。 |
 | **1.6.7** | **索引式提示注入（M1）**：`context.injectMode` 默认 `index`——每个记忆块只注入 `- [memory <eventId>] 标签 · 标题` 一行指针，正文按需用 `recall` 取；`full` 保留旧渲染与旧计费可一键回退；`ContextEngine.tokensOf()` 按渲染形态计费且显式 `tokens` 永远优先；`briefing` 块永不降级；规则段多一行「这是索引指针」只在 index 出现。**发布链完整性修正**：把 1.6.6 遗漏的 **M3**（`test/orchestrator.js` 桥接，`via: 'package' \| 'sibling'`，22 例 `orchestratorTest()` 缺包时 skipped 带原因；两包在位 510/510、单包 454 pass / 0 fail / 56 skipped）与 **M5**（`src/errors.js#fromOrchestratorError()` + `ORCHESTRATOR_CODE_MAP` 单向翻译 `ORCH_E_*` → `MEM_E_*`，三个 consent 码都落到 `MEM_E_REQUIRE_USER_CONSENT`，未列入码不拍平、原始码留在 `details.orchestratorCode`）送往 npm；同时把已发布的 `99a07cb` 并入 `main` 历史，并让本地 `v1.6.6` tag 指向 npm 实际制品。7 例 `test/v166.errorContract.test.js` + 9 例 `test/v167.m1.test.js` |
-| **1.6.8** | **写侧护栏：拒绝高熵密文/加密载荷（审计项 A4）**。新增 `src/entropy.js`（纯函数、零依赖）：`shannonEntropy()` + `detectCiphertext()` 三判据（base64 连续 ≥512 且熵 ≥4.5；hex 连续 ≥512 且熵 ≥3.5；PEM 甲壳共 5 种标记即使很短也拒绝），保守优先——散文/源码/URL/Windows 路径/低熵长串/短 base64 data URI 全部放行；新增错误码 `MEM_E_ENCRYPTED_RAW_REJECTED`（details 带 reason/runLength/entropy/at）；三条写路径统一护栏：`rawStore.capture` **拒绝且零落盘**、`remember()` 同规则**且先于** base64-media 守卫（对密文块「改用 media_url」是错误建议）、auto-capture 降级为 `{stored:false, skipped:'encrypted-blob'}` 不刷警告。8 例 `test/v168.encrypted.test.js`；全量 **534/534**（84 文件）。同时把 `记忆插件-未完成表.md` 从 2026-11-05 待办审计重写为当前状态表（A1–A21 逐项关闭依据）。 |
+| **1.6.8** | **写侧护栏：拒绝高熵密文/加密载荷（审计项 A4）**。新增 `src/entropy.js`（纯函数、零依赖）：`shannonEntropy()` + `detectCiphertext()` 三判据（base64 连续 ≥512 且熵 ≥4.5；hex 连续 ≥512 且熵 ≥3.5；PEM 甲壳共 5 种标记即使很短也拒绝），保守优先——散文/源码/URL/Windows 路径/低熵长串/短 base64 data URI 全部放行；新增错误码 `MEM_E_ENCRYPTED_RAW_REJECTED`（details 带 reason/runLength/entropy/at）；三条写路径统一护栏：`rawStore.capture` **拒绝且零落盘**、`remember()` 同规则**且先于** base64-media 守卫（对密文块「改用 media_url」是错误建议）、auto-capture 降级为 `{stored:false, skipped:'encrypted-blob'}` 不刷警告。8 例 `test/v168.encrypted.test.js`；全量 **535/535**（84 文件）。同时把 `记忆插件-未完成表.md` 从 2026-11-05 待办审计重写为当前状态表（A1–A21 逐项关闭依据）。 |
 
 ---
 
 ## 6. 测试与质量
 
-- **534 / 534 通过**，84 个测试文件；进程内 `node --test`（`test/run.mjs`），30 秒看门狗，时间一律注入 `FakeClock`。
+- **535 / 535 通过**，84 个测试文件；进程内 `node --test`（`test/run.mjs`），30 秒看门狗，时间一律注入 `FakeClock`。
 - 覆盖维度：身份幂等、索引重建一致性、召回排序与置信度、raw 四字段与游标扫描、哈希恢复、两阶段删除与墓碑、标签树生命周期与重放一致性、多空间降级、配置 fail-fast、UI 源码契约、崩溃恢复（200ms checkpoint 窗口）、事件循环让出。
 - 运维脚本：`scripts/bench-protocol.mjs`（基准协议）、`scripts/repair-handoff.mjs`（交接修复）。
 
