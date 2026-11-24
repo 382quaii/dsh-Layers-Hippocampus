@@ -7,7 +7,7 @@
 
 | | |
 | --- | --- |
-| 版本 | **1.6.9** |
+| 版本 | **1.7.0** |
 | 包名 | `dsh-layers-hippocampus` |
 | 仓库 | <https://github.com/382quaii/dsh-Layers-Hippocampus> |
 | 许可证 | MIT |
@@ -232,7 +232,7 @@ raw 层提供三档，覆盖从“只留关键”到“全留”：
 pnpm add dsh-layers-hippocampus
 
 # 或从 GitHub 指定 tag
-pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.9"
+pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.7.0"
 ```
 
 ### 2. 挂到 profile
@@ -303,7 +303,7 @@ node scripts/wait-for-routes.mjs
 ### 6. 验证
 
 ```bash
-npm test        # 进程内全量用例（541 个）
+npm test        # 进程内全量用例（548 个）
 npm run check   # 语法检查 + 全量测试
 ```
 

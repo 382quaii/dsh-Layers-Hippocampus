@@ -21,6 +21,7 @@ import { ErrorCodes, MemoryError } from './errors.js';
 import { normaliseTagToken } from './policy.js';
 import { classifyHit, parseTagPath, DAY_MS } from './tagTreeRebuild.js';
 import { assertAssociativeHops } from './tagGraph.js';
+import { PRIVACY_SECRET_TAG } from './privacy.js';
 import { clamp, round, snippet } from './util.js';
 
 const TOKEN_RE = /[a-z0-9]{2,}|[\u4e00-\u9fff]{1,}/gi;
@@ -277,6 +278,9 @@ function entitySeedsMentioned({ index, text }) {
   const seeds = [];
   let scanned = 0;
   for (const tag of tags) {
+    // v1.7.0 (M3): a secret tag never becomes a seed, so its neighbours cannot be
+    // used to reach the secret sideways through graph association.
+    if (tag === PRIVACY_SECRET_TAG) continue;
     if (!tag.startsWith('entity:')) continue;
     if (scanned >= ASSOCIATIVE_SEED_SCAN_CAP) break;
     scanned += 1;

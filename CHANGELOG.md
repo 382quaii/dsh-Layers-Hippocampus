@@ -4,6 +4,66 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.7.0] — 2026-11-24
+
+**全链路记忆的第二半：写入侧去重（实体）、检索侧联想（1 跳）、语义侧分层（六维人格）、
+隐私侧闸门（secret）、以及“模型不知道自己有哪些工具”的可观测性。**
+
+- **Added — 实体归并（M1 本地半，零 Token）**。新增 `src/entityAlias.js`：
+  `entity:` 标签在**写入前**折向已有规范词——先查 `state/entity_alias.json` 字典，
+  再判子串包含（已有 `entity:红薯` 时 `entity:烤红薯` 直接折向短词），最后是编辑距离
+  （相似度 ≥0.8 且长度差 ≤2，专治拼写错误）。折名结果改写的是**写入形状**，raw 日志照旧
+  append-only；同一批写入里连续出现的实体也互通（`_recentEntityWords` 兜住索引未跟上的窗口）。
+  折名发生在 `stage()` 内、`_resolveTags()` 之前；早先传原始 tags 会让合并结果被整体覆盖。
+- **Added — 别名字典落盘**。`state/entity_alias.json`（schema 1，`writeJsonAtomic`），
+  词表可由 Dream 自动扩充，也可人工编辑。
+- **Added — 离线同义词学习**。`DreamEngine.learnAliases()`：取过去 24h 新增 `entity:` 词
+  （<2 个词直接 skip），走与蒸馏**同一套** fetch 超时/鉴权/熔断设施发一次小请求
+  （`maxTokens = max(128, 词数×8+64)`），只接受 `{"aliases":{variant:canonical}}`；
+  `sanitiseAliasPairs(..., {known})` 要求 canonical **必须已存在**，否则等于凭空造节点。
+  学到新词后 `markDirty()` + `invalidateAdjacency()`，索引重建时旧事件自动折到新节点
+  （日志不动，删空节点只是派生视图的事）。
+- **Added — 1 跳联想召回（M2）**。新增 `src/tagGraph.js`：`buildAdjacency()` 把共现边编成
+  `Map<tag, [{tag,weight}]>`（对称、去重、权重降序、每节点最多 8 个邻居），
+  `expandOneHop()` 每条种子只做**一次** `Map.get`——没有队列、没有 visited 集，因此不存在图遍历。
+  `recall()` 新增 `adjacency` / `maxAssociativeHops`（默认 1）/ `associativeLimit`（默认 2）：
+  >1 直接抛 `MEM_E_INVALID_INPUT: maxAssociativeHops must be <= 1: associative recall is a single
+  O(1) lookup, not a graph walk`（空索引也照样抛，参数错误不该被数据量掩盖）；
+  0 则完全关闭联想。命中的邻居以 `ASSOCIATION_PENALTY`（0.5）参与打分，
+  最相似的 1–2 条 L3 摘要以半权重返回，并在 `associative` 里说明“经由哪个标签、几跳”。
+  种子来自三处：显式查询标签、文本分词命中的标签、以及**在查询文本里被点名的实体**
+  （`entitySeedsMentioned()`，硬上限 200 次扫描）——所以“红薯怎么做”也能顺着图谱摸到 `topic:吃饭`。
+- **Added — 时间窗加成**。`recall()` 的 `recentWindow`（`retrieval.recentWindowTurns`，默认 50 轮）：
+  窗口内事件按“离窗口末尾多近”给 1.2×–1.5× 加成。因为上限从 1.3 抬到 1.5，
+  剪枝硬上界同步从 `salience × 3.9` 改为 **`salience × 4.5`**（剪枝仍是精确的，测试逐位比对）。
+- **Added — 自动指针注入（M3）**。`context.autoInjectIndex`（默认 `{enabled:true, everyNTurns:3,
+  maxPointers:3, maxChars:300}`，也接受 `true`/`false` 简写）：每 N 个 user turn 在
+  `[Memory Hints]` 之后追加 `[Memory Index]`，格式 `- [memory <eventId>] <tag> · <title>`，
+  **绝不注入正文**；单次硬限 300 字符；注入过的 eventId 进入同一个 `injectedIds` 去重池；
+  活跃标签签名没变就保持沉默（不重复刷同一批指针）；新会话 / 插件重启后立刻重新布防一次
+  ——这正是“重启后上下文空白”那个缺口的补丁。`/memory status` 会报 `[Memory Index]` 状态。
+- **Added — L3 六维人格（M2）**。新增 `src/semantic/dimensions.js`：persona / preferences /
+  facts-rules / relationships / skills-patterns / boundaries；`upsert()` 接受 `dimension`
+  并落 `dim:<dim>` 标签（**标签不变量仍按调用方原始 tags 校验**，`dim:` 不能当免标签后门）；
+  未指定时按 tag → 标题 → 关键词推断。`personaTraitsText()` 按维度排序并**逐行剥离生理状态**
+  （`PHYSIOLOGY_TERMS`：疲劳/心率/体温/激素…）——“不是人体，是人格”。
+- **Added — 隐私闸门（M3）**。新增 `src/privacy.js`：带 `privacy:secret` 标签或
+  `meta.privacy='secret'` 的记录，`recall` **默认过滤**并在 `notes` 记 `privacy-withheld:<n>`；
+  只有显式 `includeSecret`（工具参数 `include_secret`）才返回；secret 既不进
+  `[Memory Index]` 指针，也不做联想种子（不然隐私会从邻边漏出来）。
+  判定与打标由调用方（情感插件）负责，本插件只提供接口与过滤。
+- **Added — Dream 事实来源（M4）**。蒸馏输出契约扩展为
+  `{"summary","confidence","facts":[{"text","source"}],"dimension"}`；`source` 只认
+  `user`/`self`，**无主或非法的条目直接丢弃**（绝不默认成“用户说”），机械兜底
+  `localDistillation()` 也按事件 role 标注。facts 与 dimension 落进该 L3 记录的 `meta`。
+- **Added — 交接摘要结构化（M1）**。`getLatestHandoffSummary()` 在保留 `text` 的同时新增
+  `activeTask` / `recentFacts` / `personaTraits` / `lastRawTurns`；`lastRawTurns` 条数由
+  `context.handoffSummaryTurns`（默认 4，范围 3–5）控制，**每条都带 role**——不接受无主纯文本。
+- **Added — 工具使用证据（M5）**。`runtime.toolUsage` 统计每个工具的真实调用次数，
+  `/memory status` 新增「工具使用（本进程）」段；`remember/recall/capture/deep_raw`
+  长期 0 次时直接建议 `/memory tools disable`。不新增任何模型请求。
+- **Tests**：新增 `test/v170.dimensions.test.js`（7 例）。全量 **548/548**（86 个测试文件）。
+
 ## [1.6.9] — 2026-11-22
 
 **全链路记忆机制：写入时归并、检索时联想、装配时只给指针。**

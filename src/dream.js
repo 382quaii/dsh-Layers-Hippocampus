@@ -155,7 +155,34 @@ export function parseDistillation(text, { maxSummaryChars = 200 } = {}) {
       got: parsed.confidence ?? null,
     });
   }
-  return { summary, confidence };
+  return { summary, confidence, facts: parseFacts(parsed.facts), dimension: parseDimension(parsed.dimension) };
+}
+
+const FACT_SOURCES = Object.freeze(['user', 'self']);
+
+/**
+ * v1.7.0 (M4): validate the fact list. A fact without a valid `source` is DROPPED,
+ * not assumed to be the user's — "unattributed" is exactly the failure this fixes.
+ */
+export function parseFacts(value, { limit = 5, maxChars = 200 } = {}) {
+  if (!Array.isArray(value)) return [];
+  const out = [];
+  for (const entry of value) {
+    const text = typeof entry?.text === 'string' ? entry.text.trim() : '';
+    const source = typeof entry?.source === 'string' ? entry.source.trim().toLowerCase() : '';
+    if (!text || !FACT_SOURCES.includes(source)) continue;
+    out.push({ text: text.slice(0, maxChars), source });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+/** v1.7.0 (M2): the model may name the dimension; anything else falls back to null. */
+export function parseDimension(value) {
+  if (typeof value !== 'string') return null;
+  const key = value.trim().toLowerCase();
+  const allowed = ['persona', 'preferences', 'facts-rules', 'relationships', 'skills-patterns', 'boundaries'];
+  return allowed.includes(key) ? key : null;
 }
 
 /**
@@ -183,16 +210,33 @@ export function localDistillation(tag, events = [], { maxSummaryChars = 200 } = 
   }
   let text = `经验·${tag}（${ordered.length} 条 / ${first}~${last}）：${cores.join('；') || '（无可用文本）'}`;
   if (text.length > maxSummaryChars) text = `${text.slice(0, Math.max(1, maxSummaryChars - 1))}…`;
-  return { summary: text, confidence: 0.5, mode: 'local' };
+  // v1.7.0 (M4): the mechanical fallback still attributes provenance from the
+  // recorded role, so a local merge never produces an unattributed fact either.
+  const facts = [];
+  for (const event of ordered) {
+    const role = event.role === 'assistant' ? 'self' : event.role === 'user' ? 'user' : null;
+    if (!role) continue;
+    const text = cleanText(snippet(event.content, 120));
+    if (!text) continue;
+    if (facts.some((fact) => fact.text === text && fact.source === role)) continue;
+    facts.push({ text, source: role });
+    if (facts.length >= 3) break;
+  }
+  return { summary: text, confidence: 0.5, mode: 'local', facts };
 }
 
 function systemPrompt(config) {
   return [
     '你是长期记忆蒸馏器。只输出一个 JSON 对象，不要 Markdown 代码块，不要任何解释。',
-    '输出格式：{"summary":"...","confidence":0.0}',
+    '输出格式：{"summary":"...","confidence":0.0,"facts":[{"text":"...","source":"user"}],"dimension":"facts-rules"}',
+    // v1.7.0 (M4): provenance is a first-class field. "用户说过" and "我说过" are not
+    // the same knowledge: one is a preference to honour, the other is a claim to keep.
+    '3) facts 最多 5 条，每条必须写 source："user"（用户说过的事实/偏好）或 "self"（我自己的结论/习惯），禁止无主陈述；',
+    '4) dimension 必须取 persona / preferences / facts-rules / relationships / skills-patterns / boundaries 之一；',
+    '5) 严禁输出生理或身体状态（疲劳、情绪、体温、心率等）——这里记录的是人格，不是人体；',
     `规则：1) summary 必须是 <= ${config.maxSummaryChars} 个字符的中文经验结论，只压缩可复用的根因/做法/教训，严禁编造；`,
     '2) confidence 是 0..1 的数字，表示结论的可信度；',
-    '3) 不要输出事件 id、时间戳或来源信息；4) 信息不足时仍输出 JSON，summary 写“经验不足，待补充”。',
+    '6) 不要输出事件 id、时间戳或来源信息；7) 信息不足时仍输出 JSON，summary 写“经验不足，待补充”。',
   ].join('\n');
 }
 
@@ -456,12 +500,19 @@ export class DreamEngine {
     let distilledBy = 'local';
     let fallbackReason = null;
     let failure = null;
+    // v1.7.0 (M4): provenance travels with the summary. `facts` is only ever filled
+    // from a source that names its owner (parseFacts drops the rest); `dimension` may
+    // stay null and is then inferred by the L3 store from the text.
+    let facts = [];
+    let dimension = null;
 
     if (config.useLlm && isLlmConfigured(config.llm) && this._circuitAllows(now)) {
       try {
         const result = await this._callLlm({ tag, sources, config, now });
         summary = result.summary;
         confidence = result.confidence;
+        facts = result.facts ?? [];
+        dimension = result.dimension ?? null;
         distilledBy = 'llm';
         this._recordLlmSuccess();
       } catch (error) {
@@ -482,6 +533,7 @@ export class DreamEngine {
       const local = localDistillation(tag, sources, { maxSummaryChars: config.maxSummaryChars });
       summary = local.summary;
       confidence = local.confidence;
+      facts = local.facts ?? [];
       distilledBy = 'local';
     }
 
@@ -496,6 +548,8 @@ export class DreamEngine {
         distilled_by: distilledBy,
         source_event_ids: sourceEventIds,
         confidence,
+        ...(facts.length > 0 ? { facts } : {}),
+        ...(dimension ? { dimension } : {}),
       },
     });
     const eventId = result?.eventId ?? null;

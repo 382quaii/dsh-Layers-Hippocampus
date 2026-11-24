@@ -25,7 +25,10 @@ test('the explicit L3 upsert refuses untagged summaries', async () => {
       (error) => error.code === 'MEM_E_SEMANTIC_TAG_REQUIRED' && error.details?.title === 'Pattern: none',
     );
     const ok = store.upsert({ clock: fixture.clock, title: 'Pattern: release', text: 'text', tags: ['Lesson:Release'] });
-    assert.deepEqual(ok.tags, ['lesson:release'], 'tags are normalised');
+    // v1.7.0 (M2): the dimension is recorded as a `dim:` tag as well as a field, so
+    // tag-driven retrieval can reach a trait by category without a new index.
+    assert.deepEqual(ok.tags, ['dim:skills-patterns', 'lesson:release'], 'tags are normalised and dimensioned');
+    assert.equal(ok.dimension, 'skills-patterns');
     assert.equal(ok.degraded, false);
   } finally {
     fixture.cleanup();
@@ -41,7 +44,7 @@ test('delete-consolidation derives tags instead of writing dead knowledge', asyn
       clock: fixture.clock,
       event: { event_id: 'ev_type_error', content: 'TypeError: querySelector is not a function', salience: 0.9, tags: [] },
     });
-    assert.deepEqual(derived.tags, ['error:typeerror'], 'content heuristics provide the anchor');
+    assert.deepEqual(derived.tags, ['dim:skills-patterns', 'error:typeerror'], 'content heuristics provide the anchor');
     assert.match(derived.title, /\(derived\)/);
 
     const fallback = store.ensureForEvent({
@@ -49,7 +52,11 @@ test('delete-consolidation derives tags instead of writing dead knowledge', asyn
       clock: fixture.clock,
       event: { event_id: 'ev_plain', content: '随便聊聊天气', salience: 0.8, tags: [] },
     });
-    assert.deepEqual(fallback.tags, ['origin:unlabelled-episode'], 'an explicit provenance anchor is better than nothing');
+    assert.deepEqual(
+      fallback.tags,
+      ['dim:skills-patterns', 'origin:unlabelled-episode'],
+      'an explicit provenance anchor is better than nothing',
+    );
     assert.equal(store.covers('ev_plain').length, 1, 'the delete pipeline coverage gate still passes');
   } finally {
     fixture.cleanup();

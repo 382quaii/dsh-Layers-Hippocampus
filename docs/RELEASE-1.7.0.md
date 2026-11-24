@@ -1,6 +1,6 @@
-# Release 1.6.9 — 发布准备（本地）
+# Release 1.7.0 — 发布准备（本地）
 
-> 版本：**1.6.9**（2026-11-22：**全链路记忆机制**——实体模糊归并 + 别名字典、1 跳共现联想 + 时间窗加成、自动指针注入 + 重启重新布防。累计 1.6.8 的写侧密文护栏 A4 与未完成表重写、1.6.7 的索引式注入 M1 与发布链修正、1.6.6 的 Live Compact 修复、1.6.5 的微内核回归、1.6.4 的 1M 溢出修复、1.6.3 的配置迁移与启动降级）。
+> 版本：**1.7.0**（2026-11-24：**全链路记忆第二半——人格化与隐私**——L3 六维人格、`privacy:secret` 隐私闸门、Dream 事实来源区分 user/self、交接接口结构化、`/memory status` 工具使用证据。累计 1.6.9 的实体模糊归并 + 别名字典、1 跳共现联想 + 时间窗加成、自动指针注入；累计 1.6.8 的写侧密文护栏 A4 与未完成表重写、1.6.7 的索引式注入 M1 与发布链修正、1.6.6 的 Live Compact 修复、1.6.5 的微内核回归、1.6.4 的 1M 溢出修复、1.6.3 的配置迁移与启动降级）。
 
 > 状态：**代码与文档已提交，GitHub 侧由发布步骤推送；npm 侧仍被账号封控挡住。**
 > 剩余 **npm publish** 未执行，且**不是本地命令的问题**：`npm whoami` 已能返回 `382quaii`，
@@ -8,7 +8,7 @@
 > **`E403 Your account has been temporarily suspended due to a recent
 > security-sensitive action`** 拒绝（2026-11-17 13:35Z 首测）。这是账号级封控，与 token/命令形态无关。
 > 命令形态都无关——**必须等 npm 解封**（见下方「npm 账号封控」一节）。
-> 基线：`dsh-memory` 工作区，全量 **541/541 测试通过**（85 个测试文件；另有 `dsh-orchestrator` 31/31）。
+> 基线：`dsh-memory` 工作区，全量 **548/548 测试通过**（86 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；
 > 插件市场仍无条目（npm 上 `latest` 仍为 `1.6.6`）。
 
@@ -23,7 +23,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 
 排查已排除的项：`whoami` 正常、`pack --dry-run` 正常、`--cache` 已指向可写目录、
 两步验证流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`）。
-`registry` 侧确认 `1.6.7` / `1.6.8` / `1.6.9` **均未发布**（`latest = 1.6.6`）。
+`registry` 侧确认 `1.6.7` / `1.6.8` / `1.6.9` / `1.7.0` **均未发布**（`latest = 1.6.6`）。
 
 恢复路径（按顺序试）：
 1. 查 `382quaii` 的注册邮箱（含垃圾箱）里的 npm 安全通知，点其中的验证/申诉链接——
@@ -32,19 +32,32 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 3. 仍未解除则走 <https://www.npmjs.com/support> 提交支持单，附上面这条 `E403` 原文与时间戳。
 4. **在解封前，用户可以改用 GitHub 安装**（tag 在远端）：
    ```powershell
-   pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.6.9"
+   pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.7.0"
    ```
 
-## 本版内容
+## 本版内容（1.7.0）
 
-**主线一：全链路记忆机制（1.6.9）——写入时归并、检索时联想、装配时只给指针。**
+1. **L3 六维人格**（`src/semantic/dimensions.js`）：persona / preferences / facts-rules / relationships /
+   skills-patterns / boundaries；`upsert()` 落 `dim:` 标签与 `dimension` 字段，但标签不变量仍按原始标签校验。
+   Persona 注入区按维度排序、每行带维度前缀，`stripPhysiology()` 逐行剔除生理状态（「不是人体，是人格」）。
+2. **`privacy:secret` 隐私闸门**（`src/privacy.js`）：写侧原样落库 + `meta.privacy=secret`；`recall` 默认过滤
+   并回报 `privacy-withheld:<n>`，`include_secret` 才返回；不进 `[Memory Index]` 指针、不做联想种子。
+3. **Dream 事实来源**（`src/dream.js`）：输出 `facts:[{text,source:user|self}]`，无主/非法 source 直接丢弃；
+   facts 与 dimension 写进 L3 `meta`；本地兜底按事件 role 生成。
+4. **交接接口结构化**：`getLatestHandoffSummary()` 增 `activeTask` / `recentFacts` / `personaTraits` /
+   `lastRawTurns`（每条带 role），轮数由 `context.handoffSummaryTurns`（默认 4，3–5）控制，保留 `text` 兼容。
+5. **工具使用证据**：`/memory status` 报各工具本进程调用次数，长期 0 次直接建议 `/memory tools disable`。
+
+## 历史版本内容（1.6.9 及更早，按版本倒序）
+
+**主线二：全链路记忆机制（1.6.9）——写入时归并、检索时联想、装配时只给指针。**
 **主线二：写侧密文护栏（1.6.8 · A4）——密文不是记忆，必须在写入前就拒绝。**
 **主线三：索引式提示注入（M1，1.6.7）——每轮 Prompt 不再为记忆正文付费。**
 **主线四：发布链完整性（1.6.7）——把 1.6.6 漏发的 M3 与 M5 送往 npm，并修复发布历史分叉。**
 **主线五：Live Compact 不再委托宿主 pruner（「10%→7%」的真凶，1.6.6，已发布）。**
 **主线六：回归微内核——指令集 0 Token、蒸馏单一调度器、原子服务接口（1.6.5，已发布）。**
 
-### 主线一（1.6.9 · 全链路记忆机制）
+### 主线二（1.6.9 · 全链路记忆机制）
 
 1. **本地实体归并（零 Token，写入时）**：新增 `src/entityAlias.js`。`entity:` 标签在
    `stage()` 里先走 `mergeEntityTags()`——① 别名字典命中即换规范词；② 子串包含（既有
@@ -85,7 +98,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
    `recall` 结果带 `associative` 与 `recentWindow`；`memory.status()` 暴露
    `entityAliasStatus()` 与 `associativeStatus()`。
 
-### 主线二（1.6.8 · A4 密文护栏）
+### 主线三（1.6.8 · A4 密文护栏）
 
 1. **`src/entropy.js`**（新增，纯函数、零依赖）：`shannonEntropy()` 与
    `detectCiphertext()` 三条判据——base64 连续 ≥512 字符且熵 ≥4.5；hex 连续 ≥512 字符
@@ -100,7 +113,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 5. **`记忆插件-未完成表.md` 重写**：A1–A21 逐项给关闭依据——13 关闭、2 superseded、
    2 并入 M3/M6、4 明确不做（并写明为什么不做），另列仍需外部动作的四项。
 
-### 主线三（1.6.7 · M1）
+### 主线四（1.6.7 · M1）
 
 1. **`context.injectMode`（默认 `index`）**：每个记忆块只注入一行指针
    `- [memory <eventId>] 标签 · 标签 · 标题`；正文不进 Prompt，需要细节时用 `memory_recall`
@@ -113,7 +126,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 4. **可配置**：`context.injectMode` 进 `EDITABLE_CONFIG_KEYS`，设置页「上下文窗口」卡片新增下拉，
    简洁模式下同样可见可存。9 例 `test/v167.m1.test.js`。
 
-### 主线四（1.6.7 · 发布链）
+### 主线五（1.6.7 · 发布链）
 
 1. **发布历史分叉修复**。1.6.6 的 npm 制品 `gitHead 99a07cb` 来自旧 checkout
    （`C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory`），
@@ -157,7 +170,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
    与 `panel.spaces.{requested,reason}` 暴露；设置页多空间卡片在「被配置关闭」时直接写明，
    不再把「没装适配器」与「你关了它」混成一个 `spaces:false`。
 
-### 主线五（1.6.6）
+### 主线六（1.6.6）
 
 1. **不再每轮委托宿主 `toolResultPruner`**。旧实现里 `guardRequest` 在**每一次**
    `agent/request` 上都 `await hostPruner.pruneSession(session)`。两处都错：
@@ -168,7 +181,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
    4,000 头 / 2,000 尾 / 每请求最多 4 个节点），健康对话**永不被改写**。
    回归用例断言：注入假 pruner 后健康请求上 `pruneSession` 调用次数 **0**。
 
-### 主线六（1.6.5）
+### 主线七（1.6.5）
 
 1. **`/memory` 指令集（0 Token）**：`resume` / `maintain` / `status` / `mute` / `unmute` 经宿主
    `commands` 服务注册。`commands.execute()` 的语义是「执行已知命令、**不发给模型**」，
@@ -189,7 +202,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
    `startSession(` / `sessionStorage` / `appendMode` / `onSlot(` / `slots.register(` /
    `ctx.slots =`。会话控制归外部路由插件。
 
-### 主线六（1.6.4）
+### 主线八（1.6.4）
 
 事故回顾（1.6.4 主线）：一次请求携带 **854,668 prompt tokens + 预留 256,000 completion tokens**
 = 1,110,668 > 模型真实窗口 **1,048,576**，被 provider 以 `CONTEXT_WINDOW_EXCEEDED` 拒绝；
@@ -288,7 +301,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 
 ## 发布步骤（需要你执行）
 
-> 两个包：`dsh-layers-hippocampus@1.6.9`（已有 git remote）与
+> 两个包：`dsh-layers-hippocampus@1.7.0`（已有 git remote）与
 > `dsh-layers-orchestrator@0.1.0`（**目前不是 git 仓库**，需先 init/建远端）。
 > git 命令在 PowerShell 下执行（本机证书链校验被中间打断，需 `GIT_SSL_NO_VERIFY=1` 才能访问 origin）。
 > npm 发布在 **cmd** 里执行，直接用 `npm`（凭证来自默认的 `%USERPROFILE%\.npmrc`），
@@ -298,7 +311,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 
 ```powershell
 cd D:\86135\Documents\dsh\workspace\dsh-memory
-node test/run.mjs                # 期望 541/541
+node test/run.mjs                # 期望 548/548
 cd ..\dsh-orchestrator
 node test/run.mjs                # 期望 31/31
 cd ..\dsh-memory
@@ -313,12 +326,12 @@ npm pack --dry-run               # 预检实际发布内容（含/不含不该�
 cd D:\86135\Documents\dsh\workspace\dsh-memory
 git add -A
 git status --short                 # 最后确认没有 node_modules / state / 测试临时目录
-git commit -m "chore(release): v1.6.9 - entity merging, 1-hop recall, auto pointer injection"
+git commit -m "chore(release): v1.7.0 - structured handoff, L3 dimensions, privacy:secret, fact provenance, tool usage"
 
 # 历史 tag：v1.5.5 / v1.5.7 / v1.6.0 / v1.6.1 / v1.6.2 / v1.6.4 / v1.6.5 / v1.6.6。
 # v1.6.5 已指向实际发布的 28776c7、v1.6.6 已指向实际发布的 99a07cb（均为 annotated），不要动它们。
-# 本次只新增 v1.6.9，不需要删任何 tag。
-git tag -a v1.6.9 -m "v1.6.9: entity merging, 1-hop recall, auto pointer injection"
+# 本次只新增 v1.7.0，不需要删任何 tag。
+git tag -a v1.7.0 -m "v1.7.0: structured handoff, L3 dimensions, privacy:secret, fact provenance, tool usage"
 $env:GIT_SSL_NO_VERIFY="1"         # 本机证书链校验被中间打断，git 需要它才能连 origin
 git push origin main --follow-tags
 Remove-Item Env:GIT_SSL_NO_VERIFY
@@ -366,7 +379,7 @@ npm view dsh-layers-orchestrator version
 ```powershell
 cd C:\Users\86135\.dsh\profiles\desktop
 # 编辑 package.json：
-#   "dsh-layers-hippocampus": "1.6.9"
+#   "dsh-layers-hippocampus": "1.7.0"
 #   "dsh-layers-orchestrator": "0.1.0"
 pnpm install
 # 重启 DSH

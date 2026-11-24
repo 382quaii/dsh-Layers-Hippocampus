@@ -24,6 +24,7 @@ import {
 import { normaliseTagToken } from '../policy.js';
 import { extractTags } from '../tagging.js';
 import { controlIdFor } from '../identity.js';
+import { dimensionTag, inferDimension, normaliseDimension } from './dimensions.js';
 
 export const SUMMARY_TYPES = Object.freeze({ UPSERT: 'semantic_upsert', RETIRE: 'semantic_retire' });
 
@@ -81,6 +82,10 @@ export class SemanticStore {
           text: record.text,
           confidence: record.confidence,
           tags,
+          // v1.7.0 (M2): every L3 record belongs to exactly one of six dimensions.
+          // Records written before this existed get a deterministic inference here
+          // instead of a rewrite of the append-only log.
+          dimension: normaliseDimension(record.dimension) ?? inferDimension({ title: record.title, text: record.text, tags }),
           sourceEvents: record.source_events ?? [],
           firstSeenAt: record.first_seen_at ?? record.log_time,
           updatedAt: record.log_time,
@@ -102,7 +107,7 @@ export class SemanticStore {
    * @param {Function} input.nextId id factory
    * @param {object} input.clock
    */
-  upsert({ clock, title, text, confidence, tags = [], sourceEvents = [] }) {
+  upsert({ clock, title, text, confidence, tags = [], sourceEvents = [], dimension = null }) {
     if (!title || !text) throw new MemoryError(ErrorCodes.INVALID_INPUT, 'summary needs title and text');
     const mergedTags = [...new Set(tags.map(normaliseTagToken).filter(Boolean))].sort();
     // v1.5.6 invariant: an L3 summary without an anchor is dead knowledge — tag-driven
@@ -115,6 +120,12 @@ export class SemanticStore {
         hint: '提供 tags，或让写作路径从内容提取（extractTags）；离线路径会写 origin:unlabelled-* 兜底锚点',
       });
     }
+    // v1.7.0 (M2): the dimension is recorded as BOTH a field and a `dim:` tag, so
+    // tag-driven retrieval reaches it without any new index structure. The tag
+    // invariant above still uses the caller's tags: adding `dim:` must not be a way
+    // to smuggle in a tagless summary.
+    const resolvedDimension = normaliseDimension(dimension) ?? inferDimension({ title, text, tags: mergedTags });
+    const dimensionedTags = [...new Set([...mergedTags, dimensionTag(resolvedDimension)])].sort();
     const summaryId = summaryIdFor({ title, sourceEvents });
     const existing = this.list().find((summary) => summary.summaryId === summaryId);
     const record = {
@@ -124,7 +135,8 @@ export class SemanticStore {
       title,
       text,
       confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : 0.5,
-      tags: mergedTags,
+      tags: dimensionedTags,
+      dimension: resolvedDimension,
       source_events: [...sourceEvents].sort(),
       first_seen_at: existing?.firstSeenAt ?? clock.now(),
       event_time: clock.now(),
@@ -176,6 +188,7 @@ export class SemanticStore {
       text,
       confidence,
       tags: finalTags,
+      dimension: inferDimension({ title, text, tags: finalTags }),
       sourceEvents: [event.event_id],
     });
   }
@@ -227,6 +240,9 @@ export class SemanticStore {
       text: record.text,
       confidence: record.confidence,
       tags: record.tags,
+      dimension:
+        normaliseDimension(record.dimension) ??
+        inferDimension({ title: record.title, text: record.text, tags: record.tags ?? [] }),
       sourceEvents: record.source_events,
       firstSeenAt: record.first_seen_at,
       updatedAt: record.log_time,

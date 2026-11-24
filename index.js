@@ -43,6 +43,8 @@ import { DreamTimer } from './src/dreamTimer.js';
 import { probeCompression, resolveEngine } from './src/compression.js';
 import { LIVE_COMPACT_DEFAULTS, liveCompactSession } from './src/context/liveCompact.js';
 import { snippet } from './src/util.js';
+import { dimensionOf, groupByDimension, stripPhysiology, containsPhysiology } from './src/semantic/dimensions.js';
+import { isSecretRecord } from './src/privacy.js';
 import { MEMORY_API, registerMemoryRoutes } from './src/webRoutes.js';
 
 export const name = 'memory';
@@ -63,7 +65,7 @@ export { resolveConfig, DEFAULT_CONFIG };
  * of letting a raw 404 reach the user.
  */
 export const CAPABILITIES = Object.freeze({
-  version: '1.6.9',
+  version: '1.7.0',
   spaces: true,
   memories: true,
   transferConsent: true,
@@ -386,6 +388,12 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
   };
 
   /** Called by every tool: keeps the dream idle clock honest. */
+  /**
+   * v1.7.0 (M5): per-tool call counts for THIS process (no model request, no file).
+   * The point is evidence: a tool that never gets called is prompt budget spent for
+   * nothing, and `/memory status` can say so.
+   */
+  runtime.toolUsage = { counts: new Map(), since: null };
   runtime.recordToolCall = ({ landed = false } = {}) => {
     runtime.syncAgentPreset();
     runtime.touch();
@@ -503,18 +511,42 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       .sort()
       .join(',')}`;
     if (runtime._personaCache?.signature === signature) return runtime._personaCache.text;
-    const ranked = [...summaries]
+    const byConfidence = (left, right) =>
+      (Number(right.confidence) || 0) - (Number(left.confidence) || 0) ||
+      String(right.summaryId ?? '').localeCompare(String(left.summaryId ?? ''));
+    const oneLine = (value) => String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, 240);
+    // v1.7.0 (M2): six dimensions, and NOTHING physiological. This plugin models a
+    // persona, not a body: a summary line that talks about fatigue/mood/heart-rate is
+    // dropped line-by-line (the rest of the same summary may still be persona), and a
+    // summary left with nothing is not rendered at all.
+    const cleaned = [];
+    for (const summary of [...summaries].sort(byConfidence)) {
+      const text = stripPhysiology(summary.text ?? '');
+      if (!text) continue;
+      cleaned.push({ ...summary, text });
+      if (cleaned.length >= 18) break;
+    }
+    if (cleaned.length === 0) return '';
+    // The dimension is a PREFIX, not a section header: one line per trait keeps the
+    // block the same size it was, and the order is grouped by dimension so a reader
+    // (human or model) can still scan it by category.
+    const dimensionOrder = new Map(
+      ['persona', 'preferences', 'facts-rules', 'relationships', 'skills-patterns', 'boundaries'].map((id, index) => [id, index]),
+    );
+    const ordered = cleaned
+      .map((summary) => ({ ...summary, dimension: dimensionOf(summary) }))
       .sort(
         (left, right) =>
-          (Number(right.confidence) || 0) - (Number(left.confidence) || 0) ||
-          String(right.summaryId ?? '').localeCompare(String(left.summaryId ?? '')),
+          (dimensionOrder.get(left.dimension) ?? 99) - (dimensionOrder.get(right.dimension) ?? 99) ||
+          byConfidence(left, right),
       )
       .slice(0, 10);
-    if (ranked.length === 0) return '';
-    const oneLine = (value) => String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, 240);
+    if (ordered.length === 0) return '';
     const text = [
       '[Persona & Traits]',
-      ...ranked.map((summary) => `- ${oneLine(summary.title) || 'trait'}: ${oneLine(summary.text)}`),
+      ...ordered.map(
+        (summary) => `- [${summary.dimension}] ${oneLine(summary.title) || summary.dimension}: ${oneLine(summary.text)}`,
+      ),
     ].join('\n');
     runtime._personaCache = { signature, text };
     return text;
@@ -646,6 +678,9 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       const best = postings.find((posting) => byId.has(posting.eventId));
       if (!best) continue;
       const event = byId.get(best.eventId);
+      // v1.7.0 (M3): a secret memory is never advertised as a pointer — the index
+      // would otherwise leak its existence into every prompt.
+      if (isSecretRecord(event)) continue;
       // A pointer already delivered in this session is never repeated.
       if (runtime.injection.ids.has(event.eventId)) continue;
       const title = snippet(String(event.content ?? ''), 60);
@@ -1468,15 +1503,67 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       tailTurns: Array.isArray(handoff?.tailTurns) ? handoff.tailTurns.map((turn) => ({ ...turn })) : [],
       text: null,
       found: false,
+      // v1.7.0 (M1): a router plugin needs FIELDS, not a wall of prose. Every raw
+      // turn below carries a role, so nothing here is unattributed text.
+      activeTask: null,
+      recentFacts: [],
+      personaTraits: [],
+      lastRawTurns: [],
     };
-    if (!handoff?.summaryEventId) return base;
+    const structured = () => {
+      const turns = Math.max(3, Math.min(5, Number(runtime.config?.context?.handoffSummaryTurns) || 4));
+      const tail = Array.isArray(base.tailTurns)
+        ? base.tailTurns.filter((turn) => turn && typeof turn.text === 'string' && turn.text.length > 0)
+        : [];
+      const lastRawTurns = tail
+        .slice(-turns)
+        .map((turn) => ({ role: turn.role === 'assistant' ? 'assistant' : 'user', text: String(turn.text).slice(0, 600) }));
+      let activeTask = null;
+      try {
+        const task = memory.promptActiveTask?.();
+        if (task?.text) {
+          activeTask = {
+            eventId: task.eventId ?? null,
+            text: String(task.text).replace(/\s+/g, ' ').trim().slice(0, 600),
+          };
+        }
+      } catch {
+        activeTask = null;
+      }
+      let summaries = [];
+      try {
+        summaries = typeof memory.semanticStore?.list === 'function' ? memory.semanticStore.list() : [];
+      } catch {
+        summaries = [];
+      }
+      const buckets = groupByDimension(summaries.filter((summary) => !containsPhysiology(summary.text ?? '')));
+      const slim = (list, dimension, limit) =>
+        (list ?? [])
+          .slice()
+          .sort((left, right) => (Number(right.confidence) || 0) - (Number(left.confidence) || 0))
+          .slice(0, limit)
+          .map((summary) => ({
+            dimension,
+            summaryId: summary.summaryId ?? null,
+            text: String(stripPhysiology(summary.text ?? '') || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+          }))
+          .filter((entry) => entry.text.length > 0);
+      return {
+        ...base,
+        activeTask,
+        recentFacts: slim(buckets.get('facts-rules'), 'facts-rules', 5),
+        personaTraits: slim(buckets.get('persona'), 'persona', 5),
+        lastRawTurns,
+      };
+    };
+    if (!handoff?.summaryEventId) return { ...base, ...structured() };
     try {
       const events = memory.indexManager.snapshot()?.events ?? [];
       const event = events.find((entry) => entry?.eventId === handoff.summaryEventId);
-      if (!event?.content) return base;
-      return { ...base, text: String(event.content).slice(0, 4000), found: true };
+      if (!event?.content) return { ...base, ...structured() };
+      return { ...base, ...structured(), text: String(event.content).slice(0, 4000), found: true };
     } catch {
-      return base;
+      return { ...base, ...structured() };
     }
   };
 
@@ -2196,7 +2283,18 @@ export async function apply(ctx, rawConfig = {}) {
         ctx.logger?.info?.(`hippocampus: tool ${definition.name} skipped by disabled feature flags`);
         return;
       }
-      disposers.push(ctx.tools.register(definition));
+      // v1.7.0 (M5): count calls per tool so `/memory status` can show real usage
+      // evidence instead of guessing. Wrapping here (one place) keeps the 10 tool
+      // definitions untouched and costs no model tokens.
+      const counted = {
+        ...definition,
+        execute: (args, context) => {
+          const name = String(definition.name ?? '').replace(`${config.toolPrefix}_`, '');
+          if (name) runtime.toolUsage.counts.set(name, (runtime.toolUsage.counts.get(name) ?? 0) + 1);
+          return definition.execute(args, context);
+        },
+      };
+      disposers.push(ctx.tools.register(counted));
     };
     const toolLine = (suffix, text) =>
       disabledToolSuffixes.has(suffix) || featureDisabledSuffix(suffix) ? null : `- ${config.toolPrefix}_${suffix}: ${text}`;
@@ -2408,6 +2506,12 @@ export async function apply(ctx, rawConfig = {}) {
           max_tokens: { type: 'number', description: 'deep_raw only: result token budget, default from raw.maxResultTokens' },
           hash: { type: 'string', description: 'deep_raw only: restore one raw turn verbatim by sha256 (from [Slimmed] hash_…)' },
           regex: { type: 'boolean', description: 'deep_raw only: treat text as a restricted regular expression' },
+          include_secret: {
+            type: 'boolean',
+            description:
+              'Include memories tagged privacy:secret. Omitted by default: secret records are filtered out and only ' +
+              'a count appears in notes (privacy-withheld:N).',
+          },
         },
         output: { schema: { type: 'string' }, render: (_args, value) => toolResult(value) },
         execute: async (args = {}) =>
@@ -2439,6 +2543,7 @@ export async function apply(ctx, rawConfig = {}) {
               tags: args.tags ?? [],
               topK: Math.min(args.top_k ?? config.retrieval.topK, config.maxRecallTopK),
               targetSpaceId: args.target_space_id,
+              includeSecret: args.include_secret === true,
             });
             runtime.recordToolCall({
               landed: (result.hits ?? []).length > 0 || (result.ghostHints ?? []).length > 0,
@@ -3030,6 +3135,15 @@ export async function apply(ctx, rawConfig = {}) {
         return ok(parts.length > 0 ? `维护完成：${parts.join('；')}。` : '维护完成：本轮无变更。');
       }
 
+      const toolUsageLine = () => {
+        const counts = [...runtime.toolUsage.counts.entries()].sort((left, right) => right[1] - left[1]);
+        if (counts.length === 0) return '本进程尚无工具调用（重启会清零）';
+        const shown = counts.slice(0, 6).map(([name, count]) => `${name} ${count}`);
+        const idle = ['remember', 'recall', 'capture', 'deep_raw'].filter((name) => !runtime.toolUsage.counts.get(name));
+        const advice = idle.length > 0 ? `；长时间 0 次：${idle.join('/')}（可考虑 /memory tools disable）` : '';
+        return `${shown.join(' · ')}${advice}`;
+      };
+
       if (verb === 'status') {
         if (runtime.phase !== 'ready') return fail(`记忆引擎状态：${runtime.phase}${runtime.phaseError ? `（${asMemoryError(runtime.phaseError).code}）` : ''}`);
         const payload = await runtime.uiPayload();
@@ -3054,6 +3168,8 @@ export async function apply(ctx, rawConfig = {}) {
             `交接标记：${session.handoffActive ? `active（${session.handoffAt ?? '?'}）` : '无'} · 冷启动待注入 ${runtime.coldStart.pending.size} 条 / 已注入 ${runtime.coldStart.injected.size} 次`,
             tagList.length ? `活跃标签 Top：${tagList.join('、')}` : '活跃标签：无',
             `[Memory Hints]：${runtime.hintsMuted ? '已静默（/memory unmute 恢复）' : '开启'}`,
+            // v1.7.0 (M5): usage EVIDENCE, computed from in-process counters only.
+            `工具使用（本进程）：${toolUsageLine()}`,
           ].join('\n'),
         );
       }

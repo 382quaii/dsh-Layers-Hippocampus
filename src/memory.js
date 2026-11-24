@@ -115,6 +115,7 @@ function validateRoutedNewSpaceId(value) {
 }
 import { ensureDir, dayKey, genNumber, sha256, readJson, writeJsonAtomic, snippet } from './util.js';
 import { detectCiphertext } from './entropy.js';
+import { filterSecret, isSecretRecord, privacyMetaFor } from './privacy.js';
 
 /** Recursive byte size of a directory tree (symlinks count as their target size). */
 function diskUsage(dir) {
@@ -805,6 +806,13 @@ export class Memory {
     if (entityMerged) {
       payloadMeta = { ...(payloadMeta && typeof payloadMeta === 'object' ? payloadMeta : {}), entity_merged: entityMerged };
     }
+    // v1.7.0 (M3): the engine does not DECIDE what is secret — the emotion plugin
+    // does, by tagging the write. Here we only make the interface honest: store it
+    // verbatim, record the fact in meta, and filter it out of every ordinary read.
+    const secretMeta = privacyMetaFor(tagInfo.tags);
+    if (secretMeta) {
+      payloadMeta = { ...(payloadMeta && typeof payloadMeta === 'object' ? payloadMeta : {}), ...secretMeta };
+    }
     const payload = {
       content,
       tags: tagInfo.tags,
@@ -1319,7 +1327,7 @@ export class Memory {
   }
 
   /** The space-local read path. */
-  async _recallLocal({ text = '', tags = [], topK, maxAssociativeHops } = {}, { mergeRecall = true } = {}) {
+  async _recallLocal({ text = '', tags = [], topK, maxAssociativeHops, includeSecret = false } = {}, { mergeRecall = true } = {}) {
     this.assertOpen();
     const now = this.clock.now();
     // v1.6.9: validated BEFORE any work (and before the empty-index shortcut) so an
@@ -1354,7 +1362,8 @@ export class Memory {
       canonicalTags.length > 0 &&
       canonicalTags.every((tag) => this._oversizedHintTags.has(tag)) &&
       this._oversizedHintTags.size > 0;
-    const semantic = this.semanticSummaries();
+    // v1.7.0 (M3): secret summaries are not candidates unless explicitly requested.
+    const semantic = filterSecret(this.semanticSummaries(), { includeSecret }).list;
     const tempSemantic = this.tempStore.list({ status: 'temp', now });
     const associations = this.graphAssociations({ tags, text });
     // v1.6.9 (module 2): the O(1) neighbour table + the recent-turn window. Both are
@@ -1388,9 +1397,12 @@ export class Memory {
     // recalled, the memo wins and duplicates collapse. Only when the Orchestrator
     // dedupe service is present; the pure core keeps its previous payload shape.
     const merged = mergeRecall ? this.mergeRecallHits(ghostPass.hits) : { hits: ghostPass.hits, stats: null };
+    // v1.7.0 (M3): the last gate before a hit can reach the model. `withheld` is a
+    // COUNT only — a caller may learn that something was withheld, never what it was.
+    const visible = filterSecret(merged.hits, { includeSecret });
     const payload = {
       ...result,
-      hits: merged.hits,
+      hits: visible.list,
       ...(merged.stats ? { merge: merged.stats } : {}),
       ghostHints: ghostPass.ghostHints,
       oversizedTagHints: result.oversizedTagHints ?? [],
@@ -1404,6 +1416,7 @@ export class Memory {
         ...ghostPass.notes,
         ...(associations.length > 0 ? [`graph-associations:${associations.length}`] : []),
         ...(merged.stats ? [`read-merge:${merged.stats.total}`] : []),
+        ...(visible.withheld > 0 ? [`privacy-withheld:${visible.withheld}`] : []),
         ...(this._boot && this._boot.status !== 'ok' ? [`boot-check:${this._boot.status}`] : []),
       ],
     };

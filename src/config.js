@@ -218,6 +218,9 @@ export const DEFAULT_CONFIG = Object.freeze({
     //  - recentTurns: inject the last few turns of the handed-off conversation
     //    (v1.6.3 default ON: a new conversation must not start "blind")
     coldStartInjectSummary: true,
+    // v1.7.0 (M1): how many raw tail turns `getLatestHandoffSummary()` carries.
+    // Bounded 3..5: fewer loses the thread, more is a second transcript.
+    handoffSummaryTurns: 4,
     coldStartInjectRecentTurns: true,
     // REMOVED in v1.5.3: `minInjectConfidence`. It never demonstrably saved tokens
     // (0.6 vs 0 produced byte-identical payloads) and every hit-shaping pass is a
@@ -831,6 +834,11 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
       ? defaults.context.coldStartInjectSummary
       : contextIn.coldStartInjectSummary,
     'context.coldStartInjectSummary',
+  );
+  const contextHandoffSummaryTurns = requireInteger(
+    contextIn.handoffSummaryTurns === undefined ? defaults.context.handoffSummaryTurns : contextIn.handoffSummaryTurns,
+    'context.handoffSummaryTurns',
+    { min: 3, max: 5 },
   );
   const contextColdStartInjectRecentTurns = requireBoolean(
     contextIn.coldStartInjectRecentTurns === undefined
@@ -1468,6 +1476,7 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
       },
       // v1.6.3 cold-start injection switches (independent booleans).
       coldStartInjectSummary: contextColdStartInjectSummary,
+      handoffSummaryTurns: contextHandoffSummaryTurns,
       coldStartInjectRecentTurns: contextColdStartInjectRecentTurns,
       // v1.5.0 routing knobs below; v1.5.3 removed minInjectConfidence entirely.
       autoSpaceFollow: contextAutoSpaceFollow,
