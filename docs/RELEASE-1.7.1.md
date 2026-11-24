@@ -1,6 +1,6 @@
-# Release 1.7.0 — 发布准备（本地）
+# Release 1.7.1 — 发布准备（本地）
 
-> 版本：**1.7.0**（2026-11-24：**全链路记忆第二半——人格化与隐私**——L3 六维人格、`privacy:secret` 隐私闸门、Dream 事实来源区分 user/self、交接接口结构化、`/memory status` 工具使用证据。累计 1.6.9 的实体模糊归并 + 别名字典、1 跳共现联想 + 时间窗加成、自动指针注入；累计 1.6.8 的写侧密文护栏 A4 与未完成表重写、1.6.7 的索引式注入 M1 与发布链修正、1.6.6 的 Live Compact 修复、1.6.5 的微内核回归、1.6.4 的 1M 溢出修复、1.6.3 的配置迁移与启动降级）。
+> 版本：**1.7.1**（2026-11-24：**提示预算治理——摘要卫生常开、提示标签单向静默、任务模式当前状态行**；累计 1.7.0 的全链路记忆第二半——人格化与隐私——L3 六维人格、`privacy:secret` 隐私闸门、Dream 事实来源区分 user/self、交接接口结构化、`/memory status` 工具使用证据。累计 1.6.9 的实体模糊归并 + 别名字典、1 跳共现联想 + 时间窗加成、自动指针注入；累计 1.6.8 的写侧密文护栏 A4 与未完成表重写、1.6.7 的索引式注入 M1 与发布链修正、1.6.6 的 Live Compact 修复、1.6.5 的微内核回归、1.6.4 的 1M 溢出修复、1.6.3 的配置迁移与启动降级）。
 
 > 状态：**代码与文档已提交，GitHub 侧由发布步骤推送；npm 侧仍被账号封控挡住。**
 > 剩余 **npm publish** 未执行，且**不是本地命令的问题**：`npm whoami` 已能返回 `382quaii`，
@@ -8,7 +8,7 @@
 > **`E403 Your account has been temporarily suspended due to a recent
 > security-sensitive action`** 拒绝（2026-11-17 13:35Z 首测）。这是账号级封控，与 token/命令形态无关。
 > 命令形态都无关——**必须等 npm 解封**（见下方「npm 账号封控」一节）。
-> 基线：`dsh-memory` 工作区，全量 **548/548 测试通过**（86 个测试文件；另有 `dsh-orchestrator` 31/31）。
+> 基线：`dsh-memory` 工作区，全量 **555/555 测试通过**（87 个测试文件；另有 `dsh-orchestrator` 31/31）。
 > 安装状态：`dsh-orchestrator` 已本地 link 安装到 desktop profile（`include:orchestrator` active）；
 > 插件市场仍无条目（npm 上 `latest` 仍为 `1.6.6`）。
 
@@ -23,7 +23,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 
 排查已排除的项：`whoami` 正常、`pack --dry-run` 正常、`--cache` 已指向可写目录、
 两步验证流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`）。
-`registry` 侧确认 `1.6.7` / `1.6.8` / `1.6.9` / `1.7.0` **均未发布**（`latest = 1.6.6`）。
+`registry` 侧确认 `1.6.7` / `1.6.8` / `1.6.9` / `1.7.0` 仍未发布；`1.7.1` 为本轮新增。
 
 恢复路径（按顺序试）：
 1. 查 `382quaii` 的注册邮箱（含垃圾箱）里的 npm 安全通知，点其中的验证/申诉链接——
@@ -32,10 +32,39 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 3. 仍未解除则走 <https://www.npmjs.com/support> 提交支持单，附上面这条 `E403` 原文与时间戳。
 4. **在解封前，用户可以改用 GitHub 安装**（tag 在远端）：
    ```powershell
-   pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.7.0"
+   pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.7.1"
    ```
 
-## 本版内容（1.7.0）
+## 本版内容
+
+### 主线一（1.7.1）提示预算治理：只给还没过期的信息
+
+1. **摘要卫生（常开，不受模式开关影响）**：新增 `src/promptHygiene.js`。交接摘要、L3 人格行、
+   `[Active Task]` 过去会带上写那一刻的簿记数字（`events 348`、`reviews total 346 due 337`、
+   `version 1.6.9`）——写入时是真的，几分钟后就是假的，模型要先读一遍再花 token 纠正。
+   `stripVolatile()` 只删**簿记子句**，**刻意不删没有键名的裸数字**（否则
+   `854,668 + 256,000 > 1,048,576` 这类教训会被一起删掉）；`hygienicSummary()` 再加一个
+   `(snapshot … · counters stripped as stale)` 时间戳。三个注入点走同一条路径。
+2. **冷启动尾部不再泄漏摘要事件**：`[Previous Context Tail]` 缺少 `tailTurns` 时会回退到
+   「最近业务事件」，而交接摘要事件本身带 `folded_summary` 标签，于是摘要被当成一轮对话
+   再注入一次（连同过期计数）。现在排除摘要事件，其余每行也过卫生。
+3. **提示标签单向静默**：新增 `src/hintFeedback.js`（`state/hint-feedback.json`）。每个标签记
+   `shown` / `recalled`；连续 `context.hintsIdleSilenceAfter`（默认 8）次展示且零 recall →
+   **永久静默**，且**不会因为之后偶然被 recall 而复活**（自动复活等于把同一个错误再学一遍）。
+   只有真正的召回路径（`injectRecall`）记 `recalled`，这是标签能留下的唯一凭证。
+4. **`[Task State]` 当前状态行（任务模式）**：记忆回答「去过哪里」，构建会话还需要「现在在哪」。
+   在 Prompt **最末**注入一行 `repo@branch · HEAD <sha7> · window 291k/1048k (host) · maintained 12m ago`：
+   HEAD 直接读 `.git/HEAD` + loose ref（**不 spawn git**，5 秒缓存），窗口压力取宿主上报值，
+   硬上限 `context.statePointer.maxChars`（默认 300）。排在所有易变段之后，前缀缓存不受影响。
+5. **任务 / 专家模式（`context.mode`）**：`task`（默认）启用 3+4；`expert` 保留全部提示、
+   不注入状态行、不咨询闭环。设置页「上下文窗口」新增运行模式下拉、静默阈值与状态行开关；
+   `context.mode` 也进了简洁模式白名单（同一开关在两种视图都必须可改）。
+6. **可观测性**：`capabilities.mode` 与 `capabilities.hints`（tracked / silenced / silencedTags）
+   进入 `/stats`；`/memory status` 显示运行模式、提示反馈统计与被静默的标签。
+7. **测试**：`test/v171.mode.test.js`（7 例），全量 **555/555**（87 文件）。
+
+---
+
 
 1. **L3 六维人格**（`src/semantic/dimensions.js`）：persona / preferences / facts-rules / relationships /
    skills-patterns / boundaries；`upsert()` 落 `dim:` 标签与 `dimension` 字段，但标签不变量仍按原始标签校验。
@@ -301,7 +330,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 
 ## 发布步骤（需要你执行）
 
-> 两个包：`dsh-layers-hippocampus@1.7.0`（已有 git remote）与
+> 两个包：`dsh-layers-hippocampus@1.7.1`（已有 git remote）与
 > `dsh-layers-orchestrator@0.1.0`（**目前不是 git 仓库**，需先 init/建远端）。
 > git 命令在 PowerShell 下执行（本机证书链校验被中间打断，需 `GIT_SSL_NO_VERIFY=1` 才能访问 origin）。
 > npm 发布在 **cmd** 里执行，直接用 `npm`（凭证来自默认的 `%USERPROFILE%\.npmrc`），
@@ -311,7 +340,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 
 ```powershell
 cd D:\86135\Documents\dsh\workspace\dsh-memory
-node test/run.mjs                # 期望 548/548
+node test/run.mjs                # 期望 555/555
 cd ..\dsh-orchestrator
 node test/run.mjs                # 期望 31/31
 cd ..\dsh-memory
@@ -326,12 +355,12 @@ npm pack --dry-run               # 预检实际发布内容（含/不含不该�
 cd D:\86135\Documents\dsh\workspace\dsh-memory
 git add -A
 git status --short                 # 最后确认没有 node_modules / state / 测试临时目录
-git commit -m "chore(release): v1.7.0 - structured handoff, L3 dimensions, privacy:secret, fact provenance, tool usage"
+git commit -m "chore(release): v1.7.1 - prompt hygiene, one-way hint silence, task/expert mode, state line"
 
 # 历史 tag：v1.5.5 / v1.5.7 / v1.6.0 / v1.6.1 / v1.6.2 / v1.6.4 / v1.6.5 / v1.6.6。
 # v1.6.5 已指向实际发布的 28776c7、v1.6.6 已指向实际发布的 99a07cb（均为 annotated），不要动它们。
-# 本次只新增 v1.7.0，不需要删任何 tag。
-git tag -a v1.7.0 -m "v1.7.0: structured handoff, L3 dimensions, privacy:secret, fact provenance, tool usage"
+# 本次只新增 v1.7.1，不需要删任何 tag。
+git tag -a v1.7.1 -m "v1.7.1: prompt hygiene, one-way hint silence, task/expert mode, state line"
 $env:GIT_SSL_NO_VERIFY="1"         # 本机证书链校验被中间打断，git 需要它才能连 origin
 git push origin main --follow-tags
 Remove-Item Env:GIT_SSL_NO_VERIFY

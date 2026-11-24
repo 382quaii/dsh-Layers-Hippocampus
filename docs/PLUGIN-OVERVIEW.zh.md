@@ -1,9 +1,9 @@
 # dsh-layers-hippocampus · 功能 / 实现 / 版本演进
 
 > 版本基线：**v1.7.0（2026-11-24：全链路记忆第二半——① L3 六维人格（persona / preferences / facts-rules / relationships / skills-patterns / boundaries），`upsert` 落 `dim:` 标签并在 persona 块逐行剥离生理状态；② `privacy:secret` 隐私闸门：默认过滤 + `includeSecret` 才返回，不进指针、不做联想种子；③ Dream 事实来源：`facts:[{text,source:user|self}]`，无主条目直接丢弃；④ `getLatestHandoffSummary()` 结构化（`activeTask`/`recentFacts`/`personaTraits`/`lastRawTurns`，每条带 role，轮数 3–5 可配）；⑤ `/memory status` 报每个工具的真实调用次数，长期 0 次直接建议禁用。累计 1.6.9 的实体归并 + 1 跳联想 + 自动指针、1.6.8 的密文护栏 A4、1.6.7 的索引式注入 M1、1.6.6 的 Live Compact、1.6.5 的微内核回归）**
-> 验证状态：**548 / 548 测试通过**（86 个测试文件 · 57 个源码文件 · 零运行时依赖）
+> 验证状态：**555 / 555 测试通过**（87 个测试文件 · 59 个源码文件 · 零运行时依赖）
 > 数据位置（本机当前）：`D:\Users\86135\memory`（本地 JSONL，可迁移）
-> 本文与 `README.md`、`docs/ARCHITECTURE.zh.md`、`CHANGELOG.md`、`docs/RELEASE-1.7.0.md` 配套。
+> 本文与 `README.md`、`docs/ARCHITECTURE.zh.md`、`CHANGELOG.md`、`docs/RELEASE-1.7.1.md` 配套。
 
 ---
 
@@ -173,11 +173,12 @@ DeepSeek Harness（DSH）的**本地优先长期记忆 Host 插件**。它不把
 | **1.6.8** | **写侧护栏：拒绝高熵密文/加密载荷（审计项 A4）**。新增 `src/entropy.js`（纯函数、零依赖）：`shannonEntropy()` + `detectCiphertext()` 三判据（base64 连续 ≥512 且熵 ≥4.5；hex 连续 ≥512 且熵 ≥3.5；PEM 甲壳共 5 种标记即使很短也拒绝），保守优先——散文/源码/URL/Windows 路径/低熵长串/短 base64 data URI 全部放行；新增错误码 `MEM_E_ENCRYPTED_RAW_REJECTED`（details 带 reason/runLength/entropy/at）；三条写路径统一护栏：`rawStore.capture` **拒绝且零落盘**、`remember()` 同规则**且先于** base64-media 守卫（对密文块「改用 media_url」是错误建议）、auto-capture 降级为 `{stored:false, skipped:'encrypted-blob'}` 不刷警告。8 例 `test/v168.encrypted.test.js`；全量 **541/541**（84 文件）。同时把 `记忆插件-未完成表.md` 从 2026-11-05 待办审计重写为当前状态表（A1–A21 逐项关闭依据）。 |
 | **1.6.9** | **全链路记忆机制**：① `src/entityAlias.js` 负责写侧实体归并——别名字典（`state/entity_alias.json`，schema 1）→ 子串包含（已有 `entity:红薯` 时 `entity:烤红薯` 折向短词）→ 编辑距离（相似度 ≥0.8 且长度差 ≤2），折名记 `meta.entity_merged`，并修掉 `_resolveTags()` 用原始 tags 覆盖合并结果的真根因；索引构建期 `buildIndex()` 通过 `canonicalTag()` 再折一次，**日志永不改写**。② `DreamEngine.learnAliases()` 取 24h 内新增 `entity:` 词做 JSON 小请求，`sanitiseAliasPairs(pairs,{known})` 只允许折向已存在规范词，成功后 `markDirty()` + `invalidateAdjacency()`。③ `src/tagGraph.js` 提供 `buildAdjacency()`（`Map<tag,[{tag,weight}]>`，对称/降序/每点 ≤8）与 `assertAssociativeHops()`；`recall()` 每种子仅一次 `Map.get()` 取最强邻居，语义联想条目 `score × 0.5` 并标 `association:{via,penalty,hops:1}`，结果带 `associative.{hops,tags,seeds,semantic}`；`entitySeedsMentioned()` 让查询文本中出现的 entity 词无需显式标签即为种子；`>1` 抛 `MEM_E_INVALID_INPUT`，`0` 关闭。④ `recentWindowTurns`（默认 50）内 1.2x–1.5x 时间加成，`timeBoost` 上限升至 1.5，`PRUNE_BOUND_FACTOR` 3.9→4.5。⑤ `context.autoInjectIndex`（默认 `{enabled:true,everyNTurns:3,maxPointers:3,maxChars:300}`，接受布尔简写）在就绪/会话切换即布防，首轮输出 `[Memory Index]`，每 N 个 user turn 重新布防，行格式 `- [memory <eventId>] <tag> · <title>`，无正文、整段 ≤300 字符，注入 id 进 `runtime.injection.ids`，标签签名未变不重复；四个键进 `EDITABLE_CONFIG_KEYS`，`memory.status()` 暴露 `entityAliasStatus()` / `associativeStatus()`。6 例 `test/v169.fullchain.test.js` |
 ---
+| **1.7.1** | **提示预算治理**：① 摘要卫生（`src/promptHygiene.js`）——注入的摘要先剥掉簿记计数（版本号 / `key: N` / `gen-…` / 时间戳）并补 `(snapshot … counters stripped as stale)`，但**保留带教训的数字**；冷启动摘要 / 人格行 / `[Active Task]` 三点统一，并修掉尾部把摘要事件当成一轮对话的泄漏。② **提示标签单向静默**（`src/hintFeedback.js`，默认 8 次零 recall 后永久静默，recall 不复活），由 `context.mode` 门控。③ **`[Task State]` 状态行**（`repo@branch · HEAD <sha7> · window …`，读 `.git/HEAD`、5s 缓存、硬上限 `context.statePointer.maxChars`）。④ 可观测：`capabilities.mode` / `capabilities.hints` / `/memory status` | 7 例 `test/v171.mode.test.js` |
 | **1.7.0** | **全链路记忆第二半（人格化与隐私）**：① **L3 六维**（`src/semantic/dimensions.js`）——persona / preferences / facts-rules / relationships / skills-patterns / boundaries，`upsert()` 落 `dim:` 标签与 `dimension` 字段（tag 不变量仍按原始标签校验，`dim:` 不是免标签后门），persona 块按维度排序且逐行剥离生理状态（bodyState/fatigue/mood/体温/心率…），标题与正文都能推断维度（tag → 标题 → 关键词 → 默认 facts-rules）；② **`privacy:secret` 隐私闸门**（`src/privacy.js`）——写侧原样落库并写 `meta.privacy=secret`，`recall` 默认过滤并回报 `privacy-withheld:<n>`，显式 `includeSecret` 才返回，且永不进 `[Memory Index]` 指针、永不成为联想种子；③ **Dream 事实来源**（`src/dream.js`）——蒸馏输出 `facts:[{text,source:user|self}]`，无主或非法 source 的条目直接丢弃（绝不默认成「用户说的」），本地兜底按事件 role 生成，facts 与 dimension 一并写进 L3 `meta`；④ **交接接口结构化**——`getLatestHandoffSummary()` 在 `text` 之外给出 `activeTask` / `recentFacts` / `personaTraits` / `lastRawTurns`（每条必带 role，轮数由 `context.handoffSummaryTurns` 限制在 3–5）；⑤ **工具使用证据**——`/memory status` 报每个工具在本进程的真实调用次数，长期 0 次的工具直接建议 `/memory tools disable`（不额外发模型请求） |
 
 ## 6. 测试与质量
 
-- **548 / 548 通过**，86 个测试文件；进程内 `node --test`（`test/run.mjs`），30 秒看门狗，时间一律注入 `FakeClock`。
+- **555 / 555 通过**，87 个测试文件；进程内 `node --test`（`test/run.mjs`），30 秒看门狗，时间一律注入 `FakeClock`。
 - 覆盖维度：身份幂等、索引重建一致性、召回排序与置信度、raw 四字段与游标扫描、哈希恢复、两阶段删除与墓碑、标签树生命周期与重放一致性、多空间降级、配置 fail-fast、UI 源码契约、崩溃恢复（200ms checkpoint 窗口）、事件循环让出。
 - 运维脚本：`scripts/bench-protocol.mjs`（基准协议）、`scripts/repair-handoff.mjs`（交接修复）。
 
@@ -186,7 +187,7 @@ DeepSeek Harness（DSH）的**本地优先长期记忆 Host 插件**。它不把
 ## 7. 已知边界与风险（诚实清单）
 
 1. **多空间依赖外部能力**：无 `dsh-orchestrator` 时只有单空间与 8 个工具，这是显式降级，不是 bug；
-2. **版本节奏**：1.5.7 的临时冻结已于 2026-11-07 全面解除，恢复语义化版本（当前 1.7.0）；
+2. **版本节奏**：1.5.7 的临时冻结已于 2026-11-07 全面解除，恢复语义化版本（当前 1.7.1）；
 3. **保存窗口**：日志 append 是 durable 的，但 manifest checkpoint 有 200ms 延迟；崩溃后依赖 `unflushedBytes` + 重建兜底；
 4. **raw 尾扫偏置**：单分片超过 `maxScanTurns`（默认 5000）时一次只看最新 N 条，更早历史需调大预算或按时间窗分页；
 5. **置信度阈值**：在高度同质的数据上不触发（A/B 已验证为 0 收益），不适合当作默认的“省 token”手段；

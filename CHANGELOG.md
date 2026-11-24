@@ -4,6 +4,49 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.7.1] — 2026-11-24
+
+**把注入面从“多给点信息”改成“只给还没过期的信息”：摘要卫生常开，提示标签单向静默，
+任务模式补一行当前状态。三项都来自一次真实长会话的复盘，不是理论优化。**
+
+- **Fixed — 注入摘要里的过期计数（常开，不受模式开关影响）**：交接摘要、L3 人格行、
+  `[Active Task]` 都会带上写那一刻的簿记数字（`events 348`、`reviews total 346 due 337`、
+  `version 1.6.9`）。它们**写入时是真的，几分钟后就假了**，模型要先读一遍再花 token 纠正。
+  新增 `src/promptHygiene.js`：`stripVolatile()` 只删**簿记子句**（版本号、`key: N`、
+  `gen-000131`、ISO 时间戳、`N 条/个/分片`），**刻意不删没有键名的裸数字**——否则
+  `854,668 + 256,000 > 1,048,576` 这类教训会被一起删掉；带「是/为/需要/必须/禁止/不要」
+  的句子不按计数量删除。`hygienicSummary()` 再补一个快照时间戳
+  （`(snapshot … · counters stripped as stale)`），让读者知道这段文字有多旧。
+  三个注入点（冷启动摘要、人格行、活动任务）全部走同一条路径。
+- **Fixed — 冷启动尾部泄漏摘要事件**：`[Previous Context Tail]` 在缺少 `tailTurns` 时回退到
+  「最近业务事件」，而交接摘要事件本身带 `folded_summary` 标签，于是**摘要被当成一轮对话**
+  再注入一次（连同它的过期计数）。现在排除摘要事件，其余每行也过一遍卫生。
+- **Added — 提示标签的单向静默（任务模式）**：`[Memory Hints]` 过去会一直展示同一个不相关
+  标签，从不换来一次 `recall`（实测 2 次出现、0 次使用）。新增 `src/hintFeedback.js`
+  （`state/hint-feedback.json`，schema 1）：每个标签记 `shown` / `recalled`；连续
+  `context.hintsIdleSilenceAfter`（默认 **8**）次展示且 `recalled === 0` → **永久静默**。
+  单向是关键：静默后即使偶然被 recall 也不会自动复活，只有 `revive()` 或删状态文件才能恢复
+  —— 自动复活只会把同一个错误再学一遍。计数只在真的渲染出 hints 时才增加；召回路径
+  （`injectRecall`）记录 `recalled`，这是唯一能让标签留下的信号。
+- **Added — `[Task State]` 当前状态行（任务模式）**：记忆回答「去过哪里」，构建/调试会话
+  还需要「现在在哪」。任务模式在 Prompt **最末**注入一行
+  （`repo@branch · HEAD <sha7> · window 291k/1048k (host) · maintained 12m ago`）：
+  HEAD 直接读 `.git/HEAD` + loose ref（**不 spawn git**，5 秒缓存），窗口压力取宿主上报值，
+  硬上限 `context.statePointer.maxChars`（默认 300，超出截断加 `…`）。
+  它排在所有易变段之后，前缀缓存不受影响。
+- **Added — 任务 / 专家模式（`context.mode`）**：`task`（默认）启用上面两项；
+  `expert` 保留全部提示、不注入状态行、不咨询提示闭环。设置页「上下文窗口」新增
+  运行模式下拉、静默阈值数字框与状态行开关；`context.mode` 也进了简洁模式白名单
+  （同一个开关在两种视图里都必须可改，否则等于骗人）。枚举校验：拼错直接 fail-fast。
+- **Observability**：`capabilities.mode` 与 `capabilities.hints`（`tracked` / `silenced` /
+  `silencedTags`）进入 `/stats`；`/memory status` 显示运行模式、提示反馈统计与被静默的标签
+  ——「一个标签为什么不再出现」必须能从接口回答，而不是靠猜。
+- **Tests**：`test/v171.mode.test.js`（7 例）锁定模式默认与枚举校验、8 次空手展示后的单向
+  静默且 recall 不复活、静默跨重启持久、有 recall 的标签不被静默、专家模式不咨询闭环也不注入
+  状态行、状态行硬上限与 HEAD 存在且排在最后、卫生剔除簿记却保留 854,668 那组教训数字、
+  快照时间戳格式，以及真实交接下冷启动块既被清洗又保留结论半句。
+  全量 **555/555**（87 个测试文件）。
+
 ## [1.7.0] — 2026-11-24
 
 **全链路记忆的第二半：写入侧去重（实体）、检索侧联想（1 跳）、语义侧分层（六维人格）、

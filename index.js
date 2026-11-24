@@ -27,6 +27,7 @@
  * must resolve standalone under pnpm's strict node_modules layout.
  */
 
+import fs from 'node:fs';
 import path from 'node:path';
 import { resolveConfig, toMemoryOptions, DEFAULT_CONFIG, multiSpaceActive, multiSpaceReason } from './src/config.js';
 import { extractEntities } from './src/utils/RegexExtractor.js';
@@ -35,8 +36,10 @@ import { MigrationRunner } from './src/migrationRunner.js';
 import { CronScheduler } from './src/scheduler.js';
 import { asMemoryError, ErrorCodes, MemoryError } from './src/errors.js';
 import { Memory, turnFromSessionEvent } from './src/memory.js';
-import { composePrompt, renderActiveTask, renderPointers } from './src/utils/promptLayout.js';
+import { composePrompt, renderActiveTask, renderPointers, renderStateLine } from './src/utils/promptLayout.js';
 import { renderMemoryHints, selectRelevantTags } from './src/utils/memoryHints.js';
+import { HintFeedbackStore } from './src/hintFeedback.js';
+import { hygienicSummary, stripVolatile } from './src/promptHygiene.js';
 import { HostBridge } from './src/hostBridge.js';
 import { isLowValley, nextLowValleyStart, windowInfo } from './src/priceWindow.js';
 import { DreamTimer } from './src/dreamTimer.js';
@@ -65,7 +68,7 @@ export { resolveConfig, DEFAULT_CONFIG };
  * of letting a raw 404 reach the user.
  */
 export const CAPABILITIES = Object.freeze({
-  version: '1.7.0',
+  version: '1.7.1',
   spaces: true,
   memories: true,
   transferConsent: true,
@@ -454,6 +457,103 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
    */
   runtime.pointers = { armed: true, userTurns: 0, lastSignature: null, lastAt: null, injected: 0 };
   /**
+   * v1.7.1: the hint feedback loop (task mode).
+   *
+   * Constructed lazily (the state directory does not exist until the memory opens) and
+   * only in task mode; expert mode keeps every hint as-is. Failure to create the store
+   * must never break prompt assembly, so construction is guarded and `null` means
+   * "no silencing" everywhere below.
+   */
+  runtime.hintFeedback = null;
+  runtime.ensureHintFeedback = () => {
+    if (runtime.hintFeedback) return runtime.hintFeedback;
+    try {
+      const stateDir = memory?.paths?.state;
+      if (typeof stateDir !== 'string' || stateDir.length === 0) return null;
+      runtime.hintFeedback = new HintFeedbackStore({
+        file: `${stateDir}/hint-feedback.json`,
+        clock: { now: () => memory.clock.now() },
+      });
+      runtime.hintFeedback.load();
+      return runtime.hintFeedback;
+    } catch {
+      return null;
+    }
+  };
+  // A functional no-op so promptState() never needs a null check at the call site.
+  runtime.hintFeedbackFacade = () => {
+    const store = runtime.ensureHintFeedback();
+    if (store) return store;
+    return { filter: (tags) => (Array.isArray(tags) ? tags : []), noteShown: () => ({ silenced: [], changed: false }), noteRecalled: () => ({ changed: false }), status: () => ({ tracked: 0, silenced: 0, silencedTags: [], updatedAt: null }) };
+  };
+  /**
+   * v1.7.1: the ONE current-state line injected in task mode.
+   *
+   * Memory answers "where have we been"; a build/debug session needs "where am I now".
+   * Two facts only, both cheap and both genuinely current:
+   *   - the repo HEAD (read from .git/HEAD + the loose ref, cached 5s — never a spawn);
+   *   - the live window pressure the host reported for this turn.
+   * Nothing here is a counter that ages badly: HEAD moves and pressure is per-turn.
+   */
+  runtime.statePointerCache = { at: null, text: '' };
+  runtime.gitHead = () => {
+    try {
+      const dir = process.cwd();
+      const headPath = `${dir}/.git/HEAD`;
+      if (!fs.existsSync(headPath)) return { branch: null, sha: null };
+      const head = String(fs.readFileSync(headPath, 'utf8')).trim();
+      if (head.startsWith('ref:')) {
+        const ref = head.slice(4).trim();
+        const refPath = `${dir}/.git/${ref}`;
+        const sha = fs.existsSync(refPath) ? String(fs.readFileSync(refPath, 'utf8')).trim().slice(0, 7) : null;
+        return { branch: ref.replace(/^refs\/heads\//, ''), sha };
+      }
+      return { branch: null, sha: head.slice(0, 7) };
+    } catch {
+      return { branch: null, sha: null };
+    }
+  };
+  runtime.statePointerText = () => {
+    // Expert mode serves the full memory contract, not a task dashboard: the caller
+    // gates this too, but the function must not lie when called directly.
+    if (runtime.config?.context?.mode === 'expert') return '';
+    const pointerConfig = runtime.config?.context?.statePointer ?? {};
+    if (pointerConfig.enabled === false) return '';
+    const budget = Math.max(60, Number(pointerConfig.maxChars) || 300);
+    const now = memory?.clock?.now?.() ?? Date.now();
+    // 5s is enough: HEAD cannot move more than once per test run, and a prompt
+    // assembly must not stat the repo on every single turn.
+    if (runtime.statePointerCache.at !== null && now - runtime.statePointerCache.at < 5000) {
+      return runtime.statePointerCache.text;
+    }
+    const fields = {};
+    try {
+      const repo = String(process.cwd()).split(/[\\/]/).filter(Boolean).pop() ?? null;
+      const { branch, sha } = runtime.gitHead();
+      if (repo) fields.repo = branch ? `${repo}@${branch}` : repo;
+      if (sha) fields.head = `HEAD ${sha}`;
+    } catch {
+      /* the task line must never fail the assembly */
+    }
+    try {
+      const session = memory.context.nativeState({ now });
+      if (Number.isFinite(Number(session?.tokens)) && Number.isFinite(Number(session?.nativeTokenLimit))) {
+        fields.window = `window ${Math.round(Number(session.tokens) / 1000)}k/${Math.round(Number(session.nativeTokenLimit) / 1000)}k (${session.windowSource ?? 'config'})`;
+      }
+    } catch {
+      /* ignore */
+    }
+    try {
+      const lastMaintain = Number(runtime.scheduler?.lastSuccessAt) || null;
+      if (lastMaintain) fields.maintained = `maintained ${Math.max(0, Math.round((now - lastMaintain) / 60000))}m ago`;
+    } catch {
+      /* ignore */
+    }
+    const text = renderStateLine(fields, { maxChars: budget });
+    runtime.statePointerCache = { at: now, text };
+    return text;
+  };
+  /**
    * v1.6.3 cold-start state (replaces the v1.6.0 boolean `coldStartPending`).
    *
    * The boolean was consumed by the FIRST prompt assembly of the whole process, so
@@ -521,7 +621,10 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     // summary left with nothing is not rendered at all.
     const cleaned = [];
     for (const summary of [...summaries].sort(byConfidence)) {
-      const text = stripPhysiology(summary.text ?? '');
+      // v1.7.1: same counter hygiene as every other injected summary — a trait line
+      // that is mostly bookkeeping is dropped, the rest is cleaned.
+      const stripped = stripVolatile(summary.text ?? '');
+      const text = stripPhysiology(stripped.text);
       if (!text) continue;
       cleaned.push({ ...summary, text });
       if (cleaned.length >= 18) break;
@@ -793,7 +896,16 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
             .join('\n');
         }
         if (summaryText.trim()) {
-          lines.push('[Cold-Start Summary]', summaryText.replace(/\s+/g, ' ').trim().slice(0, 800));
+          // v1.7.1: this is the single biggest source of stale facts in the prompt
+          // ("events 348 / reviews 346 due 337 / v1.6.9"). Strip the bookkeeping
+          // counters and stamp the moment the summary was made, so the reader knows
+          // the text is old even after cleaning. Always on, independent of mode.
+          const summaryAt =
+            Number(allEvents.find((event) => event.eventId === handoff?.summaryEventId)?.eventTime) ||
+            Number(handoff?.at) ||
+            null;
+          const hygienic = hygienicSummary(summaryText, { at: summaryAt, maxChars: 800, label: 'cold start' });
+          if (hygienic.text) lines.push('[Cold-Start Summary]', hygienic.text);
         }
       }
       if (wantTurns) {
@@ -806,8 +918,20 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
               .map((turn) => `- ${turn.role === 'assistant' ? 'assistant' : 'user'}: ${String(turn.text ?? '').replace(/\s+/g, ' ').trim().slice(0, 200)}`)
               .filter((line) => line.length > 10)
           : events
+              // v1.7.1: a folded/handoff SUMMARY is not a turn. It was leaking into the
+              // tail (with its stale counters) and duplicating the summary block above,
+              // so summary events are excluded here and each remaining line gets the
+              // same counter hygiene as everything else injected.
+              .filter((event) => {
+                if (handoff?.summaryEventId && event.eventId === handoff.summaryEventId) return false;
+                const tags = (event.tags ?? []).map((tag) => (tag?.tag ?? tag));
+                return !tags.some((tag) => tag === 'status:handoff' || tag === 'folded_summary');
+              })
               .slice(0, 5)
-              .map((event) => `- ${String(event.content ?? '').replace(/\s+/g, ' ').trim().slice(0, 200)}`)
+              .map((event) => {
+                const cleaned = stripVolatile(String(event.content ?? '')).text;
+                return `- ${cleaned.replace(/\s+/g, ' ').trim().slice(0, 200)}`;
+              })
               .filter((line) => line.length > 2);
         if (recent.length > 0) lines.push('[Previous Context Tail]', ...recent);
       }
@@ -854,10 +978,24 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
             activeTags,
             fallbackTags: runtime.lastHintTags,
           });
-      const freshTags = selected.filter((tag) => !runtime.injection.tags.has(tag));
+      // v1.7.1: in TASK mode a hint that has been shown `hintsIdleSilenceAfter` times
+      // and never earned a recall is silenced for good. The filter runs BEFORE the
+      // session-level dedup pool so a silenced tag is neither rendered nor burned.
+      const taskMode = config.context.mode !== 'expert';
+      const hintFeedback = runtime.hintFeedbackFacade();
+      const hinted = taskMode ? hintFeedback.filter(selected) : selected;
+      const freshTags = hinted.filter((tag) => !runtime.injection.tags.has(tag));
       for (const tag of freshTags) runtime.injection.tags.add(tag);
       if (selected.length > 0) runtime.lastHintTags = selected;
       const hints = hintsMuted ? '' : renderMemoryHints(freshTags, { toolName: `${config.toolPrefix}_recall` });
+      if (taskMode && hints && freshTags.length > 0) {
+        // Count only what was actually rendered; a silenced/blank render must not
+        // look like "the user saw it".
+        const feedback = hintFeedback.noteShown(freshTags, { threshold: config.context.hintsIdleSilenceAfter });
+        if (feedback.silenced.length > 0) {
+          runtime.logger?.debug?.(`hippocampus: hints silenced after N showings with no recall: ${feedback.silenced.join(',')}`);
+        }
+      }
       // v1.6.9 (module 3): computed AFTER hints (the most volatile of all) and rendered
       // below them, so the cacheable prefix never moves.
       const pointers = runtime.pointerText();
@@ -871,7 +1009,13 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
         // P3-1: the SAME event must not appear again as a `[Memory Blocks]` entry.
         // Block ids ARE event ids, so registering the bare id hides the block form.
         runtime.injection.ids.add(activeTask.eventId);
-        activeTaskBlock = renderActiveTask(activeTask);
+        // v1.7.1: the task line is a summary, so it gets the same counter hygiene as
+        // the cold-start block — a stale "events 348" is not part of the task.
+        activeTaskBlock = hygienicSummary(renderActiveTask(activeTask), {
+          at: Number(activeTask.at) || null,
+          maxChars: 1200,
+          label: 'active task',
+        }).text;
       }
 
       // Recall blocks: the block id IS the event id. Render only blocks that this
@@ -903,8 +1047,11 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       // v1.6.7 M1: in `index` mode the window renders pointer lines, so the rules
       // must say so — otherwise the model reads a title as if it were the memory.
       const rules = memory.context.injectMode === 'full' ? PROMPT_STATE_RULES : PROMPT_STATE_RULES_INDEX;
+      // v1.7.1: task mode adds ONE current-state line, last in the prompt. It answers
+      // "where am I now" (repo HEAD, window pressure), which memory cannot answer.
+      const stateLine = taskMode ? runtime.statePointerText() : '';
       return (
-        composePrompt({ rules, activeTask: activeTaskBlock, blocks, hints, pointers }) +
+        composePrompt({ rules, activeTask: activeTaskBlock, blocks, hints, pointers, stateLine }) +
         marker +
         (coldStart ? `\n${coldStart}` : '')
       );
@@ -1445,6 +1592,10 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     // M2: which optional external seams answered. Absence is reported, not hidden:
     // `wired:false` means this engine fell back to its own local behaviour.
     externalSeams: runtime.externalSeams?.() ?? null,
+    // v1.7.1: which contract this engine serves, and how the hint loop is doing.
+    // Observable on purpose — a silently silenced tag must be explainable from /stats.
+    mode: runtime.config?.context?.mode ?? 'task',
+    hints: runtime.hintFeedbackFacade().status(),
     crossSpaceTransfer: runtime.multiSpaceAvailable() && runtime.config.features.crossSpaceTransfer !== false,
     // v1.5.6: opt-in cross-space recall aggregation (default false).
     crossSpaceRecall: runtime.multiSpaceAvailable() && runtime.config.features.crossSpaceRecall === true,
@@ -1472,7 +1623,10 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     })(),
   });
 
-  /** v1.5.6: handoff observability (the client shows the marker + summary link). */  runtime.handoffView = () => {
+  /** v1.5.6: handoff observability (the client shows the marker + summary link). */  /** v1.7.1: the hint feedback loop (tracked / silenced counts and the silenced tags). */
+  runtime.hintFeedbackView = () => runtime.hintFeedbackFacade().status();
+
+  runtime.handoffView = () => {
     const handoff = memory.handoffState();
     return {
       active: handoff?.active === true,
@@ -3160,6 +3314,7 @@ export async function apply(ctx, rawConfig = {}) {
           .slice(0, 8)
           .map((entry) => entry.tag)
           .filter(Boolean);
+        const feedbackStatus = runtime.hintFeedbackView();
         return ok(
           [
             `记忆引擎：ready（v${CAPABILITIES.version}）`,
@@ -3167,7 +3322,10 @@ export async function apply(ctx, rawConfig = {}) {
             `会话 ${session.sessionId ?? '未知'} · 已用 ${session.tokens ?? 0} + 预留 ${session.reservedTokens ?? 0} = ${session.projectedTokens ?? 0} / 窗口 ${session.nativeTokenLimit ?? '?'}（来源 ${session.windowSource ?? 'config'}）`,
             `交接标记：${session.handoffActive ? `active（${session.handoffAt ?? '?'}）` : '无'} · 冷启动待注入 ${runtime.coldStart.pending.size} 条 / 已注入 ${runtime.coldStart.injected.size} 次`,
             tagList.length ? `活跃标签 Top：${tagList.join('、')}` : '活跃标签：无',
-            `[Memory Hints]：${runtime.hintsMuted ? '已静默（/memory unmute 恢复）' : '开启'}`,
+            `[Memory Hints]：${runtime.hintsMuted ? '已静默（/memory unmute 恢复）' : '开启'}·运行模式 ${runtime.config?.context?.mode ?? 'task'}`,
+            // v1.7.1: the hint loop is visible, not a mystery. A silenced tag is
+            // the engine's own decision and the operator must be able to see why.
+            `H提示反馈：追踪 ${feedbackStatus.tracked} 个标签，单向静默 ${feedbackStatus.silenced} 个${feedbackStatus.silencedTags.length ? `（${feedbackStatus.silencedTags.join('、')}）` : ''}`,
             // v1.7.0 (M5): usage EVIDENCE, computed from in-process counters only.
             `工具使用（本进程）：${toolUsageLine()}`,
           ].join('\n'),
@@ -3299,6 +3457,18 @@ function injectRecall(runtime, result) {
       at: summary.updatedAt,
       now,
     });
+  }
+  // v1.7.1: this is the ONLY place a hint can earn its keep. Feeds the loop that
+  // silences tags which keep being shown but never bring the model here — without this
+  // signal the loop would silence everything, which is worse than no loop at all.
+  try {
+    const recalledTags = [
+      ...(result.hits ?? []).flatMap((hit) => (Array.isArray(hit?.tags) ? hit.tags : [])),
+      ...(result.associative?.tags ?? []),
+    ].filter((tag) => typeof tag === 'string' && tag.length > 0);
+    if (recalledTags.length > 0) runtime.hintFeedbackFacade().noteRecalled(recalledTags);
+  } catch {
+    /* feedback is advisory: never let it break a recall */
   }
   // Folding: what left the window is not lost. Fire-and-forget so a recall never
   // waits on a write; a failure is reported through the logger, never through the

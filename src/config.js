@@ -221,6 +221,19 @@ export const DEFAULT_CONFIG = Object.freeze({
     // v1.7.0 (M1): how many raw tail turns `getLatestHandoffSummary()` carries.
     // Bounded 3..5: fewer loses the thread, more is a second transcript.
     handoffSummaryTurns: 4,
+    // v1.7.1: which of the two prompt contracts this engine serves.
+    //  - `task`  (default): the model is doing a build/debug task. It needs the
+    //    CURRENT state (repo HEAD, window pressure), not a stream of memory hints —
+    //    so hints that never earn a recall go quiet after N showings, and a compact
+    //    `[Task State]` line is injected instead.
+    //  - `expert`: the model is meant to use memory actively. Every hint stays on and
+    //    no task-state line is added.
+    mode: 'task',
+    // Shown N times with zero recalls → one-way silence (task mode only).
+    hintsIdleSilenceAfter: 8,
+    // The `[Task State]` line (task mode only). `maxChars` is a hard cap: this line
+    // sits in the volatile tail and must never grow into a status dump.
+    statePointer: { enabled: true, maxChars: 300 },
     coldStartInjectRecentTurns: true,
     // REMOVED in v1.5.3: `minInjectConfidence`. It never demonstrably saved tokens
     // (0.6 vs 0 produced byte-identical payloads) and every hit-shaping pass is a
@@ -845,6 +858,30 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
       ? defaults.context.coldStartInjectRecentTurns
       : contextIn.coldStartInjectRecentTurns,
     'context.coldStartInjectRecentTurns',
+  );
+  // v1.7.1: task vs expert is a CONTRACT choice, so it is an enum (a typo must fail
+  // fast, not silently default to "task" and mute hints the user wanted).
+  const contextMode = requireEnum(
+    contextIn.mode === undefined ? defaults.context.mode : contextIn.mode,
+    'context.mode',
+    ['task', 'expert'],
+  );
+  const contextHintsIdleSilenceAfter = requireInteger(
+    contextIn.hintsIdleSilenceAfter === undefined
+      ? defaults.context.hintsIdleSilenceAfter
+      : contextIn.hintsIdleSilenceAfter,
+    'context.hintsIdleSilenceAfter',
+    { min: 1, max: 100 },
+  );
+  const statePointerIn = contextIn.statePointer ?? {};
+  const statePointerEnabled = requireBoolean(
+    statePointerIn.enabled === undefined ? defaults.context.statePointer.enabled : statePointerIn.enabled,
+    'context.statePointer.enabled',
+  );
+  const statePointerMaxChars = requireInteger(
+    statePointerIn.maxChars === undefined ? defaults.context.statePointer.maxChars : statePointerIn.maxChars,
+    'context.statePointer.maxChars',
+    { min: 60, max: 2000 },
   );
   // REMOVED KEY (v1.5.3), loud on purpose: nested groups normally ignore unknown
   // keys, but silently ignoring a removed confidence knob would let a profile run
@@ -1477,6 +1514,10 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
       // v1.6.3 cold-start injection switches (independent booleans).
       coldStartInjectSummary: contextColdStartInjectSummary,
       handoffSummaryTurns: contextHandoffSummaryTurns,
+      // v1.7.1 task/expert contract + the two task-mode behaviours it gates.
+      mode: contextMode,
+      hintsIdleSilenceAfter: contextHintsIdleSilenceAfter,
+      statePointer: { enabled: statePointerEnabled, maxChars: statePointerMaxChars },
       coldStartInjectRecentTurns: contextColdStartInjectRecentTurns,
       // v1.5.0 routing knobs below; v1.5.3 removed minInjectConfidence entirely.
       autoSpaceFollow: contextAutoSpaceFollow,

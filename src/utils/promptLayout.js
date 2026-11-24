@@ -16,8 +16,20 @@
 export const BLOCK_MARKER = '[Memory Blocks]';
 export const ACTIVE_TASK_MARKER = '[Active Task]';
 export const POINTER_MARKER = '[Memory Index]';
+// v1.7.1: the CURRENT-STATE line (task mode). It is the most volatile thing in the
+// prompt (window pressure changes every turn), so it goes LAST — after every other
+// volatile section — and never before the block marker.
+export const STATE_MARKER = '[Task State]';
 
-export function composePrompt({ rules = '', activeTask = '', map = '', hints = '', blocks = '', pointers = '' } = {}) {
+export function composePrompt({
+  rules = '',
+  activeTask = '',
+  map = '',
+  hints = '',
+  blocks = '',
+  pointers = '',
+  stateLine = '',
+} = {}) {
   const parts = [String(rules).trim()];
   // The active task sits at the very top of the memory section: a new session must
   // know what it was doing before it reads anything else.
@@ -30,6 +42,9 @@ export function composePrompt({ rules = '', activeTask = '', map = '', hints = '
   // v1.6.9 (module 3): index pointers sit UNDER the hints — both are per-turn and
   // both must stay after the block marker so the cacheable prefix never moves.
   if (String(pointers).trim()) parts.push(`${POINTER_MARKER}\n${String(pointers).trim()}`);
+  // v1.7.1: the task-state line changes on almost every turn, so it must be the very
+  // last section — everything above it stays byte-identical for the prefix cache.
+  if (String(stateLine).trim()) parts.push(`${STATE_MARKER}\n${String(stateLine).trim()}`);
   return parts.filter(Boolean).join('\n\n');
 }
 
@@ -68,6 +83,26 @@ export function renderPointers(entries = [], { maxChars = 300 } = {}) {
     used += line.length + 1;
   }
   return lines.join('\n');
+}
+
+/**
+ * v1.7.1: render the `[Task State]` body.
+ *
+ * Contract: ONE line, `·`-separated, hard-capped by `maxChars`. This exists because a
+ * build/debug task needs "where am I right now" (repo HEAD, window pressure), while
+ * memory summarises where it has BEEN. Anything that does not fit the budget is cut,
+ * not wrapped — a status dump in the prompt tail is worse than a short line.
+ */
+export function renderStateLine(fields = {}, { maxChars = 300 } = {}) {
+  const budget = Math.max(0, Number(maxChars) || 0);
+  const parts = [];
+  for (const value of Object.values(fields ?? {})) {
+    const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+    if (text) parts.push(text);
+  }
+  const line = parts.join(' · ');
+  if (budget > 0 && line.length > budget) return line.slice(0, Math.max(0, budget - 1)) + '…';
+  return line;
 }
 
 /** Map view: tag names + counts only, never event bodies. */

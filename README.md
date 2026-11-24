@@ -7,7 +7,7 @@
 
 | | |
 | --- | --- |
-| 版本 | **1.7.0** |
+| 版本 | **1.7.1** |
 | 包名 | `dsh-layers-hippocampus` |
 | 仓库 | <https://github.com/382quaii/dsh-Layers-Hippocampus> |
 | 许可证 | MIT |
@@ -124,6 +124,21 @@
   `capabilities.externalSeams` 会如实报告 `{wired, source}`，所以「没装」是可见事实。
   **高峰期不丢任务**：LLM 蒸馏在高峰只被写入持久化队列并在谷时唤醒，不是跳过。
 
+### 提示预算治理：任务 / 专家模式（1.7.1）
+
+记忆插件过去只回答「记住什么」，不回答「该不该现在说」。1.7.1 把注入面收紧：
+
+- **摘要卫生（常开）**：注入的摘要会先去掉写那一刻的簿记数字（`events 348`、`reviews due 337`、
+  版本号），再补一个 `(snapshot …)` 时间戳。**带教训的数字不会被删**——`854,668 + 256,000 >
+  1,048,576` 这类结论原样保留。
+- **提示标签单向静默（任务模式）**：同一标签连续 `context.hintsIdleSilenceAfter`（默认 8）次出现
+  且一次都没换来 `recall`，就永久不再出现；之后偶然被召回也不会自动复活。
+  看不出来源时用 `/memory status` 查看被静默的标签。
+- **`[Task State]` 当前状态行（任务模式）**：Prompt 末尾一行
+  `repo@branch · HEAD <sha7> · window 291k/1048k (host)`，不 spawn git、硬上限 300 字符。
+- **`context.mode`**：`task`（默认）启用上面两项；`expert` 保留全部提示、不注入状态行。
+  设置页「上下文窗口」可切换，简洁模式下同样可改。
+
 ### 全链路记忆：写入归并 / 检索联想 / 自动指针（1.6.9）
 
 - **写入时归并实体**：`entity:` 标签先查别名字典，再按**子串包含**（已有 `entity:红薯`，写入
@@ -232,7 +247,7 @@ raw 层提供三档，覆盖从“只留关键”到“全留”：
 pnpm add dsh-layers-hippocampus
 
 # 或从 GitHub 指定 tag
-pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.7.0"
+pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.7.1"
 ```
 
 ### 2. 挂到 profile
@@ -303,7 +318,7 @@ node scripts/wait-for-routes.mjs
 ### 6. 验证
 
 ```bash
-npm test        # 进程内全量用例（548 个）
+npm test        # 进程内全量用例（555 个）
 npm run check   # 语法检查 + 全量测试
 ```
 

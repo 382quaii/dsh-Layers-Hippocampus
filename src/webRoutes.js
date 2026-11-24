@@ -98,6 +98,11 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   'context.autoInjectIndex.maxChars',
   // v1.6.0 cold-start injection switches (independent; both default on since 1.6.3).
   'context.handoffSummaryTurns',
+  // v1.7.1: the task/expert contract switch and the two task-mode behaviours it gates.
+  'context.mode',
+  'context.hintsIdleSilenceAfter',
+  'context.statePointer.enabled',
+  'context.statePointer.maxChars',
   'context.coldStartInjectSummary',
   'context.coldStartInjectRecentTurns',
   // v1.5.6 L2 multi-merge tunables (offline maintain phase).

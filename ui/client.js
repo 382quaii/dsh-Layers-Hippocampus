@@ -2531,6 +2531,7 @@
         // v1.6.7 M1: visible in the 上下文窗口 card in both modes, so it must also be
         // in the simple-mode allowlist — a control that renders but never saves is a lie.
         'context.injectMode',
+        'context.mode',
         'raw.mode',
         'raw.maxTotalMb',
         'raw.compressionEngine',
@@ -2643,6 +2644,10 @@
             target: Number(config.context.target),
             injectPrompt: Boolean(config.context.injectPrompt),
             injectMode: config.context && config.context.injectMode === 'full' ? 'full' : 'index',
+            // v1.7.1: default to TASK — a build session must not be fed hints forever.
+            mode: config.context && config.context.mode === 'expert' ? 'expert' : 'task',
+            hintsIdleSilenceAfter: Number((config.context && config.context.hintsIdleSilenceAfter) ?? 8),
+            statePointer: (config.context && config.context.statePointer) || { enabled: true, maxChars: 300 },
             // v1.5.0 physical routing + session handoff. Read with defaults so an
             // older Host half that has not learned these keys yet still renders.
             autoSpaceFollow: Boolean((config.context && config.context.autoSpaceFollow) ?? false),
@@ -3034,6 +3039,9 @@
             'context.target': Number(draft.context.target),
             'context.injectPrompt': Boolean(draft.context.injectPrompt),
             'context.injectMode': draft.context.injectMode === 'full' ? 'full' : 'index',
+            'context.mode': draft.context.mode === 'expert' ? 'expert' : 'task',
+            'context.hintsIdleSilenceAfter': Number(draft.context.hintsIdleSilenceAfter),
+            'context.statePointer.enabled': Boolean(draft.context.statePointer && draft.context.statePointer.enabled),
             'context.autoSpaceFollow': Boolean(draft.context.autoSpaceFollow),
             'context.autoRolloverEnabled': Boolean(draft.context.autoRolloverEnabled),
             'context.coldStartInjectSummary': Boolean(draft.context.coldStartInjectSummary),
@@ -3600,6 +3608,37 @@
                 { value: 'full', label: '全文（旧版渲染）' },
               ],
               onChange: (value) => edit('context.injectMode', value),
+              disabled,
+            }),
+            // v1.7.1: the task/expert switch. It gates TWO behaviours (hint silence and
+            // the state line); the summary-hygiene clean-up above is always on.
+            h(Select, {
+              label: '运行模式（context.mode）',
+              hint: '任务（推荐，构建/调试）：提示标签连续 N 次且一次都没换来 recall 就单向静默，并注入一行「当前状态」（仓库 HEAD / 窗口压力）。专家：每个提示都保留，不注入状态行。',
+              value: draft.context.mode === 'expert' ? 'expert' : 'task',
+              options: [
+                { value: 'task', label: '任务（静默无效提示 + 当前状态行）' },
+                { value: 'expert', label: '专家（全量提示，不静默）' },
+              ],
+              onChange: (value) => edit('context.mode', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '提示静默阈值（context.hintsIdleSilenceAfter）',
+              hint: '仅任务模式生效：同一标签连续展示这么多次且从未带来一次 recall，就永久不再出现。默认 8。',
+              value: draft.context.hintsIdleSilenceAfter,
+              min: 1,
+              max: 100,
+              step: 1,
+              onChange: (value) => edit('context.hintsIdleSilenceAfter', value),
+              disabled: disabled || (draft.context.mode === 'expert'),
+            }),
+            h(Toggle, {
+              label: '注入当前状态行（context.statePointer.enabled）',
+              hint: '任务模式有效：在 Prompt 末尾注入一行「仓库 HEAD · 窗口压力」，总长 ≤ maxChars。',
+              checked: Boolean(draft.context.statePointer && draft.context.statePointer.enabled),
+              onChange: (value) =>
+                edit('context.statePointer', { ...(draft.context.statePointer || {}), enabled: value }),
               disabled,
             }),
           ),
