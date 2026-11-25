@@ -4,6 +4,28 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.7.2] — 2026-11-25
+
+**设置页结构重构：17 张卡片按用途收进 5 个分组，左侧竖排目录导航；能力与配置一字未改。**
+
+- **Changed — 设置页从「一条长滚动」变成「分组 + 目录」**：`ui/client.js` 里 17 个
+  `Section` 按用途分成五组——`identity`（身份与行为）、`context`（上下文与注入）、
+  `ingest`（摄入与蒸馏）、`retention`（留存与归档）、`space`（空间与存储）。
+  每组由 `SettingsGroup` 渲染（组名 + 一句说明 + 卡片原样），卡片本身**逐字搬进**
+  `SettingsIdentityGroup` / `SettingsContextGroup` / `SettingsIngestGroup` /
+  `SettingsRetentionGroup` / `SettingsSpaceGroup`，控件、校验、跨字段联动一个字没改。
+- **Changed — 左侧竖排目录**：`SettingsNav` 是**独立滚动的固定栏**——外面的 shell 高度在挂载时量一次
+  （`window.innerHeight - shell.top - 24`，`resize` 时重量），目录与卡片各自拥有滚动条，
+  点目录滚卡片、滚卡片目录不动。最初用 `position: sticky` 实现，实际**不生效**：宿主 shell
+  的 overflow 包裹层不是滚动容器，sticky 子元素会随内容一起滚走。滚动高亮改用
+  `IntersectionObserver`（`root` 指向卡片滚动容器，`rootMargin: '-8% 0px -70% 0px'`）。
+- **Changed — 表单宽度**：`maxWidth` 720 → 980，目录 148px 固定、内容 `flex: 1 1 460px`，
+  窄屏自动折行（`flexWrap: 'wrap'`）。
+- **保持不变 — 简洁模式**：仍然只显示四组（`identity` / `context` / `retention` / `space`），
+  `ingest` 整组不渲染；`hidden: simpleMode` 语义与 `SIMPLE_PATCH_KEYS` 白名单完全照旧。
+- **Tests**：`test/v163.ui.test.js` 新增 `settingsBody()`，把 `MemorySettings` 与五个分组
+  组件体拼起来断言卡片存在/被隐藏，避免结构重构后测试假绿或假红。全量 **555/555**（87 个测试文件）。
+
 ## [1.7.1] — 2026-11-24
 
 **把注入面从“多给点信息”改成“只给还没过期的信息”：摘要卫生常开，提示标签单向静默，

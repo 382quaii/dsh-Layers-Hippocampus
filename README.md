@@ -7,7 +7,7 @@
 
 | | |
 | --- | --- |
-| 版本 | **1.7.1** |
+| 版本 | **1.7.2** |
 | 包名 | `dsh-layers-hippocampus` |
 | 仓库 | <https://github.com/382quaii/dsh-Layers-Hippocampus> |
 | 许可证 | MIT |
@@ -123,6 +123,12 @@
   `{delivered:false, reason:'no-notifier'}`，既不发明投递通道，也不会因缺插件抛错。
   `capabilities.externalSeams` 会如实报告 `{wired, source}`，所以「没装」是可见事实。
   **高峰期不丢任务**：LLM 蒸馏在高峰只被写入持久化队列并在谷时唤醒，不是跳过。
+
+### 设置页：左侧目录 + 五个分组（1.7.2）
+
+17 张卡片按用途收进五组，左侧竖排目录固定在视口、点击平滑跳转、滚动自动高亮：
+**身份与行为** / **上下文与注入** / **摄入与蒸馏** / **留存与归档** / **空间与存储**。
+卡片本身逐字搬迁，控件与校验行为零变化；简洁模式仍只显示四组（`ingest` 整组不渲染）。
 
 ### 提示预算治理：任务 / 专家模式（1.7.1）
 
@@ -247,7 +253,7 @@ raw 层提供三档，覆盖从“只留关键”到“全留”：
 pnpm add dsh-layers-hippocampus
 
 # 或从 GitHub 指定 tag
-pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.7.1"
+pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.7.2"
 ```
 
 ### 2. 挂到 profile

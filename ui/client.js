@@ -2923,6 +2923,978 @@
         );
       }
 
+      /**
+       * v1.7.2: the settings page is no longer one 1200-line function. Five groups, one rail
+       * item each; `visibleInSimple` makes the 简洁模式 promise (身份 / 上下文窗口 / 存储迁移 /
+       * 原始回合留存) declarative instead of a `simpleMode &&` scattered across the JSX.
+       */
+      const SETTINGS_GROUPS = [
+        { id: 'identity', label: '身份与行为', hint: '人格锚点 · 空闲行为', visibleInSimple: true },
+        { id: 'context', label: '上下文与注入', hint: '窗口记账 · 注入形态 · 运行模式 · 检索 · 调度', visibleInSimple: true },
+        { id: 'ingest', label: '摄入与蒸馏', hint: '打标 · 工具裁剪 · 能力开关 · Dream / L2 合并 / L2.5', visibleInSimple: false },
+        { id: 'retention', label: '留存与归档', hint: 'raw 冷热分层 · 标签树 · 老化 · 存储图谱 · 删除复习', visibleInSimple: true },
+        { id: 'space', label: '空间与存储', hint: '多空间路由 · 会话交接 · 数据目录迁移', visibleInSimple: true },
+      ];
+
+      /**
+       * v1.7.2 settings refactor: the "身份与行为" group body. Moved verbatim out of
+       * MemorySettings; every name it used is destructured from the shared bag, so not a
+       * single character inside the JSX had to change.
+       */
+      function SettingsIdentityGroup(bag) {
+        const { activeSpace, state, configState, serverConfig, shellState, draft, status, saving, settingsMode, simpleMode, escapeStatus, escapeBusy, statsPayload, sessionPanel, reportedSpace, displayedSpace, edit, disabled, resetHandoffState } = bag;
+        return [
+          h(
+            Section,
+            { title: '身份' },
+            h(Select, {
+              label: '事件时间策略（identity.eventTimePolicy）',
+              hint: 'content：由内容推导；explicit：调用方必须提供；ingest：使用写入时刻。',
+              value: draft.eventTimePolicy,
+              options: EVENT_TIME_OPTIONS,
+              onChange: (value) => edit('eventTimePolicy', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            { title: '行为', hidden: simpleMode },
+            h(Toggle, {
+              label: '空闲时自动整理（Dream）',
+              hint: `连续 ${draft.dreamIdleMinutes} 分钟没有记忆工具调用后跑一次维护（与 Cron 共用同一入口）。`,
+              checked: draft.enableDream,
+              onChange: (value) => edit('enableDream', value),
+              disabled,
+            }),
+            h(Toggle, {
+              label: '反思提示（Reflection）',
+              hint: '连续工具调用达到阈值后，在提示里追加自我检查。',
+              checked: draft.enableReflection,
+              onChange: (value) => edit('enableReflection', value),
+              disabled,
+            }),
+            h(Toggle, {
+              label: '提示词简报（briefing）',
+              hint: '在系统提示里放入一行记忆状态摘要。',
+              checked: draft.briefing,
+              onChange: (value) => edit('briefing', value),
+              disabled,
+            }),
+            h(Toggle, {
+              label: '提示注入（promptSection）',
+              hint: '注册 memory 提示段，教模型何时写、何时读。',
+              checked: draft.promptSection,
+              onChange: (value) => edit('promptSection', value),
+              disabled,
+            }),
+            h(Toggle, {
+              label: '启动后立即维护（autoMaintainOnBoot）',
+              checked: draft.autoMaintainOnBoot,
+              onChange: (value) => edit('autoMaintainOnBoot', value),
+              disabled,
+            }),
+          ),
+          // Tool schema pruning (v1.5.3): every enabled tool pays its JSON schema
+          // in prompt tokens on every turn. Disabled entries are validated server
+          // side (unknown/core names abort activation), so the save cannot lie.
+        ];
+      }
+
+      /**
+       * v1.7.2 settings refactor: the "上下文与注入" group body. Moved verbatim out of
+       * MemorySettings; every name it used is destructured from the shared bag, so not a
+       * single character inside the JSX had to change.
+       */
+      function SettingsContextGroup(bag) {
+        const { activeSpace, state, configState, serverConfig, shellState, draft, status, saving, settingsMode, simpleMode, escapeStatus, escapeBusy, statsPayload, sessionPanel, reportedSpace, displayedSpace, edit, disabled, resetHandoffState } = bag;
+        return [
+          h(
+            Section,
+            { title: '上下文窗口' },
+            h(Field, {
+              label: '预算（token）',
+              hint: '日常 4000；长视频或重构时建议 8000 - 12000。',
+              value: draft.context.maxTokens,
+              min: 256,
+              max: 1000000,
+              step: 256,
+              onChange: (value) => edit('context.maxTokens', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '单次召回注入上限（token）',
+              hint: '一次 recall 返回 JSON 的硬上限（默认 4000，256 – 100000）。超限会截断并带 truncated:true，绝不静默超发。',
+              value: draft.context.maxInjectTokens,
+              min: 256,
+              max: 100000,
+              step: 256,
+              onChange: (value) => edit('context.maxInjectTokens', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '淘汰阈值',
+              hint: '占用超过该比例即开始淘汰，必须大于收敛目标。',
+              value: draft.context.threshold,
+              min: 0.1,
+              max: 0.99,
+              step: 0.01,
+              onChange: (value) => edit('context.threshold', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '收敛目标',
+              value: draft.context.target,
+              min: 0.05,
+              max: 0.98,
+              step: 0.01,
+              onChange: (value) => edit('context.target', value),
+              disabled,
+            }),
+            h(Toggle, {
+              label: '注入上下文预算段（context.injectPrompt）',
+              checked: draft.context.injectPrompt,
+              onChange: (value) => edit('context.injectPrompt', value),
+              disabled,
+            }),
+            // v1.6.7 M1: pointer lines by default. `full` is kept as the escape hatch
+            // for anyone who wants the old body rendering back.
+            h(Select, {
+              label: '记忆块注入形态（context.injectMode）',
+              hint: '索引（推荐）：每块只注入 eventId + 标签 + 标题，正文按需用 recall 取；占用已用窗口的 1/10 不到。全文：沿用旧版渲染，正文直接进 Prompt（更费 Token）。',
+              value: draft.context.injectMode === 'full' ? 'full' : 'index',
+              options: [
+                { value: 'index', label: '索引（eventId + 标签 + 标题）' },
+                { value: 'full', label: '全文（旧版渲染）' },
+              ],
+              onChange: (value) => edit('context.injectMode', value),
+              disabled,
+            }),
+            // v1.7.1: the task/expert switch. It gates TWO behaviours (hint silence and
+            // the state line); the summary-hygiene clean-up above is always on.
+            h(Select, {
+              label: '运行模式（context.mode）',
+              hint: '任务（推荐，构建/调试）：提示标签连续 N 次且一次都没换来 recall 就单向静默，并注入一行「当前状态」（仓库 HEAD / 窗口压力）。专家：每个提示都保留，不注入状态行。',
+              value: draft.context.mode === 'expert' ? 'expert' : 'task',
+              options: [
+                { value: 'task', label: '任务（静默无效提示 + 当前状态行）' },
+                { value: 'expert', label: '专家（全量提示，不静默）' },
+              ],
+              onChange: (value) => edit('context.mode', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '提示静默阈值（context.hintsIdleSilenceAfter）',
+              hint: '仅任务模式生效：同一标签连续展示这么多次且从未带来一次 recall，就永久不再出现。默认 8。',
+              value: draft.context.hintsIdleSilenceAfter,
+              min: 1,
+              max: 100,
+              step: 1,
+              onChange: (value) => edit('context.hintsIdleSilenceAfter', value),
+              disabled: disabled || (draft.context.mode === 'expert'),
+            }),
+            h(Toggle, {
+              label: '注入当前状态行（context.statePointer.enabled）',
+              hint: '任务模式有效：在 Prompt 末尾注入一行「仓库 HEAD · 窗口压力」，总长 ≤ maxChars。',
+              checked: Boolean(draft.context.statePointer && draft.context.statePointer.enabled),
+              onChange: (value) =>
+                edit('context.statePointer', { ...(draft.context.statePointer || {}), enabled: value }),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            { title: '检索', hint: '默认 topK 不得超过检索上限。', hidden: simpleMode },
+            h(Field, {
+              label: '默认 topK（retrieval.topK）',
+              value: draft.retrievalTopK,
+              min: 1,
+              max: 1000,
+              step: 1,
+              onChange: (value) => edit('retrievalTopK', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '检索上限（maxRecallTopK）',
+              value: draft.maxRecallTopK,
+              min: 1,
+              max: 1000,
+              step: 1,
+              onChange: (value) => edit('maxRecallTopK', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            { title: '调度', hidden: simpleMode },
+            h(TextInput, {
+              label: '维护 Cron（5 段）',
+              hint: '例：0 */6 * * *（每 6 小时）。非法表达式会被后端拒绝。',
+              value: draft.maintenanceCron,
+              onChange: (value) => edit('maintenanceCron', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '空闲判定（分钟）',
+              value: draft.dreamIdleMinutes,
+              min: 1,
+              max: 525600,
+              step: 1,
+              onChange: (value) => edit('dreamIdleMinutes', value),
+              disabled,
+            }),
+          ),
+        ];
+      }
+
+      /**
+       * v1.7.2 settings refactor: the "摄入与蒸馏" group body. Moved verbatim out of
+       * MemorySettings; every name it used is destructured from the shared bag, so not a
+       * single character inside the JSX had to change.
+       */
+      function SettingsIngestGroup(bag) {
+        const { activeSpace, state, configState, serverConfig, shellState, draft, status, saving, settingsMode, simpleMode, escapeStatus, escapeBusy, statsPayload, sessionPanel, reportedSpace, displayedSpace, edit, disabled, resetHandoffState } = bag;
+        return [
+          h(
+            Section,
+            {
+              title: '入库自动打标（Pre-Ingest Tagging）',
+              hint: '模型手传 tags 优先；未传 tags 时由引擎从内容形态提取 1–2 个锚点（错误类型 / errno / 代码块语言 / HTTP 状态 / 文件路径 / 任务语句）。raw 保持纯净，锚点直接进 L1.5 索引；提取不到只记 MEM_E_AUTO_TAG_MISS 警告，不阻断写入。',
+              hidden: simpleMode,
+            },
+            h(Toggle, {
+              label: '启用引擎侧自动打标（tagging.autoTag）',
+              checked: draft.tagging.autoTag,
+              onChange: (value) => edit('tagging.autoTag', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '最多自动标签数（tagging.maxTags）',
+              hint: '1 – 5，默认 2。只影响未手传 tags 的写入。',
+              value: draft.tagging.maxTags,
+              min: 1,
+              max: 5,
+              step: 1,
+              onChange: (value) => edit('tagging.maxTags', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            {
+              title: '工具 schema 裁剪（tools.disabled）',
+              hint: '每个工具定义都会在每轮提示中占用固定 schema token。裁剪低频工具可降低底座税；核心工具 remember / recall / admin 不可关闭。保存后写回配置，下次宿主启动（或重载插件）时真正跳过注册。',
+              hidden: simpleMode,
+            },
+            h(
+              'div',
+              { style: { ...labelStyle, marginBottom: 6 } },
+              `已裁剪 ${Array.isArray(draft.tools.disabled) ? draft.tools.disabled.length : 0} 个 · 下次启动注册 ${TOOL_CATALOG.length - (Array.isArray(draft.tools.disabled) ? draft.tools.disabled.length : 0)} 个（核心 3 个始终保留）`,
+            ),
+            TOOL_CATALOG.map((tool) => {
+              const disabledList = Array.isArray(draft.tools.disabled) ? draft.tools.disabled : [];
+              const enabled = tool.core || !disabledList.includes(tool.name);
+              return h(Toggle, {
+                key: tool.name,
+                label: `${tool.name}（${tool.core ? '核心 · 不可关闭' : '低频 · 可裁剪'}）`,
+                hint: `${tool.hint}${tool.core ? '' : ' 关闭后该工具不注册、提示词也不再宣传它。'}`,
+                checked: enabled,
+                disabled: tool.core || disabled,
+                onChange: (value) => {
+                  const next = new Set(Array.isArray(draft.tools.disabled) ? draft.tools.disabled : []);
+                  if (value) next.delete(tool.name);
+                  else next.add(tool.name);
+                  edit('tools.disabled', [...next]);
+                },
+              });
+            }),
+          ),
+          h(
+            Section,
+            {
+              title: '可选能力（微内核边界）',
+              hint: '关闭多空间后，本体退化为严格单空间核心：targetSpaceId 只能是 default，空间工具与 /spaces、/transfer 路由返回 MEM_E_FEATURE_DISABLED。跨空间迁移必须同时启用多空间。保存后立即生效；工具注册在下次宿主启动/重载时真正移除。',
+              hidden: simpleMode,
+            },
+            h(Toggle, {
+              label: '启用多空间路由（features.multiSpace）',
+              checked: draft.features.multiSpace,
+              onChange: (value) => edit('features.multiSpace', value),
+              disabled,
+            }),
+            h(Toggle, {
+              label: '允许跨空间迁移（features.crossSpaceTransfer）',
+              hint: '关闭后 space_transfer / transfer_to_global 工具不再注册，迁移路由直接拒绝。',
+              checked: draft.features.crossSpaceTransfer,
+              onChange: (value) => edit('features.crossSpaceTransfer', value),
+              disabled: disabled || !draft.features.multiSpace,
+            }),
+            h(Toggle, {
+              label: '跨空间召回聚合（features.crossSpaceRecall，默认关）',
+              hint: '开启后每次 recall 会查询所有已打开空间并合并命中（月记可遮住它拥有的其他空间事件）；代价是每次召回多查 N 个空间。',
+              checked: draft.features.crossSpaceRecall,
+              onChange: (value) => edit('features.crossSpaceRecall', value),
+              disabled: disabled || !draft.features.multiSpace,
+            }),
+          ),
+          simpleMode
+            ? null
+            : h(OrchestratorInstallCard, {
+                installed: Boolean(state.payload && state.payload.capabilities && state.payload.capabilities.spaces === true),
+                // v1.6.7 (M6): render WHY it is off, so "I enabled multiSpace but nothing
+                // happened" is answered right here instead of looking like a silent bug.
+                reason:
+                  (state.payload && state.payload.capabilities && state.payload.capabilities.multiSpaceReason) ||
+                  (state.payload && state.payload.capabilities && state.payload.capabilities.spaces === true
+                    ? 'active'
+                    : 'orchestrator-missing'),
+              }),
+          h(
+            Section,
+            {
+              title: '离线 Dream（LLM 蒸馏）',
+              hint: 'Dream 在空闲/补偿时蒸馏同标签经验；失败会本地降级并记 MEM_E_DREAM_LLM_FALLBACK。Endpoint / Model / API Key 只从 profile 配置或 DSH_DREAM_LLM_* 环境变量注入，绝不会下发到浏览器，也不能在此页填写。',
+              hidden: simpleMode,
+            },
+            h(Toggle, {
+              label: '启用 LLM 提炼（dream.useLlm）',
+              hint: '关闭后只用本地启发式合并（时间范围 + 去重文本），不发任何网络请求。',
+              checked: draft.dream.useLlm,
+              onChange: (value) => edit('dream.useLlm', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '成组最少条数（dream.minGroupSize）',
+              value: draft.dream.minGroupSize,
+              min: 2,
+              max: 50,
+              step: 1,
+              onChange: (value) => edit('dream.minGroupSize', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '单次最多蒸馏组数（dream.maxGroupsPerRun）',
+              value: draft.dream.maxGroupsPerRun,
+              min: 1,
+              max: 50,
+              step: 1,
+              onChange: (value) => edit('dream.maxGroupsPerRun', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '摘要字数上限（dream.maxSummaryChars）',
+              value: draft.dream.maxSummaryChars,
+              min: 40,
+              max: 2000,
+              step: 20,
+              onChange: (value) => edit('dream.maxSummaryChars', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '单条来源字数上限（dream.maxSourceChars）',
+              value: draft.dream.maxSourceChars,
+              min: 80,
+              max: 4000,
+              step: 40,
+              onChange: (value) => edit('dream.maxSourceChars', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '每组最多来源条数（dream.maxEventsPerGroup）',
+              value: draft.dream.maxEventsPerGroup,
+              min: 2,
+              max: 50,
+              step: 1,
+              onChange: (value) => edit('dream.maxEventsPerGroup', value),
+              disabled,
+            }),
+            h(Field, {
+              label: 'LLM 超时（毫秒，dream.llmTimeoutMs）',
+              value: draft.dream.llmTimeoutMs,
+              min: 500,
+              max: 120000,
+              step: 500,
+              onChange: (value) => edit('dream.llmTimeoutMs', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '熔断阈值（dream.failureThreshold）',
+              hint: '连续失败达到该次数即熔断 LLM，冷却期内只本地降级。',
+              value: draft.dream.failureThreshold,
+              min: 1,
+              max: 20,
+              step: 1,
+              onChange: (value) => edit('dream.failureThreshold', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '熔断冷却（分钟，dream.cooldownMinutes）',
+              value: draft.dream.cooldownMinutes,
+              min: 1,
+              max: 1440,
+              step: 1,
+              onChange: (value) => edit('dream.cooldownMinutes', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '会话开始时补偿阈值（小时，dream.compensateAfterHours）',
+              hint: '超过该时长没有 Dream 且价格窗口允许时，会话开始会补跑一次。',
+              value: draft.dream.compensateAfterHours,
+              min: 1,
+              max: 720,
+              step: 1,
+              onChange: (value) => edit('dream.compensateAfterHours', value),
+              disabled,
+            }),
+            h(Toggle, {
+              label: '只在低谷窗口跑 LLM Dream（dream.onlyLowValley）',
+              hint: '北京时间工作日 09–12、14–18 为高峰；其余时段与周末才发起 LLM 调用。关闭后任何时段都可能调用。',
+              checked: draft.dream.onlyLowValley,
+              onChange: (value) => edit('dream.onlyLowValley', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            {
+              title: 'L2 多合一蒸馏',
+              hint: '维护时把同一标签下的重复经验合并成一条：pinned 只与 pinned 合并、普通只与普通合并，永不混组；全局大标签只保留为 meta.global_tags，不写入倒排索引。原始记录标记为已合并（state/l2-merge.json），仍可追溯。',
+              hidden: simpleMode,
+            },
+            h(Toggle, {
+              label: '启用 L2 合并（l2Merge.enabled）',
+              checked: draft.l2Merge.enabled,
+              onChange: (value) => edit('l2Merge.enabled', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '成组最少条数（l2Merge.minGroupSize）',
+              value: draft.l2Merge.minGroupSize,
+              min: 2,
+              max: 20,
+              step: 1,
+              onChange: (value) => edit('l2Merge.minGroupSize', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '单次最多合并组数（l2Merge.maxGroupsPerRun）',
+              value: draft.l2Merge.maxGroupsPerRun,
+              min: 1,
+              max: 50,
+              step: 1,
+              onChange: (value) => edit('l2Merge.maxGroupsPerRun', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '合并文本字数上限（l2Merge.maxSummaryChars）',
+              value: draft.l2Merge.maxSummaryChars,
+              min: 100,
+              max: 2000,
+              step: 20,
+              onChange: (value) => edit('l2Merge.maxSummaryChars', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            { title: 'L2.5 趋势隔离', hidden: simpleMode },
+            h(Field, {
+              label: '隔离期（天）',
+              value: draft.temp.ttlDays,
+              min: 1,
+              max: 3650,
+              step: 1,
+              suffix: '天',
+              onChange: (value) => edit('temp.ttlDays', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '晋升窗口（天）',
+              hint: '必须不大于隔离期。',
+              value: draft.temp.promotionWindowDays,
+              min: 0,
+              max: 3650,
+              step: 1,
+              suffix: '天',
+              onChange: (value) => edit('temp.promotionWindowDays', value),
+              disabled,
+            }),
+          ),
+        ];
+      }
+
+      /**
+       * v1.7.2 settings refactor: the "留存与归档" group body. Moved verbatim out of
+       * MemorySettings; every name it used is destructured from the shared bag, so not a
+       * single character inside the JSX had to change.
+       */
+      function SettingsRetentionGroup(bag) {
+        const { activeSpace, state, configState, serverConfig, shellState, draft, status, saving, settingsMode, simpleMode, escapeStatus, escapeBusy, statsPayload, sessionPanel, reportedSpace, displayedSpace, edit, disabled, resetHandoffState } = bag;
+        return [
+          h(
+            Section,
+            {
+              title: '原始回合留存（raw）',
+              hint: '只做取证，不参与索引；高价值/代码/报错/工具输出才会留，且有日/总量/保留期上限。',
+            },
+            h(Select, {
+              label: 'raw.mode',
+              hint: 'salience：只留高价值轮次；all：全留（仍受上限）；off：关闭 deep_raw。',
+              value: draft.rawMode,
+              options: [
+                { value: 'salience', label: 'salience — 只留高价值（默认）' },
+                { value: 'all', label: 'all — 全量（受预算限制）' },
+                { value: 'off', label: 'off — 不留 raw' },
+              ],
+              onChange: (value) => edit('rawMode', value),
+              disabled,
+            }),
+            simpleMode
+              ? null
+              : h(Field, {
+                  label: 'raw 最小显著度',
+                  value: draft.rawMinSalience,
+                  min: 0,
+                  max: 1,
+                  step: 0.05,
+                  onChange: (value) => edit('rawMinSalience', value),
+                  disabled,
+                }),
+            h(Field, {
+              label: 'raw 总量上限（MB）',
+              value: draft.rawMaxTotalMb,
+              min: 16,
+              max: 4096,
+              step: 16,
+              suffix: 'MB',
+              onChange: (value) => edit('rawMaxTotalMb', value),
+              disabled,
+            }),
+            simpleMode
+              ? null
+              : h(Field, {
+                  label: 'raw 保留期（天）',
+                  value: draft.rawRetentionDays,
+                  min: 1,
+                  max: 365,
+                  step: 1,
+                  suffix: '天',
+                  onChange: (value) => edit('rawRetentionDays', value),
+                  disabled,
+                }),
+            simpleMode
+              ? null
+              : h(Field, {
+                  label: '冷压缩阈值（raw.archiveAfterDays，天）',
+                  hint: '超过该天数的日分片会被按月合并为 .jsonl.gz（默认 7，必须小于保留期）。只有近 30 天零访问、且不含 pinned / status:handoff / 高频标签的分片才会被压缩；deep_raw 仍可流式读取。',
+                  value: draft.rawArchiveAfterDays,
+                  min: 1,
+                  max: 3650,
+                  step: 1,
+                  suffix: '天',
+                  onChange: (value) => edit('rawArchiveAfterDays', value),
+                  disabled,
+                }),
+            h(Select, {
+              label: '冷压缩引擎（raw.compressionEngine）',
+              hint:
+                (statsPayload && statsPayload.capabilities && statsPayload.capabilities.compression
+                  ? `当前运行时 Node ${statsPayload.capabilities.compression.node}：brotli ${statsPayload.capabilities.compression.brotli ? '可用' : '不可用'}，gzip ${statsPayload.capabilities.compression.gzip ? '可用' : '不可用'}，zstd ${statsPayload.capabilities.compression.zstd ? '可用' : '不可用'}。`
+                  : '') +
+                '全部为 Node 内置编解码器（无需下载或安装外部包）。Brotli 11 级为冷数据默认的极限压缩；Gzip/Zstd 仍可选。历史归档保持原格式，三种格式都可流式读取。',
+              value: draft.rawCompressionEngine,
+              options: [
+                { value: 'brotli', label: 'Brotli 11 级（Node 内置，默认，压缩率最高）' },
+                { value: 'gzip', label: 'Gzip（Node 内置，兼容性最好）' },
+                { value: 'zstd', label: 'Zstd（Node 内置，解压更快）' },
+              ],
+              onChange: (value) => edit('rawCompressionEngine', value),
+              disabled,
+            }),
+            simpleMode
+              ? null
+              : h(
+                  'div',
+                  { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', margin: '4px 0 10px' } },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      style: smallButtonStyle,
+                      disabled,
+                      onClick: () =>
+                        edit(
+                          'rawCompressionEngine',
+                          draft.rawCompressionEngine === 'brotli' ? 'gzip' : 'brotli',
+                        ),
+                    },
+                    draft.rawCompressionEngine === 'brotli' ? '切回 Gzip（兼容模式）' : '启用 Brotli 11 级（极限压缩）',
+                  ),
+                  h(
+                    'span',
+                    { style: { ...labelStyle, marginBottom: 0 } },
+                    draft.rawCompressionEngine === 'brotli'
+                      ? 'Brotli 11 级已选中：点击“保存全部”后，新归档使用 .jsonl.br。'
+                      : '当前未使用极限压缩：点击“保存全部”后切换，下个月归档生效。',
+                  ),
+                ),
+            simpleMode
+              ? null
+              : h(Field, {
+                  label: 'deep_raw 扫描回合上限（raw.maxScanTurns）',
+                  hint: 'deep_raw 从最新记录倒序最多扫描的回合数（默认 5000，下次 deep_raw 即生效）。调大可回溯更久但更慢；超出上限会 truncated=true 并在 notes 说明。',
+                  value: draft.rawMaxScanTurns,
+                  min: 500,
+                  max: 50000,
+                  step: 500,
+                  onChange: (value) => edit('rawMaxScanTurns', value),
+                  disabled,
+                }),
+          ),
+          h(
+            Section,
+            {
+              title: '标签树（L1.5 幽灵宽限）',
+              hint: '层级标签的生死节奏：root 永生、leaf 引用归零即死、mid 在宽限期内变"幽灵"（recall 只给元数据、引导 deep_raw），过期未复活才消亡。四个值都在下一次维护生效。',
+              hidden: simpleMode,
+            },
+            h(Slider, {
+              label: 'mid 半衰期倍率（tagTree.midHalfLifeMultiplier）',
+              hint: 'mid 半衰期 = 倍率 × leaf 半衰期（1 天）。默认 3：mid 比叶子多活 3 倍。调大→幽灵留存更久，历史更完整；调小→层级更快被清理。',
+              value: draft.tagTree.midHalfLifeMultiplier,
+              min: 1,
+              max: 10,
+              step: 0.5,
+              onChange: (value) => edit('tagTree.midHalfLifeMultiplier', value),
+              disabled,
+            }),
+            h(Slider, {
+              label: 'mid 宽限期（tagTree.midGracePeriodDays）',
+              hint: 'mid 失去最后一个叶子后的宽限天数（默认 30）。期内新叶子可立即复活它；期内召回只返回"存在模糊记忆"的元数据，绝不注入正文。',
+              value: draft.tagTree.midGracePeriodDays,
+              min: 7,
+              max: 180,
+              step: 1,
+              suffix: '天',
+              onChange: (value) => edit('tagTree.midGracePeriodDays', value),
+              disabled,
+            }),
+            h(Slider, {
+              label: '剪枝批大小（tagTree.pruneBatchSize）',
+              hint: '每次维护最多消费的待修剪叶子数（默认 100）。调小→死叶分批消失、队列落盘跨重启排空，避免一次维护风暴。',
+              value: draft.tagTree.pruneBatchSize,
+              min: 10,
+              max: 500,
+              step: 10,
+              onChange: (value) => edit('tagTree.pruneBatchSize', value),
+              disabled,
+            }),
+            h(Slider, {
+              label: 'leaf 衰减地板（tagTree.leafDecayFloor）',
+              hint: '0 = 只按引用归零死亡（严格 forget 驱动）；>0 时衰减低于该分数、又被排队的叶子会被修剪。0.05 ≈ 5 个叶子寿命后进入历史视图。',
+              value: draft.tagTree.leafDecayFloor,
+              min: 0,
+              max: 1,
+              step: 0.01,
+              onChange: (value) => edit('tagTree.leafDecayFloor', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            { title: '老化与活跃集合', hint: '这两个值同时是策略参数：写入 config 即进入 policy，下一次维护生效。', hidden: simpleMode },
+            h(Field, {
+              label: '记忆半衰期（decay.halfLifeDays）',
+              hint: '默认 30 天。调大能记住更久。',
+              value: draft.decayHalfLifeDays,
+              min: 7,
+              max: 365,
+              step: 1,
+              suffix: '天',
+              onChange: (value) => edit('decayHalfLifeDays', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '活跃标签上限（activeSet.cap）',
+              hint: '默认 200。多项目并行可调至 500（下次维护生效）。',
+              value: draft.activeSetCap,
+              min: 100,
+              max: 1000,
+              step: 50,
+              onChange: (value) => edit('activeSetCap', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            { title: '存储与图谱', hint: '存储预算只影响左上角环形图的阈值，不会删除任何数据。', hidden: simpleMode },
+            h(Field, {
+              label: '存储预算上限（MB）',
+              hint: '普通用户 50MB；重度用户可调至 200MB+。软上限：超限只在环形图标红，不删档。',
+              value: draft.storageBudgetMb,
+              min: 10,
+              max: 1000,
+              step: 10,
+              suffix: 'MB',
+              onChange: (value) => edit('storageBudgetMb', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '图谱最大边数（graphMaxEdges）',
+              hint: '保存后立即按新上限重新拉取 /api/hippocampus/graph 并重绘。',
+              value: draft.graphMaxEdges,
+              min: 100,
+              max: 2000,
+              step: 100,
+              onChange: (value) => edit('graphMaxEdges', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            { title: '删除与复习', hint: '两阶段删除先挂起，宽限期内 restore 可取消；复习排期由引擎推进。', hidden: simpleMode },
+            h(Field, {
+              label: '删除宽限期（小时）',
+              hint: '0 = 立即执行（旧行为）；默认 24 小时。',
+              value: draft.deleteGraceHours,
+              min: 0,
+              max: 168,
+              step: 1,
+              suffix: '小时',
+              onChange: (value) => edit('deleteGraceHours', value),
+              disabled,
+            }),
+            h(Toggle, {
+              label: '启用间隔重复复习（1,2,4,7,15,30 天）',
+              hint: 'reinforce 会让事件进入下一档；到期项由 maintain 汇总到 memory_admin action=reviews。',
+              checked: draft.reviewEnabled,
+              onChange: (value) => edit('reviewEnabled', value),
+              disabled,
+            }),
+          ),
+        ];
+      }
+
+      /**
+       * v1.7.2 settings refactor: the "空间与存储" group body. Moved verbatim out of
+       * MemorySettings; every name it used is destructured from the shared bag, so not a
+       * single character inside the JSX had to change.
+       */
+      function SettingsSpaceGroup(bag) {
+        const { activeSpace, state, configState, serverConfig, shellState, draft, status, saving, settingsMode, simpleMode, escapeStatus, escapeBusy, statsPayload, sessionPanel, reportedSpace, displayedSpace, edit, disabled, resetHandoffState } = bag;
+        return [
+          h(
+            Section,
+            {
+              title: '空间与会话交接（纯物理层）',
+              hint: '空间切换在面板顶部 SpaceSelector（全局，本页也会跟随）；本区只调路由相关开关与会话窗口记账。业务记忆迁移走面板勾选 + 移动到…（二次授权）。',
+              hidden: simpleMode,
+            },
+            // The same status bar as the panel, fed by the stats payload's
+            // panel.session — the operator sees the handoff countdown while tuning
+            // the threshold that produces it.
+            h(
+              'div',
+              {
+                style: {
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+                  fontSize: 12,
+                  color: palette.muted,
+                  marginBottom: 6,
+                  fontVariantNumeric: 'tabular-nums',
+                },
+              },
+              statusBarText(sessionPanel),
+            ),
+            h('div', { style: { ...labelStyle, marginBottom: 4 } }, `当前空间：${displayedSpace}`),
+            // v1.5.4 ESCAPE HATCH: the recovery path for a stuck handoff. Only
+            // state/ is rewritten (baseline + in-flight guard + marker); memories
+            // are never touched, so it is always safe to click.
+            h(
+              'div',
+              { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', margin: '2px 0 8px' } },
+              h(
+                'button',
+                { type: 'button', onClick: resetHandoffState, disabled: escapeBusy, style: smallButtonStyle },
+                escapeBusy ? '重置中…' : '强制重置交接状态（逃生舱）',
+              ),
+              h(
+                'span',
+                { style: { ...labelStyle, marginBottom: 0 } },
+                '当交接卡死/无法开新会话时使用：清零会话 token 基线、释放 in-flight 锁并消费 handoff.json，不删除任何记忆。',
+              ),
+              escapeStatus
+                ? h(
+                    'span',
+                    { style: { fontSize: 12, color: escapeStatus.tone === 'error' ? palette.danger : palette.accent } },
+                    escapeStatus.text,
+                  )
+                : null,
+            ),
+            h(Toggle, {
+              label: '强制用户授权（context.requireExplicitConsentForTransfer）',
+              hint: '默认开启：AI 直接调用迁移工具会被引擎拦截并返回 MEM_E_REQUIRE_USER_CONSENT；只有你（人类）在面板里手动点选才放行。除非明确知道风险，不要关闭。',
+              checked: draft.context.requireExplicitConsentForTransfer,
+              onChange: (value) => edit('context.requireExplicitConsentForTransfer', value),
+              disabled,
+            }),
+            h(Toggle, {
+              label: '空间软跟随（context.autoSpaceFollow）',
+              hint: '开启后跨空间操作完成，UI 自动切换到目标空间',
+              checked: draft.context.autoSpaceFollow,
+              onChange: (value) => edit('context.autoSpaceFollow', value),
+              disabled,
+            }),
+            h(Toggle, {
+              label: '自动交接（context.autoRolloverEnabled）',
+              hint: '达到触发比例时提炼末尾摘要存为 L1.5 并设置交接标记；关闭则在 95% 时强制驱逐',
+              checked: draft.context.autoRolloverEnabled,
+              onChange: (value) => edit('context.autoRolloverEnabled', value),
+              disabled,
+            }),
+            h(Toggle, {
+              label: '上下文总结注入（context.coldStartInjectSummary）',
+              hint: '开启后，新对话将自动载入之前的记忆摘要（交接摘要优先，其次 L3 语义），让 AI 无缝接续；想彻底空白开局可关闭。',
+              checked: draft.context.coldStartInjectSummary,
+              onChange: (value) => edit('context.coldStartInjectSummary', value),
+              disabled,
+            }),
+            h(Toggle, {
+              label: '前几轮原话注入（context.coldStartInjectRecentTurns）',
+              hint: '开启后，新对话会带上交接时刻最后 5 轮原话（推荐：只有摘要会让 AI 接不上具体语境）；这会增加初始 Token 消耗。',
+              checked: draft.context.coldStartInjectRecentTurns,
+              onChange: (value) => edit('context.coldStartInjectRecentTurns', value),
+              disabled,
+            }),
+            h(Slider, {
+              label: '交接触发比例（context.autoRolloverThreshold）',
+              hint: '占原生窗口的比例，默认 0.85（85%）：达到后触发自动交接。调低→更早交班、原生窗口用得更短；调高→更晚交班、更接近窗口上限。',
+              value: draft.context.autoRolloverThreshold,
+              min: 0.5,
+              max: 0.99,
+              step: 0.01,
+              onChange: (value) => edit('context.autoRolloverThreshold', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '原生窗口（context.nativeTokenLimit）',
+              hint: '低于该 Token 数绝不折叠（Qwen 原生模式）；超过则走 L1.5 分层折叠',
+              value: draft.context.nativeTokenLimit,
+              min: 512,
+              max: 1000000,
+              step: 512,
+              disabled,
+              onChange: (value) => edit('context.nativeTokenLimit', value),
+            }),
+            h(Slider, {
+              label: '单标签索引上限（index.maxPostingsPerTag）',
+              hint: '每个标签最多保留的最新且显著度最高的指针数，默认 500；超出部分只移出内存索引，JSONL 完整保留',
+              value: draft.index.maxPostingsPerTag,
+              min: 1,
+              max: 100000,
+              step: 1,
+              onChange: (value) => edit('index.maxPostingsPerTag', value),
+              disabled,
+            }),
+            // UI_TASK_1/3: manual event_ids + target_space_id inputs are REMOVED.
+            // Business-data transfer exists only in the panel checkbox flow
+            // (勾选记忆 → 移动到… → 二次显式授权).
+            h(
+              'div',
+              { style: { ...labelStyle, marginBottom: 0 } },
+              '业务记忆的跨空间迁移请到「面板 → 勾选记忆 → 移动到…」完成：目标空间由空间选择器提供，且需要二次显式授权（requireExplicitConsentForTransfer）。此处不再提供 event_ids / target_space_id 手动输入。',
+            ),
+          ),
+          // UI_TASK_1: physical dataDir migration is a SYSTEM-LEVEL tool, fully
+          // decoupled from business-data transfer (no event ids, no spaces here).
+          h(StorageMigratorUI, { config: serverConfig, disabled }),
+        ];
+      }
+
+
+      /**
+       * v1.7.2: the rail. Sticky, narrow, and always the same five (four in 简洁模式) items:
+       * a settings page people visit twice a year is not the place for a menu that shrinks
+       * and grows with capability flags.
+       */
+      function SettingsNav({ items, activeId, onPick, height }) {
+        return h(
+          'div',
+          {
+            style: {
+              // v1.7.2 (fixed): the rail owns its own scrollbar and stretches to the shell
+              // height, so it stays put while the cards scroll in the sibling pane.
+              // `position: sticky` cannot work here: the Host shell's overflow wrapper is not
+              // the scroller, and a sticky child of a non-scrolling overflow ancestor simply
+              // scrolls away with the content.
+              flex: '0 0 148px',
+              width: 148,
+              alignSelf: 'stretch',
+              maxHeight: height || undefined,
+              overflowY: 'auto',
+              overflowX: 'hidden',
+              paddingRight: 4,
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 2,
+            },
+          },
+          h(
+            'div',
+            { style: { fontSize: 11, fontWeight: 600, color: palette.muted, letterSpacing: 0.4, padding: '2px 8px 6px' } },
+            '设置分组',
+          ),
+          ...items.map((item) =>
+            h(
+              'button',
+              {
+                key: item.id,
+                type: 'button',
+                onClick: () => onPick(item.id),
+                title: item.hint,
+                style: {
+                  textAlign: 'left',
+                  padding: '7px 9px',
+                  borderRadius: 7,
+                  border: `1px solid ${item.id === activeId ? palette.accent : 'transparent'}`,
+                  background: item.id === activeId ? 'rgba(79,140,255,0.12)' : 'transparent',
+                  color: item.id === activeId ? palette.accent : palette.text,
+                  fontSize: 12,
+                  fontWeight: item.id === activeId ? 600 : 400,
+                  cursor: 'pointer',
+                  lineHeight: 1.3,
+                },
+              },
+              item.label,
+            ),
+          ),
+        );
+      }
+
+      /**
+       * v1.7.2: one rail target. The header carries the group's promise ("what lives here"),
+       * because 17 cards in one column gave no way to tell 检索 from 调度 at a glance.
+       */
+      function SettingsGroup({ groupId, label, hint, groupRefs, children }) {
+        return h(
+          'div',
+          {
+            ref: (node) => {
+              if (node && node.dataset) node.dataset.groupId = groupId;
+              if (groupRefs && groupRefs.current) groupRefs.current[groupId] = node;
+            },
+            'data-group-id': groupId,
+            style: { display: 'flex', flexDirection: 'column', gap: 10, scrollMarginTop: 12 },
+          },
+          h(
+            'div',
+            { style: { display: 'flex', alignItems: 'baseline', gap: 8, paddingTop: 2, borderTop: `1px solid ${palette.border}` } },
+            h('div', { style: { fontSize: 13, fontWeight: 700 } }, label),
+            hint ? h('div', { style: { fontSize: 11, color: palette.muted, flex: '1 1 auto', minWidth: 0 } }, hint) : null,
+          ),
+          ...(Array.isArray(children) ? children : [children]),
+        );
+      }
+
       function MemorySettings() {
         const activeSpace = useActiveSpace();
         const state = useMemoryStats(activeSpace);
@@ -2938,6 +3910,55 @@
         // v1.5.4 escape hatch: reset a wedged rollover/handoff state from the UI.
         const [escapeStatus, setEscapeStatus] = React.useState(null);
         const [escapeBusy, setEscapeBusy] = React.useState(false);
+
+        // v1.7.2 settings refactor: which rail item is highlighted. The refs are how the
+        // rail scrolls to a group without ids leaking into the DOM (and without a
+        // document.querySelector that would break the moment two settings pages mount).
+        const [activeGroup, setActiveGroup] = React.useState(SETTINGS_GROUPS[0].id);
+        const groupRefs = React.useRef({});
+        // v1.7.2 (fixed): the Host shell gives this page no scroll container of its own, so the
+        // two panes are sized from the viewport: measure the shell's top edge once and hand the
+        // rest of the visible height to the layout, which lets the cards pane scroll inside it
+        // while the rail stays pinned.
+        const settingsShellRef = React.useRef(null);
+        const settingsContentRef = React.useRef(null);
+        const [shellHeight, setShellHeight] = React.useState(null);
+        React.useEffect(() => {
+          const measure = () => {
+            const node = settingsShellRef.current;
+            if (!node || typeof node.getBoundingClientRect !== 'function') return;
+            const top = node.getBoundingClientRect().top || 0;
+            const viewport = typeof window !== 'undefined' && window.innerHeight ? window.innerHeight : 900;
+            setShellHeight(Math.max(320, Math.round(viewport - top - 24)));
+          };
+          measure();
+          if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('resize', measure);
+          return () => {
+            if (typeof window !== 'undefined' && window.removeEventListener) window.removeEventListener('resize', measure);
+          };
+        }, []);
+        React.useEffect(() => {
+          if (!draft || typeof IntersectionObserver !== 'function') return undefined;
+          const observer = new IntersectionObserver(
+            (entries) => {
+              const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => b.intersectionRatio - a.intersectionRatio);
+              const id = visible[0] && visible[0].target && visible[0].target.dataset ? visible[0].target.dataset.groupId : null;
+              if (id) setActiveGroup((current) => (current === id ? current : id));
+            },
+            {
+              // v1.7.2 (fixed): observe INSIDE the cards pane. A viewport-rooted observer never
+              // fires once the pane owns its own scrollbar.
+              root: settingsContentRef.current || null,
+              rootMargin: '-8% 0px -70% 0px',
+              threshold: [0.1, 0.35, 0.6],
+            },
+          );
+          for (const node of Object.values(groupRefs.current)) {
+            if (node) observer.observe(node);
+          }
+          return () => observer.disconnect();
+        }, [draft, shellHeight]);
+
 
         React.useEffect(() => {
           if (serverConfig && draft === null) setDraft(draftFromConfig(serverConfig));
@@ -3144,13 +4165,45 @@
           }
         };
 
+        // 简洁模式 hides groups wholesale: a rail item with nothing visible under it would
+        // be a dead link, so the filter and the render read the SAME flag.
+        const settingsNavItems = SETTINGS_GROUPS.filter((group) => !simpleMode || group.visibleInSimple);
+        const pickGroup = (id) => {
+          setActiveGroup(id);
+          const node = groupRefs.current[id];
+          if (node && typeof node.scrollIntoView === 'function') node.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        };
+        // One bag instead of 20 positional props: the group bodies were moved verbatim out
+        // of this function, so they still read `draft` / `edit` / `disabled` from here.
+        const settingsBag = {
+          activeSpace,
+          state,
+          configState,
+          serverConfig,
+          shellState,
+          draft,
+          status,
+          saving,
+          settingsMode,
+          simpleMode,
+          escapeStatus,
+          escapeBusy,
+          statsPayload,
+          sessionPanel,
+          reportedSpace,
+          displayedSpace,
+          edit,
+          disabled,
+          resetHandoffState,
+        };
+
         return h(
           'div',
-          { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 12, maxWidth: 720 } },
-          h('div', { style: { fontSize: 16, fontWeight: 600 } }, '海马体记忆'),
-          h('div', { style: labelStyle }, '保存后立即作用于运行时（fail-fast 校验，越界会被拒绝），并在可持久化时写回 Loader 配置。'),
+          { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 12, maxWidth: 980 } },
+h('div', { style: { fontSize: 16, fontWeight: 600 } }, '海马体记忆'),
+h('div', { style: labelStyle }, '保存后立即作用于运行时（fail-fast 校验，越界会被拒绝），并在可持久化时写回 Loader 配置。'),
           // v1.6.3: 视图切换。简洁模式只显示四块，隐藏项不参与保存、文件里保持原值。
-          h(
+h(
             'div',
             { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
             h(
@@ -3226,826 +4279,62 @@
                 status.text,
               )
             : null,
+          // v1.7.2 (fixed): grouped, two-pane layout. The rail and the cards each own their
+          // scrollbar and both are sized from the measured viewport height — that is what makes
+          // the rail follow the user instead of scrolling out of view with the cards.
           h(
-            Section,
-            { title: '行为', hidden: simpleMode },
-            h(Toggle, {
-              label: '空闲时自动整理（Dream）',
-              hint: `连续 ${draft.dreamIdleMinutes} 分钟没有记忆工具调用后跑一次维护（与 Cron 共用同一入口）。`,
-              checked: draft.enableDream,
-              onChange: (value) => edit('enableDream', value),
-              disabled,
-            }),
-            h(Toggle, {
-              label: '反思提示（Reflection）',
-              hint: '连续工具调用达到阈值后，在提示里追加自我检查。',
-              checked: draft.enableReflection,
-              onChange: (value) => edit('enableReflection', value),
-              disabled,
-            }),
-            h(Toggle, {
-              label: '提示词简报（briefing）',
-              hint: '在系统提示里放入一行记忆状态摘要。',
-              checked: draft.briefing,
-              onChange: (value) => edit('briefing', value),
-              disabled,
-            }),
-            h(Toggle, {
-              label: '提示注入（promptSection）',
-              hint: '注册 memory 提示段，教模型何时写、何时读。',
-              checked: draft.promptSection,
-              onChange: (value) => edit('promptSection', value),
-              disabled,
-            }),
-            h(Toggle, {
-              label: '启动后立即维护（autoMaintainOnBoot）',
-              checked: draft.autoMaintainOnBoot,
-              onChange: (value) => edit('autoMaintainOnBoot', value),
-              disabled,
-            }),
-          ),
-          // Tool schema pruning (v1.5.3): every enabled tool pays its JSON schema
-          // in prompt tokens on every turn. Disabled entries are validated server
-          // side (unknown/core names abort activation), so the save cannot lie.
-          h(
-            Section,
+            'div',
             {
-              title: '工具 schema 裁剪（tools.disabled）',
-              hint: '每个工具定义都会在每轮提示中占用固定 schema token。裁剪低频工具可降低底座税；核心工具 remember / recall / admin 不可关闭。保存后写回配置，下次宿主启动（或重载插件）时真正跳过注册。',
-              hidden: simpleMode,
+              ref: settingsShellRef,
+              style: {
+                display: 'flex',
+                alignItems: 'stretch',
+                gap: 18,
+                ...(shellHeight ? { height: shellHeight } : {}),
+              },
             },
-            h(
-              'div',
-              { style: { ...labelStyle, marginBottom: 6 } },
-              `已裁剪 ${Array.isArray(draft.tools.disabled) ? draft.tools.disabled.length : 0} 个 · 下次启动注册 ${TOOL_CATALOG.length - (Array.isArray(draft.tools.disabled) ? draft.tools.disabled.length : 0)} 个（核心 3 个始终保留）`,
-            ),
-            TOOL_CATALOG.map((tool) => {
-              const disabledList = Array.isArray(draft.tools.disabled) ? draft.tools.disabled : [];
-              const enabled = tool.core || !disabledList.includes(tool.name);
-              return h(Toggle, {
-                key: tool.name,
-                label: `${tool.name}（${tool.core ? '核心 · 不可关闭' : '低频 · 可裁剪'}）`,
-                hint: `${tool.hint}${tool.core ? '' : ' 关闭后该工具不注册、提示词也不再宣传它。'}`,
-                checked: enabled,
-                disabled: tool.core || disabled,
-                onChange: (value) => {
-                  const next = new Set(Array.isArray(draft.tools.disabled) ? draft.tools.disabled : []);
-                  if (value) next.delete(tool.name);
-                  else next.add(tool.name);
-                  edit('tools.disabled', [...next]);
-                },
-              });
-            }),
-          ),
-          h(
-            Section,
-            {
-              title: '入库自动打标（Pre-Ingest Tagging）',
-              hint: '模型手传 tags 优先；未传 tags 时由引擎从内容形态提取 1–2 个锚点（错误类型 / errno / 代码块语言 / HTTP 状态 / 文件路径 / 任务语句）。raw 保持纯净，锚点直接进 L1.5 索引；提取不到只记 MEM_E_AUTO_TAG_MISS 警告，不阻断写入。',
-              hidden: simpleMode,
-            },
-            h(Toggle, {
-              label: '启用引擎侧自动打标（tagging.autoTag）',
-              checked: draft.tagging.autoTag,
-              onChange: (value) => edit('tagging.autoTag', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '最多自动标签数（tagging.maxTags）',
-              hint: '1 – 5，默认 2。只影响未手传 tags 的写入。',
-              value: draft.tagging.maxTags,
-              min: 1,
-              max: 5,
-              step: 1,
-              onChange: (value) => edit('tagging.maxTags', value),
-              disabled,
-            }),
-          ),
-          h(
-            Section,
-            {
-              title: '可选能力（微内核边界）',
-              hint: '关闭多空间后，本体退化为严格单空间核心：targetSpaceId 只能是 default，空间工具与 /spaces、/transfer 路由返回 MEM_E_FEATURE_DISABLED。跨空间迁移必须同时启用多空间。保存后立即生效；工具注册在下次宿主启动/重载时真正移除。',
-              hidden: simpleMode,
-            },
-            h(Toggle, {
-              label: '启用多空间路由（features.multiSpace）',
-              checked: draft.features.multiSpace,
-              onChange: (value) => edit('features.multiSpace', value),
-              disabled,
-            }),
-            h(Toggle, {
-              label: '允许跨空间迁移（features.crossSpaceTransfer）',
-              hint: '关闭后 space_transfer / transfer_to_global 工具不再注册，迁移路由直接拒绝。',
-              checked: draft.features.crossSpaceTransfer,
-              onChange: (value) => edit('features.crossSpaceTransfer', value),
-              disabled: disabled || !draft.features.multiSpace,
-            }),
-            h(Toggle, {
-              label: '跨空间召回聚合（features.crossSpaceRecall，默认关）',
-              hint: '开启后每次 recall 会查询所有已打开空间并合并命中（月记可遮住它拥有的其他空间事件）；代价是每次召回多查 N 个空间。',
-              checked: draft.features.crossSpaceRecall,
-              onChange: (value) => edit('features.crossSpaceRecall', value),
-              disabled: disabled || !draft.features.multiSpace,
-            }),
-          ),
-          simpleMode
-            ? null
-            : h(OrchestratorInstallCard, {
-                installed: Boolean(state.payload && state.payload.capabilities && state.payload.capabilities.spaces === true),
-                // v1.6.7 (M6): render WHY it is off, so "I enabled multiSpace but nothing
-                // happened" is answered right here instead of looking like a silent bug.
-                reason:
-                  (state.payload && state.payload.capabilities && state.payload.capabilities.multiSpaceReason) ||
-                  (state.payload && state.payload.capabilities && state.payload.capabilities.spaces === true
-                    ? 'active'
-                    : 'orchestrator-missing'),
-              }),
-          h(
-            Section,
-            {
-              title: '离线 Dream（LLM 蒸馏）',
-              hint: 'Dream 在空闲/补偿时蒸馏同标签经验；失败会本地降级并记 MEM_E_DREAM_LLM_FALLBACK。Endpoint / Model / API Key 只从 profile 配置或 DSH_DREAM_LLM_* 环境变量注入，绝不会下发到浏览器，也不能在此页填写。',
-              hidden: simpleMode,
-            },
-            h(Toggle, {
-              label: '启用 LLM 提炼（dream.useLlm）',
-              hint: '关闭后只用本地启发式合并（时间范围 + 去重文本），不发任何网络请求。',
-              checked: draft.dream.useLlm,
-              onChange: (value) => edit('dream.useLlm', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '成组最少条数（dream.minGroupSize）',
-              value: draft.dream.minGroupSize,
-              min: 2,
-              max: 50,
-              step: 1,
-              onChange: (value) => edit('dream.minGroupSize', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '单次最多蒸馏组数（dream.maxGroupsPerRun）',
-              value: draft.dream.maxGroupsPerRun,
-              min: 1,
-              max: 50,
-              step: 1,
-              onChange: (value) => edit('dream.maxGroupsPerRun', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '摘要字数上限（dream.maxSummaryChars）',
-              value: draft.dream.maxSummaryChars,
-              min: 40,
-              max: 2000,
-              step: 20,
-              onChange: (value) => edit('dream.maxSummaryChars', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '单条来源字数上限（dream.maxSourceChars）',
-              value: draft.dream.maxSourceChars,
-              min: 80,
-              max: 4000,
-              step: 40,
-              onChange: (value) => edit('dream.maxSourceChars', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '每组最多来源条数（dream.maxEventsPerGroup）',
-              value: draft.dream.maxEventsPerGroup,
-              min: 2,
-              max: 50,
-              step: 1,
-              onChange: (value) => edit('dream.maxEventsPerGroup', value),
-              disabled,
-            }),
-            h(Field, {
-              label: 'LLM 超时（毫秒，dream.llmTimeoutMs）',
-              value: draft.dream.llmTimeoutMs,
-              min: 500,
-              max: 120000,
-              step: 500,
-              onChange: (value) => edit('dream.llmTimeoutMs', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '熔断阈值（dream.failureThreshold）',
-              hint: '连续失败达到该次数即熔断 LLM，冷却期内只本地降级。',
-              value: draft.dream.failureThreshold,
-              min: 1,
-              max: 20,
-              step: 1,
-              onChange: (value) => edit('dream.failureThreshold', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '熔断冷却（分钟，dream.cooldownMinutes）',
-              value: draft.dream.cooldownMinutes,
-              min: 1,
-              max: 1440,
-              step: 1,
-              onChange: (value) => edit('dream.cooldownMinutes', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '会话开始时补偿阈值（小时，dream.compensateAfterHours）',
-              hint: '超过该时长没有 Dream 且价格窗口允许时，会话开始会补跑一次。',
-              value: draft.dream.compensateAfterHours,
-              min: 1,
-              max: 720,
-              step: 1,
-              onChange: (value) => edit('dream.compensateAfterHours', value),
-              disabled,
-            }),
-            h(Toggle, {
-              label: '只在低谷窗口跑 LLM Dream（dream.onlyLowValley）',
-              hint: '北京时间工作日 09–12、14–18 为高峰；其余时段与周末才发起 LLM 调用。关闭后任何时段都可能调用。',
-              checked: draft.dream.onlyLowValley,
-              onChange: (value) => edit('dream.onlyLowValley', value),
-              disabled,
-            }),
-          ),
-          h(
-            Section,
-            {
-              title: 'L2 多合一蒸馏',
-              hint: '维护时把同一标签下的重复经验合并成一条：pinned 只与 pinned 合并、普通只与普通合并，永不混组；全局大标签只保留为 meta.global_tags，不写入倒排索引。原始记录标记为已合并（state/l2-merge.json），仍可追溯。',
-              hidden: simpleMode,
-            },
-            h(Toggle, {
-              label: '启用 L2 合并（l2Merge.enabled）',
-              checked: draft.l2Merge.enabled,
-              onChange: (value) => edit('l2Merge.enabled', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '成组最少条数（l2Merge.minGroupSize）',
-              value: draft.l2Merge.minGroupSize,
-              min: 2,
-              max: 20,
-              step: 1,
-              onChange: (value) => edit('l2Merge.minGroupSize', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '单次最多合并组数（l2Merge.maxGroupsPerRun）',
-              value: draft.l2Merge.maxGroupsPerRun,
-              min: 1,
-              max: 50,
-              step: 1,
-              onChange: (value) => edit('l2Merge.maxGroupsPerRun', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '合并文本字数上限（l2Merge.maxSummaryChars）',
-              value: draft.l2Merge.maxSummaryChars,
-              min: 100,
-              max: 2000,
-              step: 20,
-              onChange: (value) => edit('l2Merge.maxSummaryChars', value),
-              disabled,
-            }),
-          ),
-          h(
-            Section,
-            { title: '调度', hidden: simpleMode },
-            h(TextInput, {
-              label: '维护 Cron（5 段）',
-              hint: '例：0 */6 * * *（每 6 小时）。非法表达式会被后端拒绝。',
-              value: draft.maintenanceCron,
-              onChange: (value) => edit('maintenanceCron', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '空闲判定（分钟）',
-              value: draft.dreamIdleMinutes,
-              min: 1,
-              max: 525600,
-              step: 1,
-              onChange: (value) => edit('dreamIdleMinutes', value),
-              disabled,
-            }),
-          ),
-          h(
-            Section,
-            { title: '检索', hint: '默认 topK 不得超过检索上限。', hidden: simpleMode },
-            h(Field, {
-              label: '默认 topK（retrieval.topK）',
-              value: draft.retrievalTopK,
-              min: 1,
-              max: 1000,
-              step: 1,
-              onChange: (value) => edit('retrievalTopK', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '检索上限（maxRecallTopK）',
-              value: draft.maxRecallTopK,
-              min: 1,
-              max: 1000,
-              step: 1,
-              onChange: (value) => edit('maxRecallTopK', value),
-              disabled,
-            }),
-          ),
-          h(
-            Section,
-            { title: '上下文窗口' },
-            h(Field, {
-              label: '预算（token）',
-              hint: '日常 4000；长视频或重构时建议 8000 - 12000。',
-              value: draft.context.maxTokens,
-              min: 256,
-              max: 1000000,
-              step: 256,
-              onChange: (value) => edit('context.maxTokens', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '单次召回注入上限（token）',
-              hint: '一次 recall 返回 JSON 的硬上限（默认 4000，256 – 100000）。超限会截断并带 truncated:true，绝不静默超发。',
-              value: draft.context.maxInjectTokens,
-              min: 256,
-              max: 100000,
-              step: 256,
-              onChange: (value) => edit('context.maxInjectTokens', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '淘汰阈值',
-              hint: '占用超过该比例即开始淘汰，必须大于收敛目标。',
-              value: draft.context.threshold,
-              min: 0.1,
-              max: 0.99,
-              step: 0.01,
-              onChange: (value) => edit('context.threshold', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '收敛目标',
-              value: draft.context.target,
-              min: 0.05,
-              max: 0.98,
-              step: 0.01,
-              onChange: (value) => edit('context.target', value),
-              disabled,
-            }),
-            h(Toggle, {
-              label: '注入上下文预算段（context.injectPrompt）',
-              checked: draft.context.injectPrompt,
-              onChange: (value) => edit('context.injectPrompt', value),
-              disabled,
-            }),
-            // v1.6.7 M1: pointer lines by default. `full` is kept as the escape hatch
-            // for anyone who wants the old body rendering back.
-            h(Select, {
-              label: '记忆块注入形态（context.injectMode）',
-              hint: '索引（推荐）：每块只注入 eventId + 标签 + 标题，正文按需用 recall 取；占用已用窗口的 1/10 不到。全文：沿用旧版渲染，正文直接进 Prompt（更费 Token）。',
-              value: draft.context.injectMode === 'full' ? 'full' : 'index',
-              options: [
-                { value: 'index', label: '索引（eventId + 标签 + 标题）' },
-                { value: 'full', label: '全文（旧版渲染）' },
-              ],
-              onChange: (value) => edit('context.injectMode', value),
-              disabled,
-            }),
-            // v1.7.1: the task/expert switch. It gates TWO behaviours (hint silence and
-            // the state line); the summary-hygiene clean-up above is always on.
-            h(Select, {
-              label: '运行模式（context.mode）',
-              hint: '任务（推荐，构建/调试）：提示标签连续 N 次且一次都没换来 recall 就单向静默，并注入一行「当前状态」（仓库 HEAD / 窗口压力）。专家：每个提示都保留，不注入状态行。',
-              value: draft.context.mode === 'expert' ? 'expert' : 'task',
-              options: [
-                { value: 'task', label: '任务（静默无效提示 + 当前状态行）' },
-                { value: 'expert', label: '专家（全量提示，不静默）' },
-              ],
-              onChange: (value) => edit('context.mode', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '提示静默阈值（context.hintsIdleSilenceAfter）',
-              hint: '仅任务模式生效：同一标签连续展示这么多次且从未带来一次 recall，就永久不再出现。默认 8。',
-              value: draft.context.hintsIdleSilenceAfter,
-              min: 1,
-              max: 100,
-              step: 1,
-              onChange: (value) => edit('context.hintsIdleSilenceAfter', value),
-              disabled: disabled || (draft.context.mode === 'expert'),
-            }),
-            h(Toggle, {
-              label: '注入当前状态行（context.statePointer.enabled）',
-              hint: '任务模式有效：在 Prompt 末尾注入一行「仓库 HEAD · 窗口压力」，总长 ≤ maxChars。',
-              checked: Boolean(draft.context.statePointer && draft.context.statePointer.enabled),
-              onChange: (value) =>
-                edit('context.statePointer', { ...(draft.context.statePointer || {}), enabled: value }),
-              disabled,
-            }),
-          ),
-          h(
-            Section,
-            {
-              title: '空间与会话交接（纯物理层）',
-              hint: '空间切换在面板顶部 SpaceSelector（全局，本页也会跟随）；本区只调路由相关开关与会话窗口记账。业务记忆迁移走面板勾选 + 移动到…（二次授权）。',
-              hidden: simpleMode,
-            },
-            // The same status bar as the panel, fed by the stats payload's
-            // panel.session — the operator sees the handoff countdown while tuning
-            // the threshold that produces it.
+            h(SettingsNav, { items: settingsNavItems, activeId: activeGroup, onPick: pickGroup, height: shellHeight }),
             h(
               'div',
               {
+                ref: settingsContentRef,
                 style: {
-                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-                  fontSize: 12,
-                  color: palette.muted,
-                  marginBottom: 6,
-                  fontVariantNumeric: 'tabular-nums',
+                  flex: '1 1 460px',
+                  minWidth: 0,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 14,
+                  overflowY: 'auto',
+                  overflowX: 'hidden',
+                  paddingRight: 6,
                 },
               },
-              statusBarText(sessionPanel),
-            ),
-            h('div', { style: { ...labelStyle, marginBottom: 4 } }, `当前空间：${displayedSpace}`),
-            // v1.5.4 ESCAPE HATCH: the recovery path for a stuck handoff. Only
-            // state/ is rewritten (baseline + in-flight guard + marker); memories
-            // are never touched, so it is always safe to click.
-            h(
-              'div',
-              { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', margin: '2px 0 8px' } },
               h(
-                'button',
-                { type: 'button', onClick: resetHandoffState, disabled: escapeBusy, style: smallButtonStyle },
-                escapeBusy ? '重置中…' : '强制重置交接状态（逃生舱）',
+                SettingsGroup,
+                { groupId: 'identity', label: '身份与行为', hint: '人格锚点 · 空闲行为', groupRefs },
+                ...SettingsIdentityGroup(settingsBag),
               ),
               h(
-                'span',
-                { style: { ...labelStyle, marginBottom: 0 } },
-                '当交接卡死/无法开新会话时使用：清零会话 token 基线、释放 in-flight 锁并消费 handoff.json，不删除任何记忆。',
+                SettingsGroup,
+                { groupId: 'context', label: '上下文与注入', hint: '窗口记账 · 注入形态 · 运行模式 · 检索 · 调度', groupRefs },
+                ...SettingsContextGroup(settingsBag),
               ),
-              escapeStatus
-                ? h(
-                    'span',
-                    { style: { fontSize: 12, color: escapeStatus.tone === 'error' ? palette.danger : palette.accent } },
-                    escapeStatus.text,
-                  )
-                : null,
-            ),
-            h(Toggle, {
-              label: '强制用户授权（context.requireExplicitConsentForTransfer）',
-              hint: '默认开启：AI 直接调用迁移工具会被引擎拦截并返回 MEM_E_REQUIRE_USER_CONSENT；只有你（人类）在面板里手动点选才放行。除非明确知道风险，不要关闭。',
-              checked: draft.context.requireExplicitConsentForTransfer,
-              onChange: (value) => edit('context.requireExplicitConsentForTransfer', value),
-              disabled,
-            }),
-            h(Toggle, {
-              label: '空间软跟随（context.autoSpaceFollow）',
-              hint: '开启后跨空间操作完成，UI 自动切换到目标空间',
-              checked: draft.context.autoSpaceFollow,
-              onChange: (value) => edit('context.autoSpaceFollow', value),
-              disabled,
-            }),
-            h(Toggle, {
-              label: '自动交接（context.autoRolloverEnabled）',
-              hint: '达到触发比例时提炼末尾摘要存为 L1.5 并设置交接标记；关闭则在 95% 时强制驱逐',
-              checked: draft.context.autoRolloverEnabled,
-              onChange: (value) => edit('context.autoRolloverEnabled', value),
-              disabled,
-            }),
-            h(Toggle, {
-              label: '上下文总结注入（context.coldStartInjectSummary）',
-              hint: '开启后，新对话将自动载入之前的记忆摘要（交接摘要优先，其次 L3 语义），让 AI 无缝接续；想彻底空白开局可关闭。',
-              checked: draft.context.coldStartInjectSummary,
-              onChange: (value) => edit('context.coldStartInjectSummary', value),
-              disabled,
-            }),
-            h(Toggle, {
-              label: '前几轮原话注入（context.coldStartInjectRecentTurns）',
-              hint: '开启后，新对话会带上交接时刻最后 5 轮原话（推荐：只有摘要会让 AI 接不上具体语境）；这会增加初始 Token 消耗。',
-              checked: draft.context.coldStartInjectRecentTurns,
-              onChange: (value) => edit('context.coldStartInjectRecentTurns', value),
-              disabled,
-            }),
-            h(Slider, {
-              label: '交接触发比例（context.autoRolloverThreshold）',
-              hint: '占原生窗口的比例，默认 0.85（85%）：达到后触发自动交接。调低→更早交班、原生窗口用得更短；调高→更晚交班、更接近窗口上限。',
-              value: draft.context.autoRolloverThreshold,
-              min: 0.5,
-              max: 0.99,
-              step: 0.01,
-              onChange: (value) => edit('context.autoRolloverThreshold', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '原生窗口（context.nativeTokenLimit）',
-              hint: '低于该 Token 数绝不折叠（Qwen 原生模式）；超过则走 L1.5 分层折叠',
-              value: draft.context.nativeTokenLimit,
-              min: 512,
-              max: 1000000,
-              step: 512,
-              disabled,
-              onChange: (value) => edit('context.nativeTokenLimit', value),
-            }),
-            h(Slider, {
-              label: '单标签索引上限（index.maxPostingsPerTag）',
-              hint: '每个标签最多保留的最新且显著度最高的指针数，默认 500；超出部分只移出内存索引，JSONL 完整保留',
-              value: draft.index.maxPostingsPerTag,
-              min: 1,
-              max: 100000,
-              step: 1,
-              onChange: (value) => edit('index.maxPostingsPerTag', value),
-              disabled,
-            }),
-            // UI_TASK_1/3: manual event_ids + target_space_id inputs are REMOVED.
-            // Business-data transfer exists only in the panel checkbox flow
-            // (勾选记忆 → 移动到… → 二次显式授权).
-            h(
-              'div',
-              { style: { ...labelStyle, marginBottom: 0 } },
-              '业务记忆的跨空间迁移请到「面板 → 勾选记忆 → 移动到…」完成：目标空间由空间选择器提供，且需要二次显式授权（requireExplicitConsentForTransfer）。此处不再提供 event_ids / target_space_id 手动输入。',
-            ),
-          ),
-          // UI_TASK_1: physical dataDir migration is a SYSTEM-LEVEL tool, fully
-          // decoupled from business-data transfer (no event ids, no spaces here).
-          h(StorageMigratorUI, { config: serverConfig, disabled }),
-          h(
-            Section,
-            {
-              title: '原始回合留存（raw）',
-              hint: '只做取证，不参与索引；高价值/代码/报错/工具输出才会留，且有日/总量/保留期上限。',
-            },
-            h(Select, {
-              label: 'raw.mode',
-              hint: 'salience：只留高价值轮次；all：全留（仍受上限）；off：关闭 deep_raw。',
-              value: draft.rawMode,
-              options: [
-                { value: 'salience', label: 'salience — 只留高价值（默认）' },
-                { value: 'all', label: 'all — 全量（受预算限制）' },
-                { value: 'off', label: 'off — 不留 raw' },
-              ],
-              onChange: (value) => edit('rawMode', value),
-              disabled,
-            }),
-            simpleMode
-              ? null
-              : h(Field, {
-                  label: 'raw 最小显著度',
-                  value: draft.rawMinSalience,
-                  min: 0,
-                  max: 1,
-                  step: 0.05,
-                  onChange: (value) => edit('rawMinSalience', value),
-                  disabled,
-                }),
-            h(Field, {
-              label: 'raw 总量上限（MB）',
-              value: draft.rawMaxTotalMb,
-              min: 16,
-              max: 4096,
-              step: 16,
-              suffix: 'MB',
-              onChange: (value) => edit('rawMaxTotalMb', value),
-              disabled,
-            }),
-            simpleMode
-              ? null
-              : h(Field, {
-                  label: 'raw 保留期（天）',
-                  value: draft.rawRetentionDays,
-                  min: 1,
-                  max: 365,
-                  step: 1,
-                  suffix: '天',
-                  onChange: (value) => edit('rawRetentionDays', value),
-                  disabled,
-                }),
-            simpleMode
-              ? null
-              : h(Field, {
-                  label: '冷压缩阈值（raw.archiveAfterDays，天）',
-                  hint: '超过该天数的日分片会被按月合并为 .jsonl.gz（默认 7，必须小于保留期）。只有近 30 天零访问、且不含 pinned / status:handoff / 高频标签的分片才会被压缩；deep_raw 仍可流式读取。',
-                  value: draft.rawArchiveAfterDays,
-                  min: 1,
-                  max: 3650,
-                  step: 1,
-                  suffix: '天',
-                  onChange: (value) => edit('rawArchiveAfterDays', value),
-                  disabled,
-                }),
-            h(Select, {
-              label: '冷压缩引擎（raw.compressionEngine）',
-              hint:
-                (statsPayload && statsPayload.capabilities && statsPayload.capabilities.compression
-                  ? `当前运行时 Node ${statsPayload.capabilities.compression.node}：brotli ${statsPayload.capabilities.compression.brotli ? '可用' : '不可用'}，gzip ${statsPayload.capabilities.compression.gzip ? '可用' : '不可用'}，zstd ${statsPayload.capabilities.compression.zstd ? '可用' : '不可用'}。`
-                  : '') +
-                '全部为 Node 内置编解码器（无需下载或安装外部包）。Brotli 11 级为冷数据默认的极限压缩；Gzip/Zstd 仍可选。历史归档保持原格式，三种格式都可流式读取。',
-              value: draft.rawCompressionEngine,
-              options: [
-                { value: 'brotli', label: 'Brotli 11 级（Node 内置，默认，压缩率最高）' },
-                { value: 'gzip', label: 'Gzip（Node 内置，兼容性最好）' },
-                { value: 'zstd', label: 'Zstd（Node 内置，解压更快）' },
-              ],
-              onChange: (value) => edit('rawCompressionEngine', value),
-              disabled,
-            }),
-            simpleMode
-              ? null
-              : h(
-                  'div',
-                  { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', margin: '4px 0 10px' } },
-                  h(
-                    'button',
-                    {
-                      type: 'button',
-                      style: smallButtonStyle,
-                      disabled,
-                      onClick: () =>
-                        edit(
-                          'rawCompressionEngine',
-                          draft.rawCompressionEngine === 'brotli' ? 'gzip' : 'brotli',
-                        ),
-                    },
-                    draft.rawCompressionEngine === 'brotli' ? '切回 Gzip（兼容模式）' : '启用 Brotli 11 级（极限压缩）',
-                  ),
-                  h(
-                    'span',
-                    { style: { ...labelStyle, marginBottom: 0 } },
-                    draft.rawCompressionEngine === 'brotli'
-                      ? 'Brotli 11 级已选中：点击“保存全部”后，新归档使用 .jsonl.br。'
-                      : '当前未使用极限压缩：点击“保存全部”后切换，下个月归档生效。',
-                  ),
-                ),
-            simpleMode
-              ? null
-              : h(Field, {
-                  label: 'deep_raw 扫描回合上限（raw.maxScanTurns）',
-                  hint: 'deep_raw 从最新记录倒序最多扫描的回合数（默认 5000，下次 deep_raw 即生效）。调大可回溯更久但更慢；超出上限会 truncated=true 并在 notes 说明。',
-                  value: draft.rawMaxScanTurns,
-                  min: 500,
-                  max: 50000,
-                  step: 500,
-                  onChange: (value) => edit('rawMaxScanTurns', value),
-                  disabled,
-                }),
-          ),
-          h(
-            Section,
-            { title: '删除与复习', hint: '两阶段删除先挂起，宽限期内 restore 可取消；复习排期由引擎推进。', hidden: simpleMode },
-            h(Field, {
-              label: '删除宽限期（小时）',
-              hint: '0 = 立即执行（旧行为）；默认 24 小时。',
-              value: draft.deleteGraceHours,
-              min: 0,
-              max: 168,
-              step: 1,
-              suffix: '小时',
-              onChange: (value) => edit('deleteGraceHours', value),
-              disabled,
-            }),
-            h(Toggle, {
-              label: '启用间隔重复复习（1,2,4,7,15,30 天）',
-              hint: 'reinforce 会让事件进入下一档；到期项由 maintain 汇总到 memory_admin action=reviews。',
-              checked: draft.reviewEnabled,
-              onChange: (value) => edit('reviewEnabled', value),
-              disabled,
-            }),
-          ),
-          h(
-            Section,
-            { title: '存储与图谱', hint: '存储预算只影响左上角环形图的阈值，不会删除任何数据。', hidden: simpleMode },
-            h(Field, {
-              label: '存储预算上限（MB）',
-              hint: '普通用户 50MB；重度用户可调至 200MB+。软上限：超限只在环形图标红，不删档。',
-              value: draft.storageBudgetMb,
-              min: 10,
-              max: 1000,
-              step: 10,
-              suffix: 'MB',
-              onChange: (value) => edit('storageBudgetMb', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '图谱最大边数（graphMaxEdges）',
-              hint: '保存后立即按新上限重新拉取 /api/hippocampus/graph 并重绘。',
-              value: draft.graphMaxEdges,
-              min: 100,
-              max: 2000,
-              step: 100,
-              onChange: (value) => edit('graphMaxEdges', value),
-              disabled,
-            }),
-          ),
-          h(
-            Section,
-            {
-              title: '标签树（L1.5 幽灵宽限）',
-              hint: '层级标签的生死节奏：root 永生、leaf 引用归零即死、mid 在宽限期内变"幽灵"（recall 只给元数据、引导 deep_raw），过期未复活才消亡。四个值都在下一次维护生效。',
-              hidden: simpleMode,
-            },
-            h(Slider, {
-              label: 'mid 半衰期倍率（tagTree.midHalfLifeMultiplier）',
-              hint: 'mid 半衰期 = 倍率 × leaf 半衰期（1 天）。默认 3：mid 比叶子多活 3 倍。调大→幽灵留存更久，历史更完整；调小→层级更快被清理。',
-              value: draft.tagTree.midHalfLifeMultiplier,
-              min: 1,
-              max: 10,
-              step: 0.5,
-              onChange: (value) => edit('tagTree.midHalfLifeMultiplier', value),
-              disabled,
-            }),
-            h(Slider, {
-              label: 'mid 宽限期（tagTree.midGracePeriodDays）',
-              hint: 'mid 失去最后一个叶子后的宽限天数（默认 30）。期内新叶子可立即复活它；期内召回只返回"存在模糊记忆"的元数据，绝不注入正文。',
-              value: draft.tagTree.midGracePeriodDays,
-              min: 7,
-              max: 180,
-              step: 1,
-              suffix: '天',
-              onChange: (value) => edit('tagTree.midGracePeriodDays', value),
-              disabled,
-            }),
-            h(Slider, {
-              label: '剪枝批大小（tagTree.pruneBatchSize）',
-              hint: '每次维护最多消费的待修剪叶子数（默认 100）。调小→死叶分批消失、队列落盘跨重启排空，避免一次维护风暴。',
-              value: draft.tagTree.pruneBatchSize,
-              min: 10,
-              max: 500,
-              step: 10,
-              onChange: (value) => edit('tagTree.pruneBatchSize', value),
-              disabled,
-            }),
-            h(Slider, {
-              label: 'leaf 衰减地板（tagTree.leafDecayFloor）',
-              hint: '0 = 只按引用归零死亡（严格 forget 驱动）；>0 时衰减低于该分数、又被排队的叶子会被修剪。0.05 ≈ 5 个叶子寿命后进入历史视图。',
-              value: draft.tagTree.leafDecayFloor,
-              min: 0,
-              max: 1,
-              step: 0.01,
-              onChange: (value) => edit('tagTree.leafDecayFloor', value),
-              disabled,
-            }),
-          ),
-          h(
-            Section,
-            { title: '老化与活跃集合', hint: '这两个值同时是策略参数：写入 config 即进入 policy，下一次维护生效。', hidden: simpleMode },
-            h(Field, {
-              label: '记忆半衰期（decay.halfLifeDays）',
-              hint: '默认 30 天。调大能记住更久。',
-              value: draft.decayHalfLifeDays,
-              min: 7,
-              max: 365,
-              step: 1,
-              suffix: '天',
-              onChange: (value) => edit('decayHalfLifeDays', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '活跃标签上限（activeSet.cap）',
-              hint: '默认 200。多项目并行可调至 500（下次维护生效）。',
-              value: draft.activeSetCap,
-              min: 100,
-              max: 1000,
-              step: 50,
-              onChange: (value) => edit('activeSetCap', value),
-              disabled,
-            }),
-          ),
-          h(
-            Section,
-            { title: 'L2.5 趋势隔离', hidden: simpleMode },
-            h(Field, {
-              label: '隔离期（天）',
-              value: draft.temp.ttlDays,
-              min: 1,
-              max: 3650,
-              step: 1,
-              suffix: '天',
-              onChange: (value) => edit('temp.ttlDays', value),
-              disabled,
-            }),
-            h(Field, {
-              label: '晋升窗口（天）',
-              hint: '必须不大于隔离期。',
-              value: draft.temp.promotionWindowDays,
-              min: 0,
-              max: 3650,
-              step: 1,
-              suffix: '天',
-              onChange: (value) => edit('temp.promotionWindowDays', value),
-              disabled,
-            }),
-          ),
-          h(
-            Section,
-            { title: '身份' },
-            h(Select, {
-              label: '事件时间策略（identity.eventTimePolicy）',
-              hint: 'content：由内容推导；explicit：调用方必须提供；ingest：使用写入时刻。',
-              value: draft.eventTimePolicy,
-              options: EVENT_TIME_OPTIONS,
-              onChange: (value) => edit('eventTimePolicy', value),
-              disabled,
-            }),
-          ),
-          h(
+              h(
+                SettingsGroup,
+                { groupId: 'ingest', label: '摄入与蒸馏', hint: '打标 · 工具裁剪 · 能力开关 · Dream / L2 合并 / L2.5', groupRefs },
+                ...SettingsIngestGroup(settingsBag),
+              ),
+              h(
+                SettingsGroup,
+                { groupId: 'retention', label: '留存与归档', hint: 'raw 冷热分层 · 标签树 · 老化 · 存储图谱 · 删除复习', groupRefs },
+                ...SettingsRetentionGroup(settingsBag),
+              ),
+              h(
+                SettingsGroup,
+                { groupId: 'space', label: '空间与存储', hint: '多空间路由 · 会话交接 · 数据目录迁移', groupRefs },
+                ...SettingsSpaceGroup(settingsBag),
+              ),
+              h(
             'div',
             { style: { display: 'flex', alignItems: 'center', gap: 12, position: 'sticky', bottom: 0, padding: '8px 0', background: 'transparent' } },
             h(
@@ -4070,10 +4359,13 @@
           ),
           // The very bottom of the settings content (after the save row): the
           // promise the engine can actually keep. Sessions die; the persona does not.
-          h(
+              h(
             'div',
             { style: { paddingTop: 10, borderTop: `1px solid ${palette.border}`, fontSize: 12, fontWeight: 600, color: palette.muted } },
             '本插件不能保证一个会话永生不死，只能保证人格不死。',
+          ),
+
+            ),
           ),
         );
       }

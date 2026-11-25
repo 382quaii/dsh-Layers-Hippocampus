@@ -1,6 +1,6 @@
-# Release 1.7.1 — 发布准备（本地）
+# Release 1.7.2 — 发布准备（本地）
 
-> 版本：**1.7.1**（2026-11-24：**提示预算治理——摘要卫生常开、提示标签单向静默、任务模式当前状态行**；累计 1.7.0 的全链路记忆第二半——人格化与隐私——L3 六维人格、`privacy:secret` 隐私闸门、Dream 事实来源区分 user/self、交接接口结构化、`/memory status` 工具使用证据。累计 1.6.9 的实体模糊归并 + 别名字典、1 跳共现联想 + 时间窗加成、自动指针注入；累计 1.6.8 的写侧密文护栏 A4 与未完成表重写、1.6.7 的索引式注入 M1 与发布链修正、1.6.6 的 Live Compact 修复、1.6.5 的微内核回归、1.6.4 的 1M 溢出修复、1.6.3 的配置迁移与启动降级）。
+> 版本：**1.7.2**（2026-11-25：**设置页结构重构——17 张卡片收进五个分组、左侧竖排目录、简洁模式只留四组**；累计 1.7.1 的提示预算治理——摘要卫生常开、提示标签单向静默、任务模式当前状态行；**提示预算治理——摘要卫生常开、提示标签单向静默、任务模式当前状态行**；累计 1.7.0 的全链路记忆第二半——人格化与隐私——L3 六维人格、`privacy:secret` 隐私闸门、Dream 事实来源区分 user/self、交接接口结构化、`/memory status` 工具使用证据。累计 1.6.9 的实体模糊归并 + 别名字典、1 跳共现联想 + 时间窗加成、自动指针注入；累计 1.6.8 的写侧密文护栏 A4 与未完成表重写、1.6.7 的索引式注入 M1 与发布链修正、1.6.6 的 Live Compact 修复、1.6.5 的微内核回归、1.6.4 的 1M 溢出修复、1.6.3 的配置迁移与启动降级）。
 
 > 状态：**代码与文档已提交，GitHub 侧由发布步骤推送；npm 侧仍被账号封控挡住。**
 > 剩余 **npm publish** 未执行，且**不是本地命令的问题**：`npm whoami` 已能返回 `382quaii`，
@@ -23,7 +23,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 
 排查已排除的项：`whoami` 正常、`pack --dry-run` 正常、`--cache` 已指向可写目录、
 两步验证流程已走（提示里有 `Authenticate your account at: …/auth/cli/…`）。
-`registry` 侧确认 `1.6.7` / `1.6.8` / `1.6.9` / `1.7.0` 仍未发布；`1.7.1` 为本轮新增。
+`registry` 侧确认 `1.6.7` / `1.6.8` / `1.6.9` / `1.7.0` 仍未发布；`1.7.1` 仍未发布；`1.7.2` 为本轮新增。
 
 恢复路径（按顺序试）：
 1. 查 `382quaii` 的注册邮箱（含垃圾箱）里的 npm 安全通知，点其中的验证/申诉链接——
@@ -32,12 +32,34 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 3. 仍未解除则走 <https://www.npmjs.com/support> 提交支持单，附上面这条 `E403` 原文与时间戳。
 4. **在解封前，用户可以改用 GitHub 安装**（tag 在远端）：
    ```powershell
-   pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.7.1"
+   pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.7.2"
    ```
 
 ## 本版内容
 
-### 主线一（1.7.1）提示预算治理：只给还没过期的信息
+### 主线一（1.7.2）设置页结构重构：分组目录代替 17 张卡片的单向滚动
+
+问题不在功能而在**可达性**：17 张卡片堆在一条 4000 多行的长滚动里，改一项配置要滚很久，
+而「哪几块是一类」只能靠卡片标题自己猜。1.7.2 只动显示层：
+
+- **五个分组**（`SETTINGS_GROUPS`）：`identity` 身份与行为、`context` 上下文与注入、
+  `ingest` 摄入与蒸馏、`retention` 留存与归档、`space` 空间与存储。每项带 `label`、
+  `hint` 与 `visibleInSimple`（`ingest` 为 `false`）。
+- **左侧竖排目录**（`SettingsNav`）：**独立滚动的固定栏**。外面的 shell 高度在挂载时量一次
+  （`window.innerHeight - shell.top - 24`，`resize` 时重量），目录与卡片各有一个滚动条：
+  点目录滚卡片、滚卡片目录不动。最初写成 `position: sticky`，实测**不生效**——宿主 shell 的
+  overflow 包裹层不是滚动容器，sticky 子元素会随内容一起滚走；这是本轮唯一一次「先做错再纠正」。
+  滚动高亮改成 `IntersectionObserver`，且 `root` 必须指向卡片滚动容器（不是视口），
+  否则有了内部滚动条后 observer 永不触发。
+- **卡片 DOM 逐字搬迁**：五个 `Settings*Group(bag)` 组件只负责容器、组名与说明，JSX 原样
+  搬过去（函数体首行统一从 `bag` 解构 19 个变量，因此卡内一个字符都不用改），
+  所以控件、`validateDraft` 白名单、`hidden: simpleMode` 语义全部不变。
+- **布局**：`maxWidth` 720 → 980；外层 `display: flex; flexWrap: wrap`，目录 `flex: 0 0 148px`、
+  内容 `flex: 1 1 460px; minWidth: 0`（窄屏目录在上、内容在下）。
+- **契约测试**：`test/v163.ui.test.js` 新增 `settingsBody()`，把 `MemorySettings` 与五个分组
+  组件体拼起来断言卡片存在/被隐藏——结构重构最容易出的是「测试还在读旧位置」的假绿。
+
+### 主线二（1.7.1）提示预算治理：只给还没过期的信息
 
 1. **摘要卫生（常开，不受模式开关影响）**：新增 `src/promptHygiene.js`。交接摘要、L3 人格行、
    `[Active Task]` 过去会带上写那一刻的簿记数字（`events 348`、`reviews total 346 due 337`、
@@ -86,7 +108,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 **主线五：Live Compact 不再委托宿主 pruner（「10%→7%」的真凶，1.6.6，已发布）。**
 **主线六：回归微内核——指令集 0 Token、蒸馏单一调度器、原子服务接口（1.6.5，已发布）。**
 
-### 主线二（1.6.9 · 全链路记忆机制）
+### 主线三（1.6.9 · 全链路记忆机制）
 
 1. **本地实体归并（零 Token，写入时）**：新增 `src/entityAlias.js`。`entity:` 标签在
    `stage()` 里先走 `mergeEntityTags()`——① 别名字典命中即换规范词；② 子串包含（既有
@@ -127,7 +149,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
    `recall` 结果带 `associative` 与 `recentWindow`；`memory.status()` 暴露
    `entityAliasStatus()` 与 `associativeStatus()`。
 
-### 主线三（1.6.8 · A4 密文护栏）
+### 主线四（1.6.8 · A4 密文护栏）
 
 1. **`src/entropy.js`**（新增，纯函数、零依赖）：`shannonEntropy()` 与
    `detectCiphertext()` 三条判据——base64 连续 ≥512 字符且熵 ≥4.5；hex 连续 ≥512 字符
@@ -142,7 +164,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 5. **`记忆插件-未完成表.md` 重写**：A1–A21 逐项给关闭依据——13 关闭、2 superseded、
    2 并入 M3/M6、4 明确不做（并写明为什么不做），另列仍需外部动作的四项。
 
-### 主线四（1.6.7 · M1）
+### 主线五（1.6.7 · M1）
 
 1. **`context.injectMode`（默认 `index`）**：每个记忆块只注入一行指针
    `- [memory <eventId>] 标签 · 标签 · 标题`；正文不进 Prompt，需要细节时用 `memory_recall`
@@ -155,7 +177,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 4. **可配置**：`context.injectMode` 进 `EDITABLE_CONFIG_KEYS`，设置页「上下文窗口」卡片新增下拉，
    简洁模式下同样可见可存。9 例 `test/v167.m1.test.js`。
 
-### 主线五（1.6.7 · 发布链）
+### 主线六（1.6.7 · 发布链）
 
 1. **发布历史分叉修复**。1.6.6 的 npm 制品 `gitHead 99a07cb` 来自旧 checkout
    （`C:\Users\86135\Documents\deepseek-harness\default-workspace\dsh-memory`），
@@ -199,7 +221,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
    与 `panel.spaces.{requested,reason}` 暴露；设置页多空间卡片在「被配置关闭」时直接写明，
    不再把「没装适配器」与「你关了它」混成一个 `spaces:false`。
 
-### 主线六（1.6.6）
+### 主线七（1.6.6）
 
 1. **不再每轮委托宿主 `toolResultPruner`**。旧实现里 `guardRequest` 在**每一次**
    `agent/request` 上都 `await hostPruner.pruneSession(session)`。两处都错：
@@ -210,7 +232,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
    4,000 头 / 2,000 尾 / 每请求最多 4 个节点），健康对话**永不被改写**。
    回归用例断言：注入假 pruner 后健康请求上 `pruneSession` 调用次数 **0**。
 
-### 主线七（1.6.5）
+### 主线八（1.6.5）
 
 1. **`/memory` 指令集（0 Token）**：`resume` / `maintain` / `status` / `mute` / `unmute` 经宿主
    `commands` 服务注册。`commands.execute()` 的语义是「执行已知命令、**不发给模型**」，
@@ -231,7 +253,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
    `startSession(` / `sessionStorage` / `appendMode` / `onSlot(` / `slots.register(` /
    `ctx.slots =`。会话控制归外部路由插件。
 
-### 主线八（1.6.4）
+### 主线九（1.6.4）
 
 事故回顾（1.6.4 主线）：一次请求携带 **854,668 prompt tokens + 预留 256,000 completion tokens**
 = 1,110,668 > 模型真实窗口 **1,048,576**，被 provider 以 `CONTEXT_WINDOW_EXCEEDED` 拒绝；
@@ -330,7 +352,7 @@ npm error 403 403 Forbidden - PUT https://registry.npmjs.org/dsh-layers-hippocam
 
 ## 发布步骤（需要你执行）
 
-> 两个包：`dsh-layers-hippocampus@1.7.1`（已有 git remote）与
+> 两个包：`dsh-layers-hippocampus@1.7.2`（已有 git remote）与
 > `dsh-layers-orchestrator@0.1.0`（**目前不是 git 仓库**，需先 init/建远端）。
 > git 命令在 PowerShell 下执行（本机证书链校验被中间打断，需 `GIT_SSL_NO_VERIFY=1` 才能访问 origin）。
 > npm 发布在 **cmd** 里执行，直接用 `npm`（凭证来自默认的 `%USERPROFILE%\.npmrc`），
@@ -355,12 +377,12 @@ npm pack --dry-run               # 预检实际发布内容（含/不含不该�
 cd D:\86135\Documents\dsh\workspace\dsh-memory
 git add -A
 git status --short                 # 最后确认没有 node_modules / state / 测试临时目录
-git commit -m "chore(release): v1.7.1 - prompt hygiene, one-way hint silence, task/expert mode, state line"
+git commit -m "chore(release): v1.7.2 - restructure the settings page into grouped navigation"
 
 # 历史 tag：v1.5.5 / v1.5.7 / v1.6.0 / v1.6.1 / v1.6.2 / v1.6.4 / v1.6.5 / v1.6.6。
 # v1.6.5 已指向实际发布的 28776c7、v1.6.6 已指向实际发布的 99a07cb（均为 annotated），不要动它们。
-# 本次只新增 v1.7.1，不需要删任何 tag。
-git tag -a v1.7.1 -m "v1.7.1: prompt hygiene, one-way hint silence, task/expert mode, state line"
+# 本次只新增 v1.7.2，不需要删任何 tag。
+git tag -a v1.7.2 -m "v1.7.2: grouped settings navigation (display-only refactor)"
 $env:GIT_SSL_NO_VERIFY="1"         # 本机证书链校验被中间打断，git 需要它才能连 origin
 git push origin main --follow-tags
 Remove-Item Env:GIT_SSL_NO_VERIFY

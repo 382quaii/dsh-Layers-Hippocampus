@@ -273,7 +273,7 @@ L2.5 趋势隔离 / 幽灵节点 / 上下文分页 / cron+dream 单一闸门 / �
 - ✅ **冷启动防呆与注入开关（1.6.0，2026-11-06；1.6.3 改为按会话注入）**：`memory:policy` 静态前缀新增【状态唤醒】（禁止客服腔、先回看 L3 再 recall、自然接续）；新会话首轮附加 `[Cold-Start Detected: Active Space=…, Recent Topic=…]`，按两个独立开关注入 `[Cold-Start Summary]`（`context.coldStartInjectSummary`，默认 true；交接摘要优先、回退 L3 top3，≤800 字）与 `[Previous Context Tail]`（`context.coldStartInjectRecentTurns`，**1.6.3 起默认 true**；优先回放交接标记里的 `tailTurns`——最后 ≤5 轮原话，无则回退最近 ≤5 条业务事件，每条 ≤200 字）。双关时不注入任何历史块，静态防呆仍在。**注入按会话幂等**（键 `session|交接批次`，`runtime.coldStart.pending/injected`），兄弟 agent 先装配不会再吞掉用户新对话的注入；匹配到的 pending 即使开关全关也会被消费，不遗留到无关会话。7 个用例 `test/v160.coldStart.test.js`。
 - ✅ **检索上限剪枝（1.6.1，2026-11-07，性能审计 A）**：每个命中分数 = `salience × decay × tagAffinity(≤3) × lexicalBoost(≤1) × association(≤1) × timeBoost(≤1.3) × handoff(≤1)`，故 `salience × 3.9` 是硬上界；候选按 salience 降序访问，一旦上界打不过当前第 k 名分数即停止评分（严格 `<` 保证并列仍被访问）。pinned 命中绕过剪枝，best-k 窗口保证上界精确；结果带 `pruned` 与 `notes: pruned:<n>`。最坏复杂度仍为 O(K log K)（排序），但长尾候选的 decay/similarity 计算被跳过。4 个用例 `test/v170.pruning.test.js`。
 - ✅ **段记 Token 审计（1.6.1，2026-11-07）**：`docs/AUDIT-2026-11-07-segment-token.md` — 无 P0 重复注入；6 个注入面分别有会话级/标签级去重；记录 2 个 P3 优化点（Active Task 跨面去重、Persona 按 L3 版本 memo）。
-- ✅ **版本解冻（2026-11-07）**：移除 1.5.7 的“版本冻结/不再升版本号”表述，自 1.6.0 起恢复语义化版本节奏；当前 **1.7.1**。
+- ✅ **版本解冻（2026-11-07）**：移除 1.5.7 的“版本冻结/不再升版本号”表述，自 1.6.0 起恢复语义化版本节奏；当前 **1.7.2**。
 - ✅ **1.6.9 全链路记忆机制（2026-11-22）**：三处漏点一起补。
   ① **写入归并**——新增 `src/entityAlias.js`，`entity:` 标签在 `stage()` 里先折名：别名字典 →
   子串包含（已有 `entity:红薯` 时 `entity:烤红薯` 折向短词）→ 编辑距离（≥0.8 且长度差 ≤2）；
@@ -302,6 +302,7 @@ L2.5 趋势隔离 / 幽灵节点 / 上下文分页 / cron+dream 单一闸门 / �
   ③ **Dream 事实来源**——蒸馏输出契约扩为 `{"summary","confidence","facts":[{"text","source"}],"dimension"}`，`parseFacts()` 把**无主或非法 source 的条目直接丢弃**（绝不默认成「用户说的」），本地兜底按事件 role 生成；facts 与 dimension 一并写进 L3 `meta`。
   ④ **交接接口结构化**——`getLatestHandoffSummary()` 在保留 `text` 的同时给出 `activeTask` / `recentFacts` / `personaTraits` / `lastRawTurns`（每条必带 `role`，禁止无主纯文本），轮数由新增的 `context.handoffSummaryTurns`（默认 4，范围 3–5）控制在 3–5 条。
   ⑤ **工具使用证据**——`/memory status` 增加「工具使用（本进程）」，报每个工具真实调用次数，对 `recall`/`capture`/`deep_raw` 长期 0 次的工具直接建议 `/memory tools disable`；数据来自注册处的本地计数，不额外发模型请求。7 例 `test/v170.dimensions.test.js`，全量 **548/548**（86 文件）。
+- ✅ **1.7.2 设置页结构重构（2026-11-25）**：把 17 张卡片按用途收进五组（身份与行为 / 上下文与注入 / 摄入与蒸馏 / 留存与归档 / 空间与存储），左侧竖排目录 `position: sticky` 固定视口、`scrollIntoView` 平滑跳转、`IntersectionObserver` 同步高亮；卡片 DOM 逐字搬进 `SettingsIdentityGroup` 等五个组件，控件/校验/`hidden: simpleMode` 语义零变化（简洁模式仍只四组）；表单宽 720→980、窄屏折行；`test/v163.ui.test.js` 新增 `settingsBody()` 拼接组件体断言。全量 555/555（87 文件）。
 - ✅ **1.7.1 提示预算治理（2026-11-24）**：三项都来自一次真实长会话的复盘——
   ① **摘要卫生（常开）**：新增 `src/promptHygiene.js`，`stripVolatile()` 只删簿记子句
   （版本号 / `key: N` / `gen-…` / ISO 时间戳 / `N 条·个·分片`），**不删无键名的裸数字**，
@@ -337,11 +338,11 @@ L2.5 趋势隔离 / 幽灵节点 / 上下文分页 / cron+dream 单一闸门 / �
 - ✅ **1.6.6 发布修正（2026-11-16）**：M7 联网复核发现 **1.6.5 的 npm 制品（`gitHead 28776c7`）里没有 Live Compact 修复**——`guardRequest` 仍在每次 `agent/request` 上委托宿主 `toolResultPruner.pruneSession()`，而宿主用的预算是预设自己的（ptc `thresholdChars 8192` → 4k 头 + 1k 尾）、且只在本机 compaction-basic 的 `context-overflow` 分支里调用它，等于把「溢出时裁剪」变成「每轮都裁剪」，一次 pass 可掉约 80k tokens（用户报的「10% 直接掉到 7%」）。本版改为**只跑自己的保守裁剪**（`context.liveCompact` 默认 200,000 / 4,000 / 2,000 / 每请求 4 节点），并加回归用例断言健康请求上宿主 pruner **零调用**、一条 20k 字符的正常结果不产生任何 surface 改写。本地 `v1.6.5` tag 重建为 annotated 并指向已发布的 `28776c7`，不再与 npm/GitHub 矛盾（npm 版本不可覆盖，故修复必须走新版本号）。**事后核对：1.6.6 的 npm 制品 `gitHead 99a07cb` 同样来自旧 checkout，只含这一条修复，M3/M5 实际随 1.6.7 发出。**
 - **测试**：`dsh-memory` **555/555**（87 文件）；`dsh-orchestrator` **31/31**。
 - **M3/M4 状态更新**：M3 已落地（独立 `persona` section order=100）；M4 已改为通用 `customDecayRate`/`customHalfLifeDays`，由情感插件调用时传参，插件内不再判断 `emotion:` 前缀。
-- ✅ **版本冻结 1.5.7 + 本地发布卫生**（历史，2026-11-04）：`package.json` 升到 1.5.7；本地 commit `release: v1.5.7 …` + tag `v1.5.7`（**未 push**）。该冻结已于 2026-11-07 解除，当前 1.7.1。
-- **仍未完成**：**npm publish 1.6.7 / 1.6.8 / 1.6.9 / 1.7.0 / 1.7.1** 被账号级封控挡住——`npm whoami` 正常（`382quaii`）、
+- ✅ **版本冻结 1.5.7 + 本地发布卫生**（历史，2026-11-04）：`package.json` 升到 1.5.7；本地 commit `release: v1.5.7 …` + tag `v1.5.7`（**未 push**）。该冻结已于 2026-11-07 解除，当前 1.7.2。
+- **仍未完成**：**npm publish 1.6.7 / 1.6.8 / 1.6.9 / 1.7.0 / 1.7.1 / 1.7.2** 被账号级封控挡住——`npm whoami` 正常（`382quaii`）、
   `npm pack --dry-run` 正常（71 files / 540.2 kB），但 `npm publish` 返回
   `E403 Your account has been temporarily suspended due to a recent security-sensitive action`
   （2026-11-17，`registry` 侧确认 `latest` 仍为 `1.6.6`）。这不是 token/OTP/命令形态问题，
   需查收 npm 安全邮件走申诉或等自动解封；解封前可用
-  `pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.7.1"` 安装同一份代码。
+  `pnpm add "github:382quaii/dsh-Layers-Hippocampus#v1.7.2"` 安装同一份代码。
   之后仍是：市场目录 PR（需 GitHub/npm 凭据）。`git push` 已完成（`main = aa38876` 起的 release 链、`v1.6.7` tag）；1.6.9 的推送在发布步骤里执行。

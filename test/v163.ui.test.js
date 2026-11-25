@@ -29,6 +29,24 @@ function componentBody(name) {
   return lines.slice(start, end).join('\n');
 }
 
+/**
+ * v1.7.2: the form is split into one component per nav group, so the cards no
+ * longer live inside MemorySettings' own body. Assertions about the RENDERED
+ * cards must read MemorySettings plus every group component; assertions about
+ * behaviour (save filtering, validation) still only need MemorySettings.
+ */
+const SETTINGS_GROUP_COMPONENTS = [
+  'SettingsIdentityGroup',
+  'SettingsContextGroup',
+  'SettingsIngestGroup',
+  'SettingsRetentionGroup',
+  'SettingsSpaceGroup',
+];
+
+function settingsBody() {
+  return [componentBody('MemorySettings'), ...SETTINGS_GROUP_COMPONENTS.map((name) => componentBody(name))].join('\n');
+}
+
 test('Section respects the hidden prop before rendering anything', () => {
   const body = componentBody('Section');
   assert.match(body, /if \(props\.hidden === true\) return null;/, 'hidden sections render nothing');
@@ -47,7 +65,7 @@ test('the mode preference is client-only and defaults to 专业模式', () => {
 });
 
 test('MemorySettings hides every section except the four simple-mode blocks', () => {
-  const body = componentBody('MemorySettings');
+  const body = settingsBody();
   const hiddenTitles = [
     '行为',
     '工具 schema 裁剪（tools.disabled）',
@@ -84,7 +102,7 @@ test('MemorySettings hides every section except the four simple-mode blocks', ()
 });
 
 test('the raw card keeps exactly three controls in simple mode', () => {
-  const body = componentBody('MemorySettings');
+  const body = settingsBody();
   const rawIndex = body.indexOf("title: '原始回合留存（raw）'");
   const rawCard = body.slice(rawIndex, body.indexOf("title: '删除与复习'"));
   assert.match(rawCard, /label: 'raw\.mode'/, 'raw.mode stays');
@@ -111,7 +129,7 @@ test('simple mode filters save and validation to the visible keys', () => {
   assert.match(patchList.slice(0, 800), /'context\.maxInjectTokens'/);
   assert.match(patchList.slice(0, 800), /'raw\.compressionEngine'/);
   assert.match(source, /const SIMPLE_NUMBER_KEYS = \['context\.maxTokens'/);
-  const body = componentBody('MemorySettings');
+  const body = settingsBody();
   assert.match(body, /Object\.entries\(patch\)\.filter\(\(\[key\]\) => SIMPLE_PATCH_KEYS\.includes\(key\)\)/);
   assert.match(body, /const payloadPatch = simpleMode/, 'save builds a filtered patch');
   assert.match(body, /JSON\.stringify\(\{ patch: payloadPatch \}\)/, 'the filtered patch is what gets POSTed');
