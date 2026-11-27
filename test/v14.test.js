@@ -181,7 +181,7 @@ test('deep_raw is a loud error, not an empty list, when raw is off', async () =>
 
 // ---- raw: read-side redaction ---------------------------------------------
 
-test('disk keeps plaintext, deep_raw returns redacted snippets', async () => {
+test('disk keeps plaintext, deep_raw hard-blocks sensitive content unless allow_sensitive', async () => {
   await withMemory({ mode: 'all' }, async ({ memory, dir }) => {
     const secret = 'sk-1234567890abcdefghijklmnop';
     await memory.captureRaw({ content: `api key is ${secret} keep it local`, kind: 'chat', force: true });
@@ -189,16 +189,26 @@ test('disk keeps plaintext, deep_raw returns redacted snippets', async () => {
     const raw = fs.readFileSync(path.join(dir, 'raw', fs.readdirSync(path.join(dir, 'raw'))[0]), 'utf8');
     assert.ok(raw.includes(secret), 'black box stores plaintext');
 
+    // v1.7.3 (module 3): a sensitive raw turn is withheld at the read path, not
+    // merely redacted — a snippet is one of the ways a secret leaks back.
     const result = await memory.deepRaw({ text: 'api key', startTime: T0 - DAY_MS, endTime: T0 + DAY_MS });
-    assert.equal(result.hits.length, 1);
-    assert.ok(result.hits[0].snippet.includes('[redacted]'));
-    assert.equal(result.hits[0].snippet.includes(secret), false);
+    assert.equal(result.hits.length, 0);
+    assert.ok(result.scanned.sensitiveSkipped >= 1);
+
+    const allowed = await memory.deepRaw({
+      text: 'api key',
+      startTime: T0 - DAY_MS,
+      endTime: T0 + DAY_MS,
+      allowSensitive: true,
+    });
+    assert.equal(allowed.hits.length, 1);
+    assert.ok(allowed.hits[0].snippet.includes('api key'), 'the turn itself is reachable again');
   });
 });
 
 // ---- raw: tombstones -------------------------------------------------------
 
-test('forget appends a raw tombstone and deep_raw can no longer return the text', async () => {
+test('forget writes the tombstone overlay (not the shard) and deep_raw can no longer return the text', async () => {
   await withMemory({ mode: 'all' }, { delete: { graceHours: 0 } }, async ({ memory, dir }) => {
     const saved = await memory.remember({ content: 'the deploy window is friday night', tags: ['ops'], salience: 0.9, happenedAt: T0 });
     await memory.captureRaw({ content: 'the deploy window is friday night', role: 'assistant', kind: 'chat', force: true });
@@ -208,8 +218,12 @@ test('forget appends a raw tombstone and deep_raw can no longer return the text'
     assert.equal(before.hits.length, 1);
 
     await memory.forget({ eventIds: [saved.eventId], reason: 'tombstone-test' });
-    const raws = fs.readFileSync(path.join(dir, 'raw', fs.readdirSync(path.join(dir, 'raw'))[0]), 'utf8');
-    assert.match(raws, /raw_tombstone/);
+
+    // v1.7.3 (module 2): tombstones live in state/raw-tombstones.json — appending
+    // them into the append-only raw log duplicated the key and grew raw forever.
+    const rawName = fs.readdirSync(path.join(dir, 'raw'))[0];
+    const raws = fs.readFileSync(path.join(dir, 'raw', rawName), 'utf8');
+    assert.equal(raws.includes('raw_tombstone'), false);
 
     const after = await memory.deepRaw({ text: 'deploy window', startTime: T0 - DAY_MS, endTime: T0 + DAY_MS });
     assert.equal(after.hits.length, 0, 'tombstoned content is skipped');

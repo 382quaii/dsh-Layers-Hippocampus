@@ -71,6 +71,7 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   // only move data between spaces and track the native context window.
   'context.autoSpaceFollow',
   'context.autoRolloverEnabled',
+    'context.handoffClearRatio',
   'context.autoRolloverThreshold',
   'context.nativeTokenLimit',
   // Security red line (v1.5.1): the operator decides whether model-initiated
@@ -102,6 +103,12 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   'context.mode',
   'context.hintsIdleSilenceAfter',
   'context.statePointer.enabled',
+  // v1.7.3 physical pruning (module 1).
+  'context.smartPrune.enabled',
+  'context.smartPrune.threshold',
+  'context.smartPrune.keepRecentTurns',
+  'context.smartPrune.minChars',
+  'context.smartPrune.maxNodes',
   'context.statePointer.maxChars',
   'context.coldStartInjectSummary',
   'context.coldStartInjectRecentTurns',

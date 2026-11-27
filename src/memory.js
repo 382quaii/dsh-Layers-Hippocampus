@@ -53,7 +53,7 @@ import {
 import { SemanticStore } from './semantic/semanticStore.js';
 import { TempSemanticStore } from './semantic/tempSemantic.js';
 import { ContextEngine } from './context/contextEngine.js';
-import { rehandoffDecision } from './context/windowGuard.js';
+import { HANDOFF_CLEAR_RATIO, relievedDecision, rehandoffDecision } from './context/windowGuard.js';
 import { DEFAULT_SPACE_ID, SpaceRouter, normaliseSpaceId, validateNewSpaceId } from './spaces/singleSpace.js';
 import { nextRun, parseCron } from './cron.js';
 
@@ -116,6 +116,9 @@ function validateRoutedNewSpaceId(value) {
 import { ensureDir, dayKey, genNumber, sha256, readJson, writeJsonAtomic, snippet } from './util.js';
 import { detectCiphertext } from './entropy.js';
 import { filterSecret, isSecretRecord, privacyMetaFor } from './privacy.js';
+// v1.7.3 (module 3): fine-grained `sensitive:*` categories replace the coarse
+// `privacy:secret` marker on the WRITE path (the old tag keeps filtering reads).
+import { detectSensitive, filterSensitive, sensitiveMetaFor, sensitiveTag } from './sensitive.js';
 
 /** Recursive byte size of a directory tree (symlinks count as their target size). */
 function diskUsage(dir) {
@@ -813,6 +816,20 @@ export class Memory {
     if (secretMeta) {
       payloadMeta = { ...(payloadMeta && typeof payloadMeta === 'object' ? payloadMeta : {}), ...secretMeta };
     }
+    // v1.7.3 (module 3): Pre-Ingest classification. The content is stored verbatim
+    // (the black box must work with no other service running); what changes is that
+    // the record now carries a category the READ path can enforce.
+    const sensitiveCategories = detectSensitive(content);
+    if (sensitiveCategories.length > 0) {
+      for (const category of sensitiveCategories) {
+        const tag = sensitiveTag(category);
+        if (!tagInfo.tags.includes(tag)) tagInfo.tags.push(tag);
+      }
+      const sensitiveMeta = sensitiveMetaFor(sensitiveCategories);
+      if (sensitiveMeta) {
+        payloadMeta = { ...(payloadMeta && typeof payloadMeta === 'object' ? payloadMeta : {}), ...sensitiveMeta };
+      }
+    }
     const payload = {
       content,
       tags: tagInfo.tags,
@@ -1245,7 +1262,13 @@ export class Memory {
       };
     }
     const job = await this.deletePipeline.request({ eventIds: ids, mode, reason });
-    if (mode === 'purge') await this.raw.tombstone(contentHashes, { at: this.clock.now() });
+    if (mode === 'purge') {
+      // v1.7.3 (module 2): tombstone BOTH granularities. The content hash covers
+      // the fragment that was deleted; the turn id covers the raw turn it came
+      // from, so `deep_raw` cannot hand back "the turn behind the deleted memory".
+      const turnIds = await this.raw.turnIdsForHashes(contentHashes);
+      await this.raw.tombstone({ hashes: contentHashes, turnIds, at: this.clock.now() });
+    }
     const maintenance = await this.maintenance.run({ reason: `forget:${job.id}` });
     return { state: 'deleted', job: this.publicJob(job), maintenance: this.publicMaintenance(maintenance) };
   }
@@ -1327,7 +1350,7 @@ export class Memory {
   }
 
   /** The space-local read path. */
-  async _recallLocal({ text = '', tags = [], topK, maxAssociativeHops, includeSecret = false } = {}, { mergeRecall = true } = {}) {
+  async _recallLocal({ text = '', tags = [], topK, maxAssociativeHops, includeSecret = false, allowSensitive = false } = {}, { mergeRecall = true } = {}) {
     this.assertOpen();
     const now = this.clock.now();
     // v1.6.9: validated BEFORE any work (and before the empty-index shortcut) so an
@@ -1400,9 +1423,12 @@ export class Memory {
     // v1.7.0 (M3): the last gate before a hit can reach the model. `withheld` is a
     // COUNT only — a caller may learn that something was withheld, never what it was.
     const visible = filterSecret(merged.hits, { includeSecret });
+    // v1.7.3 (module 3): sensitive records are PHYSICALLY excluded unless the caller
+    // passes `allow_sensitive`. The count is reported, the content never is.
+    const cleared = filterSensitive(visible.list, { allowSensitive });
     const payload = {
       ...result,
-      hits: visible.list,
+      hits: cleared.list,
       ...(merged.stats ? { merge: merged.stats } : {}),
       ghostHints: ghostPass.ghostHints,
       oversizedTagHints: result.oversizedTagHints ?? [],
@@ -1417,6 +1443,7 @@ export class Memory {
         ...(associations.length > 0 ? [`graph-associations:${associations.length}`] : []),
         ...(merged.stats ? [`read-merge:${merged.stats.total}`] : []),
         ...(visible.withheld > 0 ? [`privacy-withheld:${visible.withheld}`] : []),
+        ...(cleared.withheld > 0 ? [`sensitive-withheld:${cleared.withheld}`] : []),
         ...(this._boot && this._boot.status !== 'ok' ? [`boot-check:${this._boot.status}`] : []),
       ],
     };
@@ -1626,6 +1653,8 @@ export class Memory {
       });
     }
     return this.raw.scan({
+      // v1.7.3 (module 3): the raw scan is a read path like any other.
+      allowSensitive: query.allowSensitive === true || query.allow_sensitive === true,
       text: query.text,
       startTime: query.startTime,
       endTime: query.endTime,
@@ -1969,6 +1998,67 @@ export class Memory {
     // Keep provenance even after consumption (consumedBy/consumedAt are how the
     // next boot can tell "handed off" from "never handed off").
     return { ...marker, active: marker.active === true };
+  }
+
+  /**
+   * v1.7.4: keep an ACTIVE marker honest — it must EXPIRE with the pressure that
+   * wrote it.
+   *
+   * Before this, `checkHandoff()` ran only when a request already could not fit, so
+   * a marker was written at ≥80% pressure and then never cleared. The prompt kept
+   * injecting "[交接标记] 上下文已接近原生窗口上限" every turn no matter how small the
+   * conversation became — external compaction (billion-context) can drop the same
+   * session from ~900k to ~120k tokens and the plugin had no way to notice. The model
+   * trusted the claim and handed off "early" by design.
+   *
+   * Runs synchronously in the prompt path (state/handoff.json is a small JSON read and
+   * nativeState() is pure arithmetic), because it has to be true for THIS turn.
+   *
+   * @param {{ usage?: { sessionId?: string|null, tokens?: number }|null, threshold?: number|null }} input
+   * @returns {{ marker: object, cleared: boolean, relieved: boolean, ratio: number|null, reason: string }}
+   */
+  maintainHandoffMarker({ usage = null, ratio = null, threshold = null } = {}) {
+    const marker = this.handoffState();
+    if (!marker || marker.active !== true) {
+      return { marker, cleared: false, relieved: false, ratio: null, reason: 'inactive' };
+    }
+    const limit = Number.isFinite(threshold) ? threshold : this.config?.context?.handoffClearRatio ?? HANDOFF_CLEAR_RATIO;
+    // The host's own measurement (`tokenMeter.contextPressure`, threaded through
+    // `guardRequest`) is authoritative. The local session counter is only a fallback:
+    // nothing in the real host calls observeSessionTokens, so it is usually EMPTY — and
+    // an absent ratio must never be mistaken for 0 pressure (that would clear a marker
+    // that is still true).
+    let projectedRatio = Number.isFinite(ratio) ? ratio : null;
+    if (projectedRatio === null) {
+      const sessionTokens = Number.isFinite(usage?.tokens) && usage.tokens > 0 ? usage.tokens : this.sessionUsage()?.tokens;
+      if (!Number.isFinite(sessionTokens) || sessionTokens <= 0) {
+        return { marker, cleared: false, relieved: false, ratio: null, reason: 'no-pressure' };
+      }
+      try {
+        projectedRatio = this.context?.nativeState?.({ sessionTokens })?.projectedRatio ?? null;
+      } catch {
+        projectedRatio = null;
+      }
+    }
+    if (!Number.isFinite(projectedRatio)) {
+      return { marker, cleared: false, relieved: false, ratio: null, reason: 'no-pressure' };
+    }
+    const decision = relievedDecision({ markerRatio: marker.ratio ?? null, projectedRatio, threshold: limit });
+    if (!decision.relieved) {
+      return { marker, cleared: false, relieved: false, ratio: projectedRatio, reason: decision.reason };
+    }
+    const consumedBy = usage?.sessionId ?? null;
+    let cleared = marker;
+    try {
+      cleared = this.clearHandoff({
+        reason: `pressure-relieved:${decision.reason}`,
+        consumedBy: `${consumedBy ?? 'unknown'}:ratio=${projectedRatio}`,
+      });
+    } catch {
+      /* a stale marker is bad, but failing the prompt would be worse */
+      return { marker, cleared: false, relieved: true, ratio: projectedRatio, reason: `${decision.reason}:write-failed` };
+    }
+    return { marker: cleared, cleared: true, relieved: true, ratio: projectedRatio, reason: decision.reason };
   }
 
   /** Mark a handoff consumed (new session, or an explicit clear). */
@@ -2431,6 +2521,27 @@ export class Memory {
     } catch (error) {
       report.rawIndexError = error instanceof Error ? error.message : String(error);
     }
+    // v1.7.3 (module 2): one-time migration of the OLD tombstone format. Up to 1.7.2 a
+    // purge appended `{type:'raw_tombstone'}` lines INTO the day shards; that made the
+    // shards stop being "turns in append order" and re-scanning them on every read was
+    // the real cost. Move those keys into the overlay, then rewrite the shards clean.
+    try {
+      const legacy = this.raw._loadTombstones?.();
+      if (legacy && legacy.size > 0) {
+        const bytesBefore = await this.raw.shardBytes?.();
+        report.rawTombstoneMigration = await this.raw.stripLegacyTombstoneLines({ limit: 50 });
+        report.rawTombstoneMigration.bytesBefore = bytesBefore ?? null;
+        if (report.rawTombstoneMigration.removedLines > 0) {
+          this.logger?.info?.(
+            `raw tombstones moved to state/raw-tombstones.json: ${report.rawTombstoneMigration.removedLines} legacy lines`,
+          );
+        }
+      } else {
+        report.rawTombstoneMigration = { shards: 0, removedLines: 0, skipped: true };
+      }
+    } catch (error) {
+      report.rawTombstoneMigrationError = error instanceof Error ? error.message : String(error);
+    }
     try {
       const due = this.pendingDeletes.due(this.clock.now());
       const promoted = [];
@@ -2440,7 +2551,10 @@ export class Memory {
           .map((id) => sha256(snapshot.records.find((record) => record.event_id === id)?.content ?? ''))
           .filter(Boolean);
         await this.deletePipeline.request({ eventIds: item.eventIds, mode: item.mode, reason: item.reason });
-        if (item.mode === 'purge') await this.raw.tombstone(hashes, { at: this.clock.now() });
+        if (item.mode === 'purge') {
+        const turnIds = await this.raw.turnIdsForHashes(hashes);
+        await this.raw.tombstone({ hashes, turnIds, at: this.clock.now() });
+      }
         this.pendingDeletes.remove(item.id);
         promoted.push({ id: item.id, events: item.eventIds.length });
       }

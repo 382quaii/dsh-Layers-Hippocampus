@@ -333,6 +333,20 @@ export function hashPolicy(policy) {
 /** tag token normalisation: trim, lowercase, collapse separators. */
 export function normaliseTagToken(token) {
   if (typeof token !== 'string') return '';
+  // v1.7.3 (module 3): `sensitive:*` categories are a READ-PATH CONTRACT — the gate
+  // matches the literal prefix and external consumers key on `sensitive:api_key`.
+  // Collapsing `_` to `-` here would silently rename the contract to `api-key`, so
+  // this one family keeps its separators (spaces still normalise).
+  const lowered = token.trim().toLowerCase();
+  if (lowered.startsWith('sensitive:')) {
+    const head = lowered.slice(0, 'sensitive:'.length);
+    const tail = lowered
+      .slice('sensitive:'.length)
+      .replace(/\s+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '');
+    return (head + tail).slice(0, 64);
+  }
   return token
     .trim()
     .toLowerCase()

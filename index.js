@@ -45,6 +45,14 @@ import { isLowValley, nextLowValleyStart, windowInfo } from './src/priceWindow.j
 import { DreamTimer } from './src/dreamTimer.js';
 import { probeCompression, resolveEngine } from './src/compression.js';
 import { LIVE_COMPACT_DEFAULTS, liveCompactSession } from './src/context/liveCompact.js';
+
+// v1.7.4: how long a host-measured pressure reading may be reused while deciding
+// whether a handoff marker still tells the truth. Requests are seconds apart, so five
+// minutes is generous — and a stale reading is never used to CLEAR something.
+const HANDOFF_PRESSURE_FRESH_MS = 5 * 60 * 1000;
+// v1.7.3 (module 1): physical context pruning. No host compaction, no model call —
+// the turn is REPLACED with a pointer that keeps the event id.
+import { smartPruneSession, FOLD_MIN_CHARS, FOLD_MAX_NODES } from './src/context/smartPrune.js';
 import { snippet } from './src/util.js';
 import { dimensionOf, groupByDimension, stripPhysiology, containsPhysiology } from './src/semantic/dimensions.js';
 import { isSecretRecord } from './src/privacy.js';
@@ -68,7 +76,7 @@ export { resolveConfig, DEFAULT_CONFIG };
  * of letting a raw 404 reach the user.
  */
 export const CAPABILITIES = Object.freeze({
-  version: '1.7.2',
+  version: '1.7.3',
   spaces: true,
   memories: true,
   transferConsent: true,
@@ -952,8 +960,23 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     // current preset is readable here even when no change event ever fired.
     runtime.syncAgentPreset();
     if (runtime.phase === 'ready') {
-      const handoff = memory.handoffState();
       const usage = memory.sessionUsage();
+      // v1.7.4: the marker must expire with the pressure that wrote it. This used to be
+      // checked only on the fail-fast path, so "[交接标记] 上下文已接近原生窗口上限" was
+      // injected on every turn even at 10% usage, and the model handed off early.
+      let handoff = memory.handoffState();
+      try {
+        // Only a FRESH host measurement may expire the marker (see guardRequest); the
+        // local usage counter is empty in the real host, so it must not be trusted here.
+        const pressure = runtime.lastPressure;
+        const fresh =
+          pressure && Number.isFinite(pressure.ratio) && memory.clock.now() - pressure.at <= HANDOFF_PRESSURE_FRESH_MS;
+        if (handoff.active && fresh) {
+          handoff = memory.maintainHandoffMarker({ ratio: pressure.ratio, usage })?.marker ?? handoff;
+        }
+      } catch {
+        /* prompt assembly must never fail because of marker upkeep */
+      }
       const sessionId = usage?.sessionId ?? 'anonymous';
       // SessionStart OR rollover resets the dedup pool: the new session may receive
       // the same handoff summary / tags that the old one already saw.
@@ -1168,11 +1191,81 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     }
     hostProbes.updatedAt = memory.clock.now();
 
-    // ---- 3. fail fast on a request that CANNOT fit -------------------------
-    const state = memory.context.nativeState({
+    // ---- 2.5 physical pruning (v1.7.3, module 1) --------------------------
+    // At the configured share of the REAL window we fold the oldest verbose turns
+    // into pointers BEFORE measuring again. This is what makes the plugin usable
+    // without the host's compaction engine: the surface shrinks, the log does not.
+    const pruneConfig = runtime.config?.context?.smartPrune ?? {};
+    let state = memory.context.nativeState({
       usedTokens: hostProbes.usedTokens ?? undefined,
       reservedTokens: hostProbes.reservedTokens ?? undefined,
     });
+    const pruneThreshold = Number.isFinite(pruneConfig.threshold) ? pruneConfig.threshold : 0.85;
+    if (pruneConfig.enabled !== false && session && state.projectedRatio >= pruneThreshold) {
+      try {
+        runtime.lastSmartPrune = {
+          source: 'hippocampus',
+          at: memory.clock.now(),
+          threshold: pruneThreshold,
+          ratioBefore: state.projectedRatio,
+          ...smartPruneSession(session, {
+            keepRecentTurns: pruneConfig.keepRecentTurns ?? 3,
+            minChars: pruneConfig.minChars ?? FOLD_MIN_CHARS,
+            maxNodes: pruneConfig.maxNodes ?? FOLD_MAX_NODES,
+            logger: runtime.logger,
+            // The pointer must name something a reader can actually resolve. The raw
+            // store keys its turns deterministically (`turn_<seq>_<role>`), so the fold
+            // points at the raw turn instead of an opaque number.
+            describe: ({ seq, event }) => {
+              let role = null;
+              try {
+                role = turnFromSessionEvent(event)?.role ?? null;
+              } catch {
+                role = null;
+              }
+              return {
+                turnId: role ? `turn_${seq}_${role}` : `turn_${seq}`,
+                tool: event?.type === 'tool/result' ? (event?.data?.name ?? null) : null,
+              };
+            },
+          }),
+        };
+        if (runtime.lastSmartPrune.folded > 0) {
+          // The surface changed, so the measurement must be taken again — and the
+          // probe is refreshed too, because the host may not have re-measured yet.
+          try {
+            const after = typeof tokenMeter?.contextPressure === 'function' ? tokenMeter.contextPressure(session) : null;
+            const values = [after?.pressureTokens, after?.projectedTokens].filter((value) => Number.isFinite(value));
+            if (values.length > 0) hostProbes.usedTokens = Math.max(...values);
+          } catch {
+            /* a stale probe only costs one extra fold attempt */
+          }
+          state = memory.context.nativeState({
+            usedTokens: hostProbes.usedTokens ?? undefined,
+            reservedTokens: hostProbes.reservedTokens ?? undefined,
+          });
+          runtime.lastSmartPrune.ratioAfter = state.projectedRatio;
+        }
+      } catch (error) {
+        runtime.logger?.warn?.(`hippocampus: smart prune failed: ${asMemoryError(error).code}`);
+      }
+    }
+
+    // v1.7.4: marker upkeep on EVERY request, not only on the fail-fast path below —
+    // that asymmetry is exactly why a marker outlived the pressure that created it.
+    // This is the ONE place that owns a host-true measurement, so it is also what the
+    // next prompt assembly reuses (runtime.lastPressure).
+    try {
+      runtime.lastPressure = { ratio: state.projectedRatio, tokens: state.tokens, at: memory.clock.now() };
+      runtime.lastHandoffMaintenance = memory.maintainHandoffMarker({
+        ratio: state.projectedRatio,
+        usage: { sessionId: session?.id ?? null, tokens: state.tokens },
+      });
+    } catch {
+      /* advisory only: never block a request on marker upkeep */
+    }
+
+    // ---- 3. fail fast on a request that CANNOT fit -------------------------
     if (!state.hardExceeded) return state;
     // Try to hand off first: even though it cannot shrink THIS request, it leaves a
     // distilled tail for the next one instead of repeating the same failure.
@@ -1197,6 +1290,7 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
         ratio: state.ratio,
         handoff: handoff?.handoff?.summaryEventId ?? null,
         liveCompact: runtime.lastLiveCompact ?? null,
+        smartPrune: runtime.lastSmartPrune ?? null,
       },
     );
   };
@@ -2097,6 +2191,9 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       // "a handoff summary exists and this conversation has not seen it yet"
       // (inside noteColdStart). A delegated sub-agent also lands here — it merely
       // arms its OWN entry, and the user's conversation arms its own on first turn.
+      // v1.7.4: a new conversation starts with no pressure history; reusing the old
+      // reading would let it clear a marker that belongs to a different conversation.
+      runtime.lastPressure = null;
       runtime.noteColdStart({ agentId: payload?.agent?.id ?? null, source: 'agent-created' });
       // Track the mode this session actually runs in (a session may be created with
       // a preset without emitting a change event).
@@ -2660,6 +2757,13 @@ export async function apply(ctx, rawConfig = {}) {
           max_tokens: { type: 'number', description: 'deep_raw only: result token budget, default from raw.maxResultTokens' },
           hash: { type: 'string', description: 'deep_raw only: restore one raw turn verbatim by sha256 (from [Slimmed] hash_…)' },
           regex: { type: 'boolean', description: 'deep_raw only: treat text as a restricted regular expression' },
+          allow_sensitive: {
+            type: 'boolean',
+            description:
+              'Include records tagged sensitive:* (api_key / credential / pii). Omitted by default: they are ' +
+              'PHYSICALLY excluded and only a count appears in notes (sensitive-withheld:N). ' +
+              'Only pass this when the user has explicitly asked you to handle the secret.',
+          },
           include_secret: {
             type: 'boolean',
             description:
@@ -2673,7 +2777,10 @@ export async function apply(ctx, rawConfig = {}) {
             if (args.mode === 'deep_raw') {
               if (runtime.phase !== 'ready') return errorJson(runtime.notReady('deep_raw'));
               if (typeof args.hash === 'string' && args.hash.trim()) {
-                const restored = await runtime.memory.deepRaw({ hash: args.hash.trim() });
+                const restored = await runtime.memory.deepRaw({
+                  hash: args.hash.trim(),
+                  allowSensitive: args.allow_sensitive === true,
+                });
                 return JSON.stringify({ ok: true, ...restored });
               }
               // A missing window is NOT pre-validated here: the engine decides. A
@@ -2687,6 +2794,7 @@ export async function apply(ctx, rawConfig = {}) {
                 limit,
                 regex: args.regex === true,
                 maxTokens: args.max_tokens,
+                allowSensitive: args.allow_sensitive === true,
               });
               runtime.touch();
               runtime.recordToolCall({ landed: (result.hits ?? []).length > 0 });
@@ -2698,6 +2806,7 @@ export async function apply(ctx, rawConfig = {}) {
               topK: Math.min(args.top_k ?? config.retrieval.topK, config.maxRecallTopK),
               targetSpaceId: args.target_space_id,
               includeSecret: args.include_secret === true,
+              allowSensitive: args.allow_sensitive === true,
             });
             runtime.recordToolCall({
               landed: (result.hits ?? []).length > 0 || (result.ghostHints ?? []).length > 0,

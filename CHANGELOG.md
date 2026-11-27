@@ -4,6 +4,79 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.7.3] — 2026-11-27
+
+**上下文物理折叠、raw 墓碑移位、敏感标签硬拦截，以及交接标记随压力过期：
+四件都不靠原生压缩，全部落在插件自己的存储与读取层。**
+
+- **Added — 模块一：上下文物理裁剪（`src/context/smartPrune.js`）**。`guardRequest` 在
+  fail-fast **之前**新增「2.5 physical pruning」一步：当 `context.smartPrune.enabled !== false`
+  且 `projectedRatio >= threshold`（默认 0.85）时，把冗长的历史轮次**在原地替换**成折叠指针——
+  `session.append('compaction/prune', {...})` 记录被遮蔽的 seq 区间，再以
+  `surfaceOp: { op: 'replace', startSeq, endSeq }` 写回同类型事件，内容只剩一行：
+  `[System: 此段包含 N 轮关于 [标签] 的细节，已折叠。原文 ID: ev_xxx。若需要，请使用 recall 工具检索。]`。
+  `tool/call` 与 `tool/result` 成对保留（折叠只挑 user/assistant 长轮，跳过工具配对与已折叠节点），
+  折叠后重新测量压力并把 `ratioAfter` 记进 `runtime.lastSmartPrune`。指针优先写事件 ID，
+  没有事件 ID 时退化为 `raw:turn_<seq>_<role>` —— raw 存储的 turn_id 是确定性的，
+  所以指针永远能被 `deep_raw` 反查回来。
+- **Added — 模块二：raw 墓碑移出热路径（`src/tombstones.js` + `state/raw-tombstones.json`）**。
+  此前 `forget` 往 `raw/*.jsonl` **追加**一行 `{type:'raw_tombstone'}`：raw 是追加日志，
+  墓碑会让文件只增不减，而且每次 `deep_raw` 都要扫全部分片才能知道哪些内容已死。
+  现在 tombstone 只写覆盖层 `state/raw-tombstones.json`，**双层键**——
+  `turnIds`（整回合，O(1) 命中）与 `contentHashes`（片段级，覆盖同一句话在别处的复读）。
+  `forget()` 先用 `raw.turnIdsForHashes()` 按 `sha256(content)` 反查 turn_id，双键一起写；
+  `scan()` / 归档扫描 / `has()` 全部改走 `_isTombstoned()`。
+  `maintain()` 里加了一次性迁移：`stripLegacyTombstoneLines()` 逐分片重写文件，
+  把旧版 `raw_tombstone` 行搬进覆盖层（先 `add` 保住键，再 `.tmp-clean` + rename），
+  所以老数据升级后 raw 字节数会**下降**而不是增长。
+- **Added — 模块三：敏感标签与读时硬拦截（`src/sensitive.js`）**。`privacy:secret` 是「整条记录
+  私密」的一刀切；实际上一条记录里往往只有一句是密钥。Pre-Ingest 现在按内容分类，命中就追加
+  `sensitive:api_key` / `sensitive:pii` / `sensitive:credential` 标签（`meta.sensitive`
+  同时留证据）。读取层默认**物理剔除**：`recall` 把这些记录从 hits 里拿掉并记
+  `sensitive-withheld:<n>`，`deep_raw` 连 snippet 都不给（snippet 本身就是泄漏面），
+  只有显式 `allow_sensitive: true` 才放行；工具侧参数同名 `allow_sensitive`。
+  审计类场景需要「知道被拦了多少」但不该看到内容时，用 `memory_admin` 的计数。
+  标签归一化对 `sensitive:` 家族开了例外（保留 `_`），因为它是**读取契约**，
+  不能被 `normaliseTagToken` 改写成 `sensitive:api-key`。
+- **Changed — 契约变更（旧测试同步更新）**：`test/v14.test.js` 的「deep_raw 返回脱敏片段」
+  改为「默认拦截、放行后可见」；「forget 追加墓碑行」改为「写覆盖层、分片不增长」；
+  `test/v162.nonlinear.test.js` 的 distill-prune 墓碑断言改查覆盖层。
+- **Fixed — `pruneDistilled()` 仍在用旧的定位参数签名**（`tombstone([...hashes], {at})`），
+  1.7.3 换成对象签名后它静默写不进键；测试把这条抓了出来，已改为
+  `tombstone({ hashes: [...hashes], at: now })`。
+- **Fixed — 交接标记永不过期（"总是提前交接上下文"）**。`state/handoff.json` 一旦
+  `active: true`，`runtime.promptState()` 就**每一轮**把
+  `[交接标记] 上下文已接近原生窗口上限…` 追加到提示词尾部。而唯一会清它的两条路径都不在
+  prompt 上：① `checkHandoff()` 只在 `guardRequest` 的 `hardExceeded`（真塞不下）分支里被调用；
+  ② 1.6.3 起同一会话内不再换 session id，`marker.sessionId === usage.sessionId`，
+  stale-session 分支也不触发。于是外部压缩（host compaction / billion-context）把
+  900k 压回 120k 之后，标记仍然字面为真地宣称"接近上限"，模型学到的行为就是**提前交接**。
+- **Added — `src/context/windowGuard.js`：`relievedDecision()` + `HANDOFF_CLEAR_RATIO = 0.5`**。
+  两条独立判据，任一成立即视为"压力已解除"：`projectedRatio <= context.handoffClearRatio`
+  （绝对，默认 0.5）；或 `projectedRatio <= markerRatio - 0.3`（相对，即"这段对话被压缩过"，
+  `RELIEF_COLLAPSE_DELTA = 0.3`）。
+- **Added — `Memory#maintainHandoffMarker({ usage, ratio, threshold })`**（同步）：读标记 →
+  用**宿主的真实测量**（经 `guardRequest` 传入的 `state.projectedRatio`）判压 →
+  `clearHandoff({ reason: 'pressure-relieved:<reason>', consumedBy: '<session>:ratio=<r>' })`。
+  这里有一条必须写死的保守规则：**"没有测量"不等于"压力为 0"**。真实宿主从不调用
+  `observeSessionTokens()`，本地会话计数器通常是空的；把它读成 0 会把一条仍然真实的标记清掉，
+  所以缺测量时返回 `reason: 'no-pressure'` 并保持标记不动。
+- **Changed — 压力读数只有一个来源**：`guardRequest` 每次请求都记
+  `runtime.lastPressure = { ratio, tokens, at }` 并在**所有**请求上跑一次 upkeep（原来只在
+  fail-fast 上跑）；`promptState()` 只复用**新鲜**（`HANDOFF_PRESSURE_FRESH_MS = 5 分钟`）的读数，
+  过期或缺失时保持标记——不会因为旧读数误杀。`onAgentCreated` 会重置 `lastPressure`，
+  避免新会话继承上一个会话的读数。
+- **Added — 配置项 `context.handoffClearRatio`**（默认 `0.5`，允许 `0.1–0.9`），
+  可在设置页/配置补丁里直接改；`src/webRoutes.js` 白名单同步收录。
+- **Tests**：新增 `test/v173.pipeline.test.js` 7 例（指针形状、surface-replace 后长文本变指针且
+  tool 配对完整、保护窗口、forget 后分片字节不变/覆盖层有双键/deep_raw 扫不到、
+  敏感分类、`recall` 与 `deep_raw` 双向拦截与放行、`filterSensitive` 计数）。
+  另加 `test/v173.handoff.test.js` 9 例：两条解除判据的单元边界（含"小幅抖动不算解除"）、
+  空计数器不清标记、低压力消耗标记并写明 reason、高压力保留、相对塌陷在绝对阈值之上也能清、
+  **端到端复现原 bug**（86% 时注入、收到 12% 新鲜读数后不再注入且后续轮次保持干净）、
+  读数过期/缺失时保持注入、配置范围校验。
+  全量 **571/571**（88 个测试文件）。
+
 ## [1.7.2] — 2026-11-25
 
 **设置页结构重构：17 张卡片按用途收进 5 个分组，左侧竖排目录导航；能力与配置一字未改。**

@@ -244,6 +244,10 @@ export const DEFAULT_CONFIG = Object.freeze({
     // permission rules here, only routing and context-window bookkeeping.
     autoSpaceFollow: false,
     autoRolloverEnabled: true,
+    // v1.7.4: a handoff marker is a claim about pressure. Below this ratio the claim is
+    // no longer true, so the marker is consumed and the [交接标记] block stops being
+    // injected (otherwise the model reads "context almost full" at 10% usage forever).
+    handoffClearRatio: 0.5,
     autoRolloverThreshold: 0.85,
     // v1.6.3: USER OVERRIDE ONLY. The model's real context window comes from the host
     // adapter (`llm.resolveModelInfo().context.contextWindow`); this value is used only
@@ -262,6 +266,11 @@ export const DEFAULT_CONFIG = Object.freeze({
       tailChars: 2_000,
       maxNodesPerRequest: 4,
     },
+    // v1.7.3 (module 1): physical pruning of the conversation surface. This is the
+    // replacement for "hope the host compacts": at `threshold` of the REAL window the
+    // oldest verbose turns are rewritten into `[System: …已折叠。原文 ID: ev_x]` pointers.
+    // The log itself is untouched — only the surface the model reads.
+    smartPrune: { enabled: true, threshold: 0.85, keepRecentTurns: 3, minChars: 1200, maxNodes: 8 },
     // Security (v1.5.1): moving memories across spaces is NEVER an autonomous
     // decision. While true, the engine refuses a model-initiated transfer unless
     // the tool call carries `user_approved: true`; the UI route is the human
@@ -898,6 +907,11 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
     contextIn.autoSpaceFollow === undefined ? defaults.context.autoSpaceFollow : contextIn.autoSpaceFollow,
     'context.autoSpaceFollow',
   );
+  const contextHandoffClearRatio = requireNumberInRange(
+    contextIn.handoffClearRatio === undefined ? defaults.context.handoffClearRatio : contextIn.handoffClearRatio,
+    'context.handoffClearRatio',
+    { min: 0.1, max: 0.9 },
+  );
   const contextAutoRolloverEnabled = requireBoolean(
     contextIn.autoRolloverEnabled === undefined ? defaults.context.autoRolloverEnabled : contextIn.autoRolloverEnabled,
     'context.autoRolloverEnabled',
@@ -917,6 +931,32 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
   );
   // v1.6.3 Live Compact tunables. `thresholdChars` is compared against the total
   // characters of ONE tool result's text blocks.
+  // v1.7.3 physical pruning (module 1).
+  const smartPruneIn = contextIn.smartPrune ?? {};
+  const smartPruneEnabled = requireBoolean(
+    smartPruneIn.enabled === undefined ? defaults.context.smartPrune.enabled : smartPruneIn.enabled,
+    'context.smartPrune.enabled',
+  );
+  const smartPruneThreshold = requireNumberInRange(
+    smartPruneIn.threshold === undefined ? defaults.context.smartPrune.threshold : smartPruneIn.threshold,
+    'context.smartPrune.threshold',
+    { min: 0.5, max: 0.99 },
+  );
+  const smartPruneKeepRecentTurns = requireInteger(
+    smartPruneIn.keepRecentTurns === undefined ? defaults.context.smartPrune.keepRecentTurns : smartPruneIn.keepRecentTurns,
+    'context.smartPrune.keepRecentTurns',
+    { min: 0, max: 50 },
+  );
+  const smartPruneMinChars = requireInteger(
+    smartPruneIn.minChars === undefined ? defaults.context.smartPrune.minChars : smartPruneIn.minChars,
+    'context.smartPrune.minChars',
+    { min: 200, max: 1_000_000 },
+  );
+  const smartPruneMaxNodes = requireInteger(
+    smartPruneIn.maxNodes === undefined ? defaults.context.smartPrune.maxNodes : smartPruneIn.maxNodes,
+    'context.smartPrune.maxNodes',
+    { min: 1, max: 64 },
+  );
   const liveCompactIn = contextIn.liveCompact ?? {};
   const liveCompactEnabled = requireBoolean(
     liveCompactIn.enabled === undefined ? defaults.context.liveCompact.enabled : liveCompactIn.enabled,
@@ -1522,6 +1562,7 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
       // v1.5.0 routing knobs below; v1.5.3 removed minInjectConfidence entirely.
       autoSpaceFollow: contextAutoSpaceFollow,
       autoRolloverEnabled: contextAutoRolloverEnabled,
+      handoffClearRatio: contextHandoffClearRatio,
       autoRolloverThreshold: contextAutoRolloverThreshold,
       nativeTokenLimit: contextNativeTokenLimit,
       liveCompact: {
@@ -1530,6 +1571,13 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
         headChars: liveCompactHeadChars,
         tailChars: liveCompactTailChars,
         maxNodesPerRequest: liveCompactMaxNodesPerRequest,
+      },
+      smartPrune: {
+        enabled: smartPruneEnabled,
+        threshold: smartPruneThreshold,
+        keepRecentTurns: smartPruneKeepRecentTurns,
+        minChars: smartPruneMinChars,
+        maxNodes: smartPruneMaxNodes,
       },
       requireExplicitConsentForTransfer: contextRequireExplicitConsentForTransfer,
     },

@@ -116,3 +116,33 @@ export function rehandoffDecision({ markerRatio = null, projectedRatio = 0, same
   if (projectedRatio - base >= REHANDOFF_DELTA) return { rehandoff: true, reason: 'pressure-growth' };
   return { rehandoff: false, reason: 'below-delta' };
 }
+
+/**
+ * v1.7.4: when does an ACTIVE handoff marker stop being true?
+ *
+ * `checkHandoff()` used to run only on the fail-fast path, and since 1.6.3 a
+ * conversation keeps its session id across a handoff, so the stale-session branch
+ * never fired either: once a marker went active NOTHING cleared it. The prompt then
+ * announced "context near the native window limit" on every single turn — even after
+ * the host compacted this conversation down to ~10% — and the model duly handed off
+ * early. Relief is observable: pressure below half the window, or a 30-point drop
+ * against the marker's own ratio, means the marker is no longer telling the truth.
+ */
+export const HANDOFF_CLEAR_RATIO = 0.5;
+
+/** How far pressure must fall below the marker's own ratio to count as relief. */
+export const RELIEF_COLLAPSE_DELTA = 0.3;
+
+/**
+ * @param {{ markerRatio?: number|null, projectedRatio?: number, threshold?: number }} input
+ * @returns {{ relieved: boolean, reason: string }}
+ */
+export function relievedDecision({ markerRatio = null, projectedRatio = 0, threshold = HANDOFF_CLEAR_RATIO }) {
+  const limit = Number.isFinite(threshold) && threshold > 0 && threshold < 1 ? threshold : HANDOFF_CLEAR_RATIO;
+  const base = Number.isFinite(markerRatio) && markerRatio > 0 ? markerRatio : null;
+  if (projectedRatio <= limit) return { relieved: true, reason: 'below-clear-ratio' };
+  if (base !== null && projectedRatio <= base - RELIEF_COLLAPSE_DELTA) {
+    return { relieved: true, reason: 'pressure-collapsed' };
+  }
+  return { relieved: false, reason: 'pressure-still-high' };
+}

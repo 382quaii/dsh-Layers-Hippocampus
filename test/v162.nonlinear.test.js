@@ -173,8 +173,10 @@ test('distilled raw shards are physically cleaned and tombstoned (no resurrectio
     assert.ok(!fs.existsSync(`${file}.idx.json`), 'side-car index removed too');
 
     // Tombstone: the content is now dead for scans even if it reappears.
-    const tombstones = store._loadTombstones();
-    assert.ok(tombstones.has(sha256(content)), 'content hash tombstoned');
+    // v1.7.3 (module 2): distilled prunes write the overlay store, which outlives the
+    // shard by design (state/raw-tombstones.json sits outside raw/).
+    assert.ok(store.tombstones.has({ contentHash: sha256(content) }), 'content hash tombstoned');
+    assert.ok(fs.existsSync(store.tombstones.file), 'overlay file persisted');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

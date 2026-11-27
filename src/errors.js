@@ -150,6 +150,10 @@ export const ErrorCodes = Object.freeze({
    * paying for the prompt.
    */
   CONTEXT_EXCEEDED: 'MEM_E_CONTEXT_EXCEEDED',
+  // v1.7.3 (module 3): a caller asked for a specific record that carries a
+  // `sensitive:*` tag without passing `allow_sensitive`. Refusing loudly beats
+  // returning "[withheld]" and letting the caller believe the record is gone.
+  SENSITIVE_ACCESS_DENIED: 'MEM_E_SENSITIVE_ACCESS_DENIED',
 });
 
 export class MemoryError extends Error {

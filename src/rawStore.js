@@ -30,6 +30,8 @@ import { RawArchive, archiveMonthOf, isArchiveName, scanGzipArchive } from './ra
 import { engineForArchive } from './compression.js';
 import { buildIndex, indexFileFor, isIndexFile, readIndex, shardOverlapsWindow, writeIndex } from './rawIndex.js';
 import { detectCiphertext } from './entropy.js';
+import { RawTombstoneStore, RAW_TOMBSTONE_FILE } from './tombstones.js';
+import { detectSensitive } from './sensitive.js';
 
 export const RAW_DIR = 'raw';
 /** Records queued before a forced flush. */
@@ -212,7 +214,13 @@ export class RawStore {
     this._flushChain = Promise.resolve();
     this._hashes = new Map(); // day -> Set(sha256)
     this._dayBytes = new Map(); // day -> bytes
-    this._tombstones = null; // Set(sha256), loaded lazily
+    /**
+     * v1.7.3 (module 2): tombstone keys live in `state/raw-tombstones.json`, NOT in the
+     * log. The shard files must contain turns and nothing else, so the overlay is an
+     * external read-time filter (`turn_id` + `content_hash`).
+     */
+    this.tombstones = new RawTombstoneStore({ file: path.join(dataDir, 'state', RAW_TOMBSTONE_FILE), clock });
+    this._legacyTombstones = null; // Set(sha256) parsed from pre-1.7.3 shard lines
     this._total = null;
   }
 
@@ -408,26 +416,40 @@ export class RawStore {
     this._flushChain = Promise.resolve();
     this._hashes.clear();
     this._dayBytes.clear();
-    this._tombstones = null;
+    this._legacyTombstones = null;
     this._total = null;
   }
 
-  /** Tombstone content hashes at the raw layer (called after a purge). */
-  async tombstone(hashes = [], { at = this.clock.now() } = {}) {
-    const unique = [...new Set(hashes)].filter(Boolean);
-    if (unique.length === 0) return { tombstoned: 0 };
-    ensureDir(this.dir);
-    const day = dayKey(at);
-    const lines = unique.map((hash) => JSON.stringify({ type: 'raw_tombstone', hash, timestamp: at }));
-    await fs.promises.appendFile(this.dayFile(day), `${lines.join('\n')}\n`, 'utf8');
-    if (this._tombstones) for (const hash of unique) this._tombstones.add(hash);
-    this._total = null;
-    this._dayBytes.delete(day);
-    return { tombstoned: unique.length };
+  /**
+   * v1.7.3 (module 2): record tombstones in the OVERLAY, never in a shard.
+   *
+   * Accepts both keys because deletion happens at two granularities:
+   *   - `hashes` — content fragments (an episode distilled out of a turn);
+   *   - `turnIds` — whole captured turns (`turn_<seq>_<role>`).
+   * Nothing is appended to `raw/*.jsonl`, which is what keeps the log "turns only".
+   */
+  async tombstone({ hashes = [], turnIds = [], at = this.clock.now() } = {}) {
+    const cleanHashes = [...new Set(hashes)].filter((hash) => typeof hash === 'string' && hash.length > 0);
+    const cleanTurns = [...new Set(turnIds)].filter((id) => typeof id === 'string' && id.length > 0);
+    if (cleanHashes.length === 0 && cleanTurns.length === 0) return { tombstoned: 0, added: 0 };
+    const result = this.tombstones.add({ turnIds: cleanTurns, contentHashes: cleanHashes, at });
+    return {
+      tombstoned: cleanHashes.length + cleanTurns.length,
+      added: result.added,
+      total: result.total,
+      file: this.tombstones.file,
+    };
   }
 
+  /** Undo a purge (used by `restore` when the events are still in the log). */
+  async untombstone({ hashes = [], turnIds = [] } = {}) {
+    const removed = this.tombstones.remove({ turnIds, contentHashes: hashes });
+    return { restored: removed };
+  }
+
+  /** Legacy `{type:'raw_tombstone'}` lines written by <=1.7.2 (read-only fallback). */
   _loadTombstones() {
-    if (this._tombstones) return this._tombstones;
+    if (this._legacyTombstones) return this._legacyTombstones;
     const set = new Set();
     for (const name of this.listShards()) {
       try {
@@ -445,8 +467,113 @@ export class RawStore {
         if (!error || error.code !== 'ENOENT') throw error;
       }
     }
-    this._tombstones = set;
+    this._legacyTombstones = set;
     return set;
+  }
+
+  /**
+   * One-time migration: physically remove `raw_tombstone` lines from every shard.
+   *
+   * Rewriting a shard is normally forbidden (append-only), and the ONLY exception is
+   * this: a bookkeeping line is not a turn, and leaving it in place means every
+   * reader has to keep special-casing it. Turn lines are copied byte-for-byte, so the
+   * log's turn content and order are unchanged; the keys are already in the overlay
+   * by the time the rewrite runs.
+   */
+  async stripLegacyTombstoneLines({ limit = Infinity } = {}) {
+    const report = { shards: 0, removedLines: 0, bytesBefore: 0, bytesAfter: 0, skipped: 0 };
+    if (!fs.existsSync(this.dir)) return report;
+    for (const name of this.listShards()) {
+      if (report.shards >= limit) break;
+      const file = path.join(this.dir, name);
+      let text;
+      try {
+        text = fs.readFileSync(file, 'utf8');
+      } catch (error) {
+        if (error && error.code === 'ENOENT') continue;
+        throw error;
+      }
+      if (!text.includes('"raw_tombstone"')) continue;
+      report.shards += 1;
+      report.bytesBefore += Buffer.byteLength(text, 'utf8');
+      const kept = [];
+      let removed = 0;
+      for (const line of text.split('\n')) {
+        if (line.includes('"raw_tombstone"')) {
+          let record = null;
+          try {
+            record = JSON.parse(line);
+          } catch {
+            record = null;
+          }
+          if (record && record.type === 'raw_tombstone') {
+            // Preserve the key before dropping the line, so a crash mid-rewrite cannot
+            // resurrect content that was already purged.
+            if (record.hash) this.tombstones.add({ contentHashes: [record.hash], at: record.timestamp ?? this.clock.now() });
+            removed += 1;
+            continue;
+          }
+        }
+        if (line.length > 0) kept.push(line);
+      }
+      if (removed === 0) continue;
+      const next = kept.length > 0 ? `${kept.join('\n')}\n` : '';
+      const temp = `${file}.tmp-clean`;
+      fs.writeFileSync(temp, next, 'utf8');
+      fs.renameSync(temp, file);
+      report.removedLines += removed;
+      report.bytesAfter += Buffer.byteLength(next, 'utf8');
+      this._dayBytes.delete(name.replace('.jsonl', ''));
+      this._hashes.delete(name.replace('.jsonl', ''));
+    }
+    this._legacyTombstones = new Set();
+    this._total = null;
+    return report;
+  }
+
+  /** True when a raw record is tombstoned by turn id OR by content hash. */
+  _isTombstoned(record) {
+    if (!record) return true;
+    if (this.tombstones.has({ turnId: record.turn_id, contentHash: sha256(record.content) })) return true;
+    return this._loadTombstones().has(sha256(record.content));
+  }
+
+  /** Overlay status for the panel/`/memory status`. */
+  tombstoneStatus() {
+    return { ...this.tombstones.status(), legacyLines: this._loadTombstones().size };
+  }
+
+  /**
+   * v1.7.3 (module 2): which raw TURNS produced these content hashes?
+   *
+   * A purge knows the episode ids and their content hashes, but the overlay also has
+   * to match at `turn_id` granularity — otherwise `deep_raw` could still find the
+   * turn that the deleted episode was distilled from. Deleting is rare, so one bounded
+   * pass over the shards is an acceptable price for a 100%-matching overlay.
+   */
+  async turnIdsForHashes(hashes = []) {
+    const wanted = new Set((Array.isArray(hashes) ? hashes : []).filter((hash) => typeof hash === 'string' && hash.length > 0));
+    if (wanted.size === 0) return [];
+    const found = new Set();
+    for (const name of this.listShards()) {
+      try {
+        for await (const line of readLinesForward(path.join(this.dir, name))) {
+          if (line.length === 0) continue;
+          let record;
+          try {
+            record = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (typeof record?.turn_id !== 'string' || typeof record?.content !== 'string') continue;
+          if (wanted.has(sha256(record.content))) found.add(record.turn_id);
+        }
+      } catch (error) {
+        if (error && error.code === 'ENOENT') continue;
+        throw error;
+      }
+    }
+    return [...found];
   }
 
   /** Non-empty line count of one shard (bounded streaming pass, no full read). */
@@ -466,7 +593,7 @@ export class RawStore {
    * Bounded deep scan with a mandatory time window (enforced by the caller) and
    * a token budget. Returns redacted snippets; disk remains plaintext.
    */
-  async scan({ text = '', startTime, endTime, limit = 20, regex = false, maxTokens } = {}) {
+  async scan({ text = '', startTime, endTime, limit = 20, regex = false, maxTokens, allowSensitive = false } = {}) {
     const config = this.config();
     if (!config || config.mode === 'off') {
       throw new MemoryError(ErrorCodes.RAW_DISABLED, 'raw storage is disabled (raw.mode=off); enable it to use deep_raw', {
@@ -520,7 +647,7 @@ export class RawStore {
     const hits = [];
     const archiveErrors = [];
     const notes = [];
-    const scanned = { turns: 0, bytes: 0, shards: 0, tombstonesSkipped: 0, peakBufferBytes: 0 };
+    const scanned = { turns: 0, bytes: 0, shards: 0, tombstonesSkipped: 0, sensitiveSkipped: 0, peakBufferBytes: 0 };
     // The caller's `limit` is advisory; the engine enforces its own ceiling so a
     // direct embedder can never request an unbounded result set.
     const effectiveLimit = Math.min(Math.max(1, Math.floor(Number(limit) || 20)), MAX_SCAN_RESULTS);
@@ -570,8 +697,15 @@ export class RawStore {
           // A raw turn carries no `type`: the four-field shape is the record.
           if (typeof record.turn_id !== 'string' || typeof record.content !== 'string') continue;
           if (record.timestamp < startTime || record.timestamp > endTime) continue;
-          if (tombstones.has(sha256(record.content))) {
+          if (this._isTombstoned(record)) {
             scanned.tombstonesSkipped += 1;
+            continue;
+          }
+          // v1.7.3 (module 3): a sensitive turn is physically excluded unless the
+          // caller presented the opt-in. The raw bytes stay on disk (plaintext by
+          // design); the read path is the gate.
+          if (allowSensitive !== true && detectSensitive(record.content).length > 0) {
+            scanned.sensitiveSkipped += 1;
             continue;
           }
           const haystack = record.content;
@@ -622,8 +756,12 @@ export class RawStore {
           if (record?.type === 'raw_tombstone') return true;
           if (typeof record?.turn_id !== 'string' || typeof record?.content !== 'string') return true;
           if (record.timestamp < startTime || record.timestamp > endTime) return true;
-          if (tombstones.has(sha256(record.content))) {
+          if (this._isTombstoned(record)) {
             scanned.tombstonesSkipped += 1;
+            return true;
+          }
+          if (allowSensitive !== true && detectSensitive(record.content).length > 0) {
+            scanned.sensitiveSkipped += 1;
             return true;
           }
           if (!matcher.test(record.content)) return true;
@@ -855,12 +993,12 @@ export class RawStore {
         throw error;
       }
     }
-    if (hashes.size > 0) await this.tombstone([...hashes], { at: now });
+    if (hashes.size > 0) await this.tombstone({ hashes: [...hashes], at: now });
     if (removed.length > 0) {
       this._total = null;
       this._hashes.clear();
       this._dayBytes.clear();
-      this._tombstones = null;
+      this._legacyTombstones = null;
     }
     return { enabled: true, removed, freedBytes: freed, tombstoned: hashes.size, hotWindowDays: windowDays };
   }
@@ -910,7 +1048,7 @@ export class RawStore {
       this._total = null;
       this._hashes.clear();
       this._dayBytes.clear();
-      this._tombstones = null;
+      this._legacyTombstones = null;
       if (removedArchives.length > 0) {
         try {
           const state = this.archive.readState();
