@@ -4,6 +4,43 @@ All notable changes to `dsh-layers-hippocampus` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.7.4] — 2026-11-28
+
+**图谱从「640×320 里挤沙子」变成可缩放的布局世界；节点按事件数自动收敛到 80；
+recall 时命中的标签会真的亮起来。**
+
+- **Fixed — 布局塌缩与画死边界（`ui/client.js`）**。旧实现把画布写死成 `640×320`，
+  再在 640 宽里做力导向：向心力 `((width/2 - x)/width) * 2 * alpha` 在边缘处接近
+  `0.9*alpha`，远强于 40–80px 距离上的斥力 `900/d²`，于是所有点被吸回中心；
+  布局和拖拽又各自 `Math.max(24, Math.min(width - 24, ...))`，节点永远出不了那个框。
+  现在：坐标系换成**布局世界**（`layoutWorld()` 按节点数放大，最多 3×），斥力按面积自适应
+  （`0.9 * spacing²`），向心力改成温和弹簧（`0.02 * alpha`），最小距离 6px 防爆，
+  标签留白 `GRAPH_LABEL_ROOM = 26`，最大速度收敛即早停；容器用 `ResizeObserver` 测量，
+  `viewBox` 跟着容器走、节点与文字保持固定像素大小；初始 `fitView()` 一屏看全，
+  拖到边缘 28px 内自动平移（`GRAPH_AUTOPAN_EDGE`），world 之外还有 160px 缓冲带——
+  **节点可以被拖出可见范围**；新增「适应视图」按钮与虚线世界边界，双击空白仍然重置。
+- **Added — 节点上限 80（`src/graph.js#trimGraph`）**。`graphMaxNodes` 默认 80（10–2000），
+  超出时按**事件数最少优先**隐藏（`events` ASC → `weight` ASC → `id` ASC），
+  边同步过滤并按 weight 截断；payload 增加 `totalNodes` / `droppedNodes` / `droppedEdges`，
+  面板显示「+N 节点未显示（按事件数从少到多隐藏）」。**事件多的节点是记忆里更扎实的那些**，
+  所以先淘汰稀疏点而不是砍断主干。
+- **Added — recall 光效（`src/activity.js` + `GET /api/hippocampus/activity`）**。
+  `_recallLocal` 在读取成功后 best-effort 记一条活动（`kind: 'recall'`，附 tags / eventIds，
+  `sensitive:` 与 `privacy:` 标签在入口就被剥离）；图谱每 1000ms 拉一次增量
+  （页面不可见时跳过），命中的标签**强光呼吸**、1 跳邻居**弱光**，新写入的标签**脉冲 620ms**，
+  2400ms 后自动熄灭。颜色默认跟随主题强调色（`ui.graphGlowPreset: 'accent'`），
+  另有 `vivid` / `warm` 预设与 `ui.graphGlowCustom` 十六进制自定义；白底刺眼时可用
+  `ui.graphCanvasTint` 给画布加一层极淡底色；`prefers-reduced-motion` 下只保留静态高亮不脉冲。
+  活动流默认只在内存里（`ui.graphActivityPersist: false`），打开后才落 `state/activity.json`（5s 节流）。
+  节点总开关 `ui.graphGlowEnabled`。
+- **Added — 设置页新增「图谱与光效」组**：节点上限、最大边数、光效开关、预设色、
+  自定义取色器（「恢复跟随预设」一键回到 accent）、画布底色、活动持久化。
+- **Contract**：MEMORY 路由表 9 → **10 条**（新增 `/api/hippocampus/activity`，GET/HEAD）；
+  新配置 `graphMaxNodes` 与 `ui.{graphGlowEnabled, graphGlowPreset, graphGlowCustom, graphCanvasTint, graphActivityPersist}`，
+  全部可在设置 UI 改。
+- **Tests**：`test/v174.ui.test.js`（几何纯函数真值断言 + 源码契约）、`test/v174.graph.test.js`、
+  `test/v174.activity.test.js`；全量 **590 / 590 通过，92 个测试文件**。
+
 ## [1.7.3] — 2026-11-27
 
 **上下文物理折叠、raw 墓碑移位、敏感标签硬拦截，以及交接标记随压力过期：

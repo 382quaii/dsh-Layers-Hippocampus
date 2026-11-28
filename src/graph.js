@@ -137,6 +137,79 @@ export function buildGraph(events = [], { maxEdges = GRAPH_HARD_CAP, topNeighbor
   };
 }
 
+/** Lexicographic (code-unit) comparison, so trimming is locale-independent. */
+function compareText(a, b) {
+  const left = String(a);
+  const right = String(b);
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
+/**
+ * Read-time trim: cap the cached graph to `maxNodes` nodes and `maxEdges` edges
+ * without touching the cache file.
+ *
+ * Eviction is deterministic and purely local:
+ *   - nodes sort by `events` ASC, then `weight` ASC, then `id` ASC; the nodes with
+ *     the fewest events are evicted first, so the tail is what survives;
+ *   - edges keep only endpoints that survived, then sort by `weight` DESC, then
+ *     `source`, then `target`, and are sliced to `maxEdges`.
+ *
+ * The input is never mutated: arrays and node/edge objects in the result are
+ * copies. Every other field of the source graph is carried over unchanged.
+ *
+ * @param {object} graph            a `buildGraph()`/`GraphCache.view()` shaped object
+ * @param {{maxNodes?: number, maxEdges?: number}} [options]
+ * @returns {object} new graph object with trim accounting
+ */
+export function trimGraph(graph, { maxNodes = 80, maxEdges = 500 } = {}) {
+  const source = graph && typeof graph === 'object' ? graph : {};
+  const sourceNodes = Array.isArray(source.nodes) ? source.nodes : [];
+  const sourceEdges = Array.isArray(source.edges) ? source.edges : [];
+  const totalNodes = sourceNodes.length;
+  const totalEdges = sourceEdges.length;
+  const nodeLimit = Math.max(0, Math.trunc(Number(maxNodes)) || 0);
+  const edgeLimit = Math.max(0, Math.trunc(Number(maxEdges)) || 0);
+
+  const byEvictionPriority = [...sourceNodes].sort((a, b) => {
+    const eventsA = Number.isFinite(a?.events) ? a.events : 0;
+    const eventsB = Number.isFinite(b?.events) ? b.events : 0;
+    if (eventsA !== eventsB) return eventsA - eventsB;
+    const weightA = Number.isFinite(a?.weight) ? a.weight : 0;
+    const weightB = Number.isFinite(b?.weight) ? b.weight : 0;
+    if (weightA !== weightB) return weightA - weightB;
+    return compareText(a?.id, b?.id);
+  });
+  const dropCount = Math.max(0, totalNodes - nodeLimit);
+  const keptNodes = byEvictionPriority.slice(dropCount).map((node) => ({ ...node }));
+  const keptIds = new Set(keptNodes.map((node) => String(node.id)));
+
+  const keptEdges = sourceEdges
+    .filter((edge) => keptIds.has(String(edge?.source)) && keptIds.has(String(edge?.target)))
+    .sort((a, b) => {
+      const weightA = Number.isFinite(a?.weight) ? a.weight : 0;
+      const weightB = Number.isFinite(b?.weight) ? b.weight : 0;
+      if (weightA !== weightB) return weightB - weightA;
+      return compareText(a?.source, b?.source) || compareText(a?.target, b?.target);
+    })
+    .slice(0, edgeLimit)
+    .map((edge) => ({ ...edge }));
+
+  return {
+    ...source,
+    nodes: keptNodes,
+    edges: keptEdges,
+    nodeCount: keptNodes.length,
+    edgeCount: keptEdges.length,
+    totalNodes,
+    totalEdges,
+    droppedNodes: totalNodes - keptNodes.length,
+    droppedEdges: totalEdges - keptEdges.length,
+    truncated: totalNodes > keptNodes.length || totalEdges > keptEdges.length,
+  };
+}
+
 /** Read-only view over the cached graph file. */
 export class GraphCache {
   constructor({ dataDir, clock }) {

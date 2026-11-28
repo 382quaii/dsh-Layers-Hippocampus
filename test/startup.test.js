@@ -179,7 +179,7 @@ test('webServer arriving AFTER apply still registers routes (cold-start ordering
 
     // The web app row activates later: only NOW does the route table exist.
     pending[0](host.ctx);
-    assert.equal(order.length, 9, 'all nine routes register as soon as webServer appears');
+    assert.equal(order.length, 10, 'all ten routes register as soon as webServer appears');
     assert.ok(order.every((entry) => entry === 'route'));
   } finally {
     host.dispose();

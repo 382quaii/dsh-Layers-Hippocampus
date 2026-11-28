@@ -1,7 +1,7 @@
 # dsh-layers-hippocampus · 功能 / 实现 / 版本演进
 
 > 版本基线：**v1.7.0（2026-11-24：全链路记忆第二半——① L3 六维人格（persona / preferences / facts-rules / relationships / skills-patterns / boundaries），`upsert` 落 `dim:` 标签并在 persona 块逐行剥离生理状态；② `privacy:secret` 隐私闸门：默认过滤 + `includeSecret` 才返回，不进指针、不做联想种子；③ Dream 事实来源：`facts:[{text,source:user|self}]`，无主条目直接丢弃；④ `getLatestHandoffSummary()` 结构化（`activeTask`/`recentFacts`/`personaTraits`/`lastRawTurns`，每条带 role，轮数 3–5 可配）；⑤ `/memory status` 报每个工具的真实调用次数，长期 0 次直接建议禁用。累计 1.6.9 的实体归并 + 1 跳联想 + 自动指针、1.6.8 的密文护栏 A4、1.6.7 的索引式注入 M1、1.6.6 的 Live Compact、1.6.5 的微内核回归）**
-> 验证状态：**571 / 571 测试通过**（88 个测试文件 · 59 个源码文件 · 零运行时依赖）
+> 验证状态：**590 / 590 测试通过**（92 个测试文件 · 60 个源码文件 · 零运行时依赖）
 > 数据位置（本机当前）：`D:\Users\86135\memory`（本地 JSONL，可迁移）
 > 本文与 `README.md`、`docs/ARCHITECTURE.zh.md`、`CHANGELOG.md`、`docs/RELEASE-1.7.2.md` 配套。
 
@@ -148,7 +148,7 @@ DeepSeek Harness（DSH）的**本地优先长期记忆 Host 插件**。它不把
 
 ---
 
-## 5. 版本演进（1.4.0 → 1.7.3）
+## 5. 版本演进（1.4.0 → 1.7.4）
 
 | 版本 | 主题 |
 |---|---|
@@ -173,6 +173,7 @@ DeepSeek Harness（DSH）的**本地优先长期记忆 Host 插件**。它不把
 | **1.6.8** | **写侧护栏：拒绝高熵密文/加密载荷（审计项 A4）**。新增 `src/entropy.js`（纯函数、零依赖）：`shannonEntropy()` + `detectCiphertext()` 三判据（base64 连续 ≥512 且熵 ≥4.5；hex 连续 ≥512 且熵 ≥3.5；PEM 甲壳共 5 种标记即使很短也拒绝），保守优先——散文/源码/URL/Windows 路径/低熵长串/短 base64 data URI 全部放行；新增错误码 `MEM_E_ENCRYPTED_RAW_REJECTED`（details 带 reason/runLength/entropy/at）；三条写路径统一护栏：`rawStore.capture` **拒绝且零落盘**、`remember()` 同规则**且先于** base64-media 守卫（对密文块「改用 media_url」是错误建议）、auto-capture 降级为 `{stored:false, skipped:'encrypted-blob'}` 不刷警告。8 例 `test/v168.encrypted.test.js`；全量 **541/541**（84 文件）。同时把 `记忆插件-未完成表.md` 从 2026-11-05 待办审计重写为当前状态表（A1–A21 逐项关闭依据）。 |
 | **1.6.9** | **全链路记忆机制**：① `src/entityAlias.js` 负责写侧实体归并——别名字典（`state/entity_alias.json`，schema 1）→ 子串包含（已有 `entity:红薯` 时 `entity:烤红薯` 折向短词）→ 编辑距离（相似度 ≥0.8 且长度差 ≤2），折名记 `meta.entity_merged`，并修掉 `_resolveTags()` 用原始 tags 覆盖合并结果的真根因；索引构建期 `buildIndex()` 通过 `canonicalTag()` 再折一次，**日志永不改写**。② `DreamEngine.learnAliases()` 取 24h 内新增 `entity:` 词做 JSON 小请求，`sanitiseAliasPairs(pairs,{known})` 只允许折向已存在规范词，成功后 `markDirty()` + `invalidateAdjacency()`。③ `src/tagGraph.js` 提供 `buildAdjacency()`（`Map<tag,[{tag,weight}]>`，对称/降序/每点 ≤8）与 `assertAssociativeHops()`；`recall()` 每种子仅一次 `Map.get()` 取最强邻居，语义联想条目 `score × 0.5` 并标 `association:{via,penalty,hops:1}`，结果带 `associative.{hops,tags,seeds,semantic}`；`entitySeedsMentioned()` 让查询文本中出现的 entity 词无需显式标签即为种子；`>1` 抛 `MEM_E_INVALID_INPUT`，`0` 关闭。④ `recentWindowTurns`（默认 50）内 1.2x–1.5x 时间加成，`timeBoost` 上限升至 1.5，`PRUNE_BOUND_FACTOR` 3.9→4.5。⑤ `context.autoInjectIndex`（默认 `{enabled:true,everyNTurns:3,maxPointers:3,maxChars:300}`，接受布尔简写）在就绪/会话切换即布防，首轮输出 `[Memory Index]`，每 N 个 user turn 重新布防，行格式 `- [memory <eventId>] <tag> · <title>`，无正文、整段 ≤300 字符，注入 id 进 `runtime.injection.ids`，标签签名未变不重复；四个键进 `EDITABLE_CONFIG_KEYS`，`memory.status()` 暴露 `entityAliasStatus()` / `associativeStatus()`。6 例 `test/v169.fullchain.test.js` |
 ---
+| **1.7.4** | **图谱布局世界 · 节点上限 80 · recall 光效**：① `ui/client.js` 的硬编码 `640×320` 画布换成可放大的布局世界（`layoutWorld()` ≤3×、斥力 `0.9*spacing²`、向心弹簧 `0.02*alpha`、`fitView()` 一屏看全、`ResizeObserver` 跟随容器、拖到边缘自动平移、虚线世界边界 +「适应视图」按钮），节点可以真正拖出可见范围；② 节点上限 `graphMaxNodes` 默认 80（10–2000），超出按**事件数最少优先**隐藏（`trimGraph()`，`totalNodes`/`droppedNodes` 回传）；③ 新增 `src/activity.js` + `GET /api/hippocampus/activity`，recall 命中标签**强光呼吸**、1 跳邻居**弱光**、新写入标签**脉冲 620ms**，颜色默认跟随强调色（`ui.graphGlowPreset` accent/vivid/warm + `ui.graphGlowCustom`），画布底色 `ui.graphCanvasTint`，活动流默认不落盘（`ui.graphActivityPersist: false`）；④ 设置页新增「图谱与光效」组。新增 `test/v174.ui.test.js` 8 例 + `test/v174.graph.test.js` 5 例 + `test/v174.activity.test.js` 6 例 | 590/590（92 文件） |
 | **1.7.3** | **上下文物理折叠 · raw 墓碑移位 · 敏感硬拦截 · 交接标记随压力过期**：① `guardRequest` 在 fail-fast 前按 `context.smartPrune.threshold`（默认 0.85）把冗长历史轮次用 `surfaceOp: { op: 'replace' }` 换成一行指针（`原文 ID: ev_xxx…`），`tool/call` 与 `tool/result` 成对保留；② `forget` 的 `raw_tombstone` 不再追加进 `raw/*.jsonl`，改写入 `state/raw-tombstones.json` 双键覆盖层（`turn_id` + `content_hash`），`maintain()` 一次性迁移老分片；③ Pre-Ingest 打 `sensitive:api_key` / `sensitive:pii` / `sensitive:credential`，`recall` / `deep_raw` 默认物理剔除、只有 `allow_sensitive: true` 放行；④ **交接标记随压力过期**：`src/context/windowGuard.js#relievedDecision()`（绝对 `context.handoffClearRatio` 0.5 + 相对塌陷 0.3）+ `Memory#maintainHandoffMarker()`，修复「总是提前交接上下文」。新增 `test/v173.pipeline.test.js` 7 例 + `test/v173.handoff.test.js` 9 例 | 571/571（88 文件） |
 | **1.7.2** | **设置页结构重构**：17 张卡片按用途分成五组（`identity` / `context` / `ingest` / `retention` / `space`），左侧 `SettingsNav` 竖排目录 `position: sticky` 固定视口，点击 `scrollIntoView` 平滑跳转，`IntersectionObserver` 随滚动同步高亮；卡片 DOM 逐字搬进五个 `Settings*Group` 组件（控件 / 校验 / `hidden: simpleMode` 语义不变，简洁模式仍只显示四组）；表单 `maxWidth` 720 → 980、窄屏自动折行；`test/v163.ui.test.js` 用 `settingsBody()` 拼接组件体断言 | 555/555（87 文件） |
 | **1.7.1** | **提示预算治理**：① 摘要卫生（`src/promptHygiene.js`）——注入的摘要先剥掉簿记计数（版本号 / `key: N` / `gen-…` / 时间戳）并补 `(snapshot … counters stripped as stale)`，但**保留带教训的数字**；冷启动摘要 / 人格行 / `[Active Task]` 三点统一，并修掉尾部把摘要事件当成一轮对话的泄漏。② **提示标签单向静默**（`src/hintFeedback.js`，默认 8 次零 recall 后永久静默，recall 不复活），由 `context.mode` 门控。③ **`[Task State]` 状态行**（`repo@branch · HEAD <sha7> · window …`，读 `.git/HEAD`、5s 缓存、硬上限 `context.statePointer.maxChars`）。④ 可观测：`capabilities.mode` / `capabilities.hints` / `/memory status` | 7 例 `test/v171.mode.test.js` |
@@ -180,7 +181,7 @@ DeepSeek Harness（DSH）的**本地优先长期记忆 Host 插件**。它不把
 
 ## 6. 测试与质量
 
-- **571 / 571 通过**，88 个测试文件；进程内 `node --test`（`test/run.mjs`），30 秒看门狗，时间一律注入 `FakeClock`。
+- **590 / 590 通过**，92 个测试文件；进程内 `node --test`（`test/run.mjs`），30 秒看门狗，时间一律注入 `FakeClock`。
 - 覆盖维度：身份幂等、索引重建一致性、召回排序与置信度、raw 四字段与游标扫描、哈希恢复、两阶段删除与墓碑、标签树生命周期与重放一致性、多空间降级、配置 fail-fast、UI 源码契约、崩溃恢复（200ms checkpoint 窗口）、事件循环让出。
 - 运维脚本：`scripts/bench-protocol.mjs`（基准协议）、`scripts/repair-handoff.mjs`（交接修复）。
 

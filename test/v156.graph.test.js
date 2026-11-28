@@ -35,14 +35,17 @@ test('Ctrl+wheel zooms around the cursor (and plain wheel does not)', () => {
 
 test('the initial frozen layout is overlap-separated', () => {
   assert.ok(SOURCE.includes('function separateOverlaps(positions'), 'separation pass exists');
-  assert.ok(SOURCE.includes('separateOverlaps(computeLayout(allNodes, allEdges, width, height))'), 'it wraps the layout');
-  assert.ok(SOURCE.includes('minDistance = 56'), 'a readable minimum distance is set');
+  assert.ok(
+    SOURCE.includes('separateOverlaps(computeLayout(allNodes, allEdges, world.width, world.height, maxWeight), {'),
+    'it wraps the layout',
+  );
+  assert.ok(SOURCE.includes('GRAPH_LABEL_ROOM'), 'a readable minimum distance is set');
 });
 
 test('view reset and the visible interaction hint ship with the bundle', () => {
-  assert.ok(SOURCE.includes('const resetView = () =>'), 'reset helper exists');
+  assert.ok(SOURCE.includes('const resetView = fitToContent'), 'reset helper exists');
   assert.ok(SOURCE.includes('onDoubleClick: (evt) =>'), 'double-click is wired');
-  assert.ok(SOURCE.includes('Ctrl 拖拽平移 · Ctrl 滚轮缩放'), 'header hint is rendered');
-  assert.ok(SOURCE.includes('Ctrl+拖拽平移 · Ctrl+滚轮缩放 · 双击空白重置视图'), 'footer hint is rendered');
+  assert.ok(SOURCE.includes('拖拽平移 · Ctrl 滚轮缩放'), 'header hint is rendered');
+  assert.ok(SOURCE.includes('空白处拖拽平移 · Ctrl+滚轮缩放 · 双击空白或「适应视图」回到全貌'), 'footer hint is rendered');
   assert.ok(SOURCE.includes("h('g', { ref: groupRef, transform: 'translate(0, 0) scale(1)' }"), 'the pan/zoom group wraps the graph');
 });

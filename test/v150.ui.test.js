@@ -310,7 +310,10 @@ test('the tag search uses native Enter and contains NO timer (the no-delay rule)
   assert.ok(!source.includes('debounce'), 'no delay/caching word in the search path');
 
   const start = source.indexOf('function TagSearch');
-  const end = source.indexOf('function KnowledgeGraph');
+  // v1.7.4: the recall glow feed (useActivity) lives between TagSearch and the
+  // graph, and it owns the only timer in this area — the search slice ends there.
+  const glow = source.indexOf('function useActivity');
+  const end = glow > start ? glow : source.indexOf('function KnowledgeGraph');
   assert.ok(start > 0, 'TagSearch component exists');
   assert.ok(end > start, 'KnowledgeGraph follows TagSearch');
   const slice = source.slice(start, end);
@@ -473,14 +476,15 @@ test('webRoutes: the v1.5.0 config keys are whitelisted and nest under their gro
   assert.throws(() => validatePatch({ 'index.unknown': 1 }), /not editable/);
 });
 
-test('webRoutes: exactly nine exact routes, transfer/memories/spaces/session-reset/install included', () => {
+test('webRoutes: exactly ten exact routes, transfer/memories/spaces/session-reset/install/activity included', () => {
   const { runtime } = fakeRuntime();
   const routes = createMemoryRoutes({ runtime });
-  assert.equal(routes.length, 9);
+  assert.equal(routes.length, 10);
   assert.deepEqual(routes.map((route) => route.path), [
     MEMORY_API.stats,
     MEMORY_API.config,
     MEMORY_API.graph,
+    MEMORY_API.activity,
     MEMORY_API.retry,
     MEMORY_API.transfer,
     MEMORY_API.memories,
@@ -488,7 +492,7 @@ test('webRoutes: exactly nine exact routes, transfer/memories/spaces/session-res
     MEMORY_API.sessionReset,
     MEMORY_API.orchestratorInstall,
   ]);
-  assert.deepEqual(routes.map((route) => route.kind), ['exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact']);
+  assert.deepEqual(routes.map((route) => route.kind), ['exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact']);
   assert.equal(MEMORY_API.transfer, '/api/hippocampus/transfer');
   assert.equal(MEMORY_API.memories, '/api/hippocampus/memories');
   assert.equal(MEMORY_API.spaces, '/api/hippocampus/spaces');

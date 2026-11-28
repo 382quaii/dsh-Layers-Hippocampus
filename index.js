@@ -57,6 +57,9 @@ import { snippet } from './src/util.js';
 import { dimensionOf, groupByDimension, stripPhysiology, containsPhysiology } from './src/semantic/dimensions.js';
 import { isSecretRecord } from './src/privacy.js';
 import { MEMORY_API, registerMemoryRoutes } from './src/webRoutes.js';
+// v1.7.4: bounded graph projection + the recent activity ring the panel flashes.
+import { trimGraph } from './src/graph.js';
+import { ActivityStore } from './src/activity.js';
 
 export const name = 'memory';
 export const inject = ['tools', 'systemPrompt'];
@@ -76,7 +79,7 @@ export { resolveConfig, DEFAULT_CONFIG };
  * of letting a raw 404 reach the user.
  */
 export const CAPABILITIES = Object.freeze({
-  version: '1.7.3',
+  version: '1.7.4',
   spaces: true,
   memories: true,
   transferConsent: true,
@@ -259,6 +262,7 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
               policy: options.policy,
               config: owner.config,
               spaceId: path.basename(childDir),
+              activity: activityFor(path.basename(childDir)),
               ...multiSpaceExtras(),
             }),
         }),
@@ -268,8 +272,31 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       dedupe: orchestrator.dedupe ?? null,
     };
   };
+  // v1.7.4 activity ring: ONE store per physical space, created lazily. The file is
+  // opt-in (`ui.graphActivityPersist`) and lives inside that space's OWN state/
+  // directory, so two spaces never share a ring. `runtime` does not exist yet while
+  // the first Memory is built, hence the small live-config reference. Tags only —
+  // ActivityStore strips sensitive:/privacy: and caps both arrays.
+  let runtimeRef = null;
+  const activityStores = new Map();
+  const activityConfig = () => runtimeRef?.config ?? config;
+  const activityFilePath = (spaceId) => {
+    if (activityConfig().ui?.graphActivityPersist !== true) return null;
+    const root = activityConfig().dataDir;
+    const dir = !spaceId || spaceId === 'default' ? root : path.join(root, 'spaces', String(spaceId));
+    return path.join(dir, 'state', 'activity.json');
+  };
+  const activityFor = (spaceId) => {
+    const key = spaceId === null || spaceId === undefined || spaceId === '' ? 'default' : String(spaceId);
+    let store = activityStores.get(key);
+    if (!store) {
+      store = new ActivityStore({ limit: 64, file: activityFilePath(key === 'default' ? null : key), clock });
+      activityStores.set(key, store);
+    }
+    return store;
+  };
   // `let` (not const): a failed bootstrap can be retried by rebuilding the facade.
-  let memory = new Memory({ dataDir: config.dataDir, policy: options.policy, config: options.config, clock, ...multiSpaceExtras() });
+  let memory = new Memory({ dataDir: config.dataDir, policy: options.policy, config: options.config, clock, activity: activityFor(null), ...multiSpaceExtras() });
   // v1.5.6: engine warnings (currently MEM_E_AUTO_TAG_MISS) go to the Host log.
   memory.setWarnHook?.((code, message, details) => {
     ctx?.logger?.warn?.(`hippocampus: ${code} ${message}`, details);
@@ -279,6 +306,11 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
   const runtime = {
     config,
     memory,
+    // v1.7.4: recent recall/capture hints. One ring per physical space; `activity`
+    // is the default-space store handed to the Memory facade above.
+    activity: activityFor(null),
+    activityStores,
+    activityFor,
     logger: ctx?.logger ?? null,
     /** Raw (unresolved) config: re-merging a patch must not bake in defaults. */
     rawConfig: cloneRaw(raw ?? config),
@@ -307,6 +339,15 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     lastUserText: '',
     /** Set by apply(): persists config patches through configEditor. */
     persist: null,
+  };
+  runtimeRef = runtime;
+
+  /** Rebind the rings to the current dataDir / persistence flag (cosmetic state). */
+  runtime.resetActivityStores = () => {
+    activityStores.clear();
+    runtime.activity = activityFor(null);
+    runtime.activityStores = activityStores;
+    if (runtime.memory) runtime.memory.activity = runtime.activity;
   };
 
   const migrationRunner = new MigrationRunner({
@@ -1601,15 +1642,18 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
       return {
         ok: false,
         ...view,
-        graph: { available: false, nodes: [], edges: [], totalEdges: 0, limit: runtime.config.graphMaxEdges },
+        graph: { available: false, nodes: [], edges: [], totalEdges: 0, limit: runtime.config.graphMaxEdges, maxNodes: runtime.config.graphMaxNodes },
         tagTree: { available: false, ghosts: [] },
       };
     }
     try {
-      const { spaceId: selected, graph, tagTree } = await memory.graphForSpace({
+      const { spaceId: selected, graph: rawGraph, tagTree } = await memory.graphForSpace({
         targetSpaceId: spaceId ?? undefined,
         limit: runtime.config.graphMaxEdges,
       });
+      // v1.7.4: the cache keeps its full projection; the ROUTE gets a bounded copy so
+      // one huge graph can never stall the panel. trimGraph is pure.
+      const graph = trimGraph(rawGraph, { maxNodes: runtime.config.graphMaxNodes, maxEdges: runtime.config.graphMaxEdges });
       return { ok: true, phase: runtime.phase, state: runtime.phase, spaceId: selected, graph, tagTree };
     } catch (error) {
       return {
@@ -1617,10 +1661,21 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
         ...view,
         spaceId,
         error: asMemoryError(error).toJSON(),
-        graph: { available: false, nodes: [], edges: [], limit: runtime.config.graphMaxEdges },
+        graph: { available: false, nodes: [], edges: [], limit: runtime.config.graphMaxEdges, maxNodes: runtime.config.graphMaxNodes },
         tagTree: { available: false, ghosts: [] },
       };
     }
+  };
+
+  /**
+   * v1.7.4 activity route payload: the default or named space's recent ring.
+   * `since` is an exclusive seq cursor, so the panel polls for just the new flips.
+   * Read-only and store-independent: a hint never blocks on bootstrap.
+   */
+  runtime.activityPayload = ({ spaceId = null, since = 0, limit = 64 } = {}) => {
+    const store = runtime.activityFor(spaceId);
+    const recent = store.recent({ since, limit });
+    return { ok: true, spaceId: spaceId ?? 'default', items: recent.items, cursor: recent.cursor, now: recent.now };
   };
 
   /** Global SpaceSelector data source (root router: every physical space). */
@@ -1868,7 +1923,13 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
    * needs a restart.
    */
   runtime.applyConfig = (next) => {
+    const previous = runtime.config;
     runtime.config = next;
+    // v1.7.4: the rings' file binding depends on dataDir + ui.graphActivityPersist.
+    // Rebinding is enough; the hint history itself is disposable.
+    const rebindActivity =
+      (previous.ui?.graphActivityPersist === true) !== (next.ui?.graphActivityPersist === true) ||
+      path.resolve(previous.dataDir) !== path.resolve(next.dataDir);
     // Retrieval reads `memory.policy` on every call. The resolved policy is
     // deep-frozen, so replace it with a shallow copy carrying the new topK
     // instead of mutating a frozen object (which throws in strict mode).
@@ -1885,6 +1946,7 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     // facade (and every open child space) instead of waiting for a reload: the
     // settings page promises "保存后立即生效".
     if (liveMemory) liveMemory.applyLiveConfig(toMemoryOptions(next).config);
+    if (rebindActivity) runtime.resetActivityStores();
     emit({ type: 'config', config: uiConfig(next) });
     return next;
   };
@@ -1971,10 +2033,13 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     } catch {
       /* the old store is read-mostly */
     }
-    memory = new Memory({ dataDir: next.dataDir, policy: nextOptions.policy, config: nextOptions.config, clock, ...multiSpaceExtras() });
+    memory = new Memory({ dataDir: next.dataDir, policy: nextOptions.policy, config: nextOptions.config, clock, activity: activityFor(null), ...multiSpaceExtras() });
     runtime.memory = memory;
     runtime.config = next;
     runtime.rawConfig = merged;
+    // The rings are bound to physical dirs; after the swap they must follow the new
+    // dataDir (hints are cosmetic, so dropping the old in-memory ring is fine).
+    runtime.resetActivityStores();
     await memory.init();
     if (runtime.scheduler) memory.attachScheduler(runtime.scheduler);
     // The runner still points at the OLD state file; rebase it on the new dataDir
@@ -2040,7 +2105,7 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
     } catch {
       /* a half-open store must not block the rebuild */
     }
-    memory = new Memory({ dataDir: config.dataDir, policy: options.policy, config: options.config, clock, ...multiSpaceExtras() });
+    memory = new Memory({ dataDir: config.dataDir, policy: options.policy, config: options.config, clock, activity: runtime.activity, ...multiSpaceExtras() });
     runtime.memory = memory;
     memory.setHandoffPresetProvider?.(() => runtime.agentPreset);
     emit({ type: 'retry', phase: runtime.phase });
@@ -2348,6 +2413,9 @@ function uiConfig(config) {
     dreamIdleMinutes: config.dreamIdleMinutes,
     enableReflection: config.enableReflection,
     graphMaxEdges: config.graphMaxEdges,
+    graphMaxNodes: config.graphMaxNodes,
+    // v1.7.4 presentation knobs (glow / canvas tint) + optional activity persistence.
+    ui: config.ui,
     storageBudgetMb: config.storageBudgetMb,
     maxRecallTopK: config.maxRecallTopK,
     retrieval: { topK: config.retrieval.topK },

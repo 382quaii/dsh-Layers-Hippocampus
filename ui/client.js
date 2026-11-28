@@ -52,6 +52,8 @@
         sessionReset: '/api/hippocampus/session/reset',
         // Settings page: install the GitHub Orchestrator through the Host manager.
         orchestratorInstall: '/api/hippocampus/orchestrator/install',
+        // v1.7.4: recent recall/capture events, used only to light up the graph.
+        activity: '/api/hippocampus/activity',
       };
       const POLL_MS = 3000;
       /** Fallback ring budget (MB) when the Host has not sent the config yet. */
@@ -921,6 +923,93 @@
         return hash >>> 0;
       }
 
+      // ---- v1.7.4 graph geometry ---------------------------------------------
+      // Pure math: no DOM, no React, deterministic. Exported as
+      // `module.exports.graphGeometry` so the unit tests exercise real numbers
+      // instead of asserting on source text.
+      const GRAPH_MIN_RADIUS = 4;
+      const GRAPH_MAX_RADIUS = 14;
+      const GRAPH_LABEL_ROOM = 26;
+      const GRAPH_PADDING = 16;
+      const GRAPH_AUTOPAN_EDGE = 28;
+
+      function clampNumber(value, low, high) {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) return low;
+        return Math.max(low, Math.min(high, numeric));
+      }
+
+      /** Node radius in CSS pixels — stays constant however far the view zooms. */
+      function computeRadius(node, maxWeight) {
+        if (node && node.ghost === true) return 4;
+        if (node && node.ghostRoot === true) return 6;
+        const weight = Math.max(0, Number(node && node.weight) || 0);
+        const ceiling = Math.max(1, Number(maxWeight) || 0);
+        const scale = Math.min(1, Math.sqrt(weight / ceiling));
+        return clampNumber(
+          GRAPH_MIN_RADIUS + scale * (GRAPH_MAX_RADIUS - GRAPH_MIN_RADIUS),
+          GRAPH_MIN_RADIUS,
+          GRAPH_MAX_RADIUS,
+        );
+      }
+
+      /**
+       * The drawable world is at least the viewport and grows when `count` nodes
+       * cannot be laid out readably inside it. Growing the world — then fitting
+       * the view — is what replaced the old behaviour of cramming everything into
+       * a fixed 640×320 box, which was the "dots piled up in the middle" bug.
+       */
+      function layoutWorld({ width, height, count } = {}) {
+        const viewWidth = Math.max(160, Number(width) || 0);
+        const viewHeight = Math.max(160, Number(height) || 0);
+        const cell = 96; // diameter + label room + breathing space per node
+        const needed = Math.max(1, Number(count) || 0) * cell * cell;
+        const factor = clampNumber(Math.sqrt(needed / (viewWidth * viewHeight)), 1, 3);
+        return {
+          x: 0,
+          y: 0,
+          width: Math.round(viewWidth * factor),
+          height: Math.round(viewHeight * factor),
+          factor,
+        };
+      }
+
+      function graphBounds(positions) {
+        if (!positions || positions.length === 0) return { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        for (const position of positions) {
+          const r = Number(position.r) || 6;
+          minX = Math.min(minX, position.x - r);
+          minY = Math.min(minY, position.y - r);
+          maxX = Math.max(maxX, position.x + r);
+          maxY = Math.max(maxY, position.y + r);
+        }
+        return { minX, minY, maxX, maxY };
+      }
+
+      /**
+       * Viewport transform that shows the whole graph. `k` may exceed 1 a little
+       * so a 3-node graph is not lost in a corner, but never so far that a node
+       * leaves the frame.
+       */
+      function fitView(positions, viewport, { padding = 40, maxScale = 1.4 } = {}) {
+        const viewWidth = Math.max(80, Number(viewport && viewport.width) || 0);
+        const viewHeight = Math.max(80, Number(viewport && viewport.height) || 0);
+        if (!positions || positions.length === 0) return { x: 0, y: 0, k: 1 };
+        const bounds = graphBounds(positions);
+        const width = Math.max(1, bounds.maxX - bounds.minX + padding * 2);
+        const height = Math.max(1, bounds.maxY - bounds.minY + padding * 2);
+        const k = clampNumber(Math.min(maxScale, viewWidth / width, viewHeight / height), 0.2, 1.4);
+        return {
+          x: (viewWidth - width * k) / 2 - (bounds.minX - padding) * k,
+          y: (viewHeight - height * k) / 2 - (bounds.minY - padding) * k,
+          k,
+        };
+      }
+
       /**
        * Position the graph ONCE, off the render path.
        *
@@ -929,17 +1018,25 @@
        * result is frozen in a ref by the caller, so progressive reveal — which
        * only changes how many frozen coordinates are painted — can never restart
        * the simulation.
+       *
+       * v1.7.4: distances and forces scale with the world size (not with a fixed
+       * 640px constant), the centring force is a gentle spring instead of the old
+       * `(width/2 - x) / width * 2` term that dwarfed repulsion and collapsed the
+       * cloud, and every coordinate is clamped to the world, not to a 640×320 box.
        */
-      function computeLayout(nodes, edges, width, height) {
+      function computeLayout(nodes, edges, width, height, maxWeight) {
+        const worldWidth = Math.max(80, Number(width) || 0);
+        const worldHeight = Math.max(80, Number(height) || 0);
         const rand = mulberry32(hashSeed(nodes.map((node) => node.id).join('|')));
         const index = new Map(nodes.map((node, i) => [node.id, i]));
         const count = nodes.length;
         const positions = nodes.map((node, i) => ({
           id: node.id,
-          x: width / 2 + (rand() - 0.5) * width * 0.6 + (i % 7) * 2,
-          y: height / 2 + (rand() - 0.5) * height * 0.6 + (i % 5) * 2,
+          x: worldWidth / 2 + (rand() - 0.5) * worldWidth * 0.5 + (i % 7) * 2,
+          y: worldHeight / 2 + (rand() - 0.5) * worldHeight * 0.5 + (i % 5) * 2,
           vx: 0,
           vy: 0,
+          r: computeRadius(node, maxWeight),
           // Isolated nodes get extra jitter so they cannot sit in a neat pile.
           jitter: (rand() - 0.5) * 24,
         }));
@@ -948,8 +1045,10 @@
           .map((edge) => ({ a: index.get(edge.source), b: index.get(edge.target), weight: edge.weight || 1 }))
           .filter((link) => link.a !== undefined && link.b !== undefined);
 
-        const iterations = Math.min(320, 40 + count * 4);
-        const repulsion = 900;
+        const area = worldWidth * worldHeight;
+        const spacing = clampNumber(Math.sqrt((area * 0.08) / Math.max(1, count)), 44, 150);
+        const repulsion = 0.9 * spacing * spacing;
+        const iterations = Math.min(600, 80 + count * 8);
         for (let step = 0; step < iterations; step += 1) {
           const alpha = 0.9 * (1 - step / iterations) + 0.02;
           for (let i = 0; i < count; i += 1) {
@@ -959,12 +1058,13 @@
               let dx = a.x - b.x;
               let dy = a.y - b.y;
               let distance = Math.sqrt(dx * dx + dy * dy);
-              if (distance < 1) {
+              if (distance < 0.001) {
                 dx = (rand() - 0.5) * 2;
                 dy = (rand() - 0.5) * 2;
                 distance = 1;
               }
-              const force = (repulsion / (distance * distance)) * alpha;
+              const d = Math.max(6, distance); // clamp so a near-collision cannot explode
+              const force = (repulsion / (d * d)) * alpha;
               const fx = (dx / distance) * force;
               const fy = (dy / distance) * force;
               a.vx += fx;
@@ -979,40 +1079,47 @@
             const dx = b.x - a.x;
             const dy = b.y - a.y;
             const distance = Math.sqrt(dx * dx + dy * dy) || 1;
-            const target = 80;
+            const target = 46 + 0.9 * ((a.r || 6) + (b.r || 6));
             const force = ((distance - target) / distance) * 0.04 * alpha * Math.min(2, link.weight);
             a.vx += dx * force;
             a.vy += dy * force;
             b.vx -= dx * force;
             b.vy -= dy * force;
           }
+          let fastest = 0;
           for (let i = 0; i < count; i += 1) {
             const node = positions[i];
-            node.vx += ((width / 2 - node.x) / width) * 2 * alpha;
-            node.vy += ((height / 2 - node.y) / height) * 2 * alpha;
-            node.vx *= 0.6;
-            node.vy *= 0.6;
-            node.x = Math.max(24, Math.min(width - 24, node.x + node.vx + node.jitter * 0.05));
-            node.y = Math.max(24, Math.min(height - 24, node.y + node.vy + node.jitter * 0.05));
+            // Gentle spring: 1/50 of the remaining distance per unit alpha.
+            node.vx += (worldWidth / 2 - node.x) * 0.02 * alpha;
+            node.vy += (worldHeight / 2 - node.y) * 0.02 * alpha;
+            node.vx *= 0.72;
+            node.vy *= 0.72;
+            node.x = clampNumber(node.x + node.vx + node.jitter * 0.05, GRAPH_PADDING, worldWidth - GRAPH_PADDING);
+            node.y = clampNumber(node.y + node.vy + node.jitter * 0.05, GRAPH_PADDING, worldHeight - GRAPH_PADDING);
+            fastest = Math.max(fastest, Math.abs(node.vx), Math.abs(node.vy));
           }
+          if (step > 40 && fastest < 0.05) break;
         }
         return positions;
       }
 
       /**
-       * v1.5.6: initial overlap separation. The force pass can leave a pair (or a
-       * tight cluster) closer than a readable node, especially with equal weights.
-       * One deterministic post-pass pushes every pair below `minDistance` apart
-       * without re-running the simulation, so the first painted frame is already
-       * readable instead of a pile of labels.
+       * Post-pass that guarantees readable spacing: every pair is pushed apart
+       * until the gap covers both radii plus label room, and each push stays
+       * inside the world so no node slides out of reach.
        */
-      function separateOverlaps(positions, { minDistance = 56, passes = 14 } = {}) {
+      function separateOverlaps(positions, { width = null, height = null, padding = GRAPH_PADDING, passes = 16 } = {}) {
+        const worldWidth = Number.isFinite(Number(width)) ? Number(width) : null;
+        const worldHeight = Number.isFinite(Number(height)) ? Number(height) : null;
+        const clampX = (value) => (worldWidth === null ? value : clampNumber(value, padding, worldWidth - padding));
+        const clampY = (value) => (worldHeight === null ? value : clampNumber(value, padding, worldHeight - padding));
         for (let pass = 0; pass < passes; pass += 1) {
           let moved = false;
           for (let i = 0; i < positions.length; i += 1) {
             for (let j = i + 1; j < positions.length; j += 1) {
               const a = positions[i];
               const b = positions[j];
+              const minDistance = (a.r || 6) + (b.r || 6) + GRAPH_LABEL_ROOM;
               const dx = a.x - b.x;
               const dy = a.y - b.y;
               const distance = Math.sqrt(dx * dx + dy * dy);
@@ -1021,10 +1128,10 @@
               const angle = distance > 0.001 ? Math.atan2(dy, dx) : ((i * 37 + j * 17) % 628) / 100;
               const ux = Math.cos(angle);
               const uy = Math.sin(angle);
-              a.x += ux * push;
-              a.y += uy * push;
-              b.x -= ux * push;
-              b.y -= uy * push;
+              a.x = clampX(a.x + ux * push);
+              a.y = clampY(a.y + uy * push);
+              b.x = clampX(b.x - ux * push);
+              b.y = clampY(b.y - uy * push);
               moved = true;
             }
           }
@@ -1142,10 +1249,102 @@
         );
       }
 
+      // ---- v1.7.4 activity glow ---------------------------------------------
+
+      const GLOW_PRESETS = {
+        accent: { strong: '#0a2f6b', weak: '#7fb0ff', capture: '#bfe0ff' },
+        vivid: { strong: '#0b3d1f', weak: '#63e6a4', capture: '#c8ffe0' },
+        warm: { strong: '#5a2b00', weak: '#ffb481', capture: '#ffe3b0' },
+      };
+      const GLOW_STRONG_TAG_LIMIT = 6;
+      const GLOW_WEAK_TAG_LIMIT = 24;
+      const GLOW_DWELL_MS = 2400;
+      const GLOW_FRESH_MS = 6000;
+
+      function normalizeHex(value) {
+        return typeof value === 'string' && /^#[0-9a-fA-F]{6}$/.test(value.trim()) ? value.trim().toLowerCase() : null;
+      }
+
+      function mixHex(a, b, ratio) {
+        const left = normalizeHex(a) || '#4f8cff';
+        const right = normalizeHex(b) || '#ffffff';
+        const blend = (offset) => {
+          const x = parseInt(left.slice(offset, offset + 2), 16);
+          const y = parseInt(right.slice(offset, offset + 2), 16);
+          return Math.round(x + (y - x) * ratio).toString(16).padStart(2, '0');
+        };
+        return '#' + blend(1) + blend(3) + blend(5);
+      }
+
+      /**
+       * Glow colours, derived from the theme accent by default so a white canvas
+       * keeps enough contrast (the shadow is dark blue, not a pale wash).
+       */
+      function glowColors({ preset = 'accent', custom = null } = {}) {
+        if (normalizeHex(custom)) {
+          const base = normalizeHex(custom);
+          return { strong: mixHex(base, '#0a1b3d', 0.35), weak: mixHex(base, '#ffffff', 0.55), capture: mixHex(base, '#ffffff', 0.2) };
+        }
+        return GLOW_PRESETS[preset] || GLOW_PRESETS.accent;
+      }
+
+      const GRAPH_STYLE = [
+        '.hp-graph svg g.hp-glow-strong circle.hp-dot { stroke: var(--hip-glow-strong); stroke-width: 2.4; filter: drop-shadow(0 0 3px var(--hip-glow-strong)) drop-shadow(0 0 11px var(--hip-glow-strong)); }',
+        '.hp-graph svg g.hp-glow-weak circle.hp-dot { stroke: var(--hip-glow-weak); stroke-width: 1.8; filter: drop-shadow(0 0 5px var(--hip-glow-weak)); }',
+        '.hp-graph svg g.hp-glow-capture circle.hp-dot { stroke: var(--hip-glow-capture); stroke-width: 2; animation: hp-glow-pulse 620ms ease-out 1; }',
+        '@keyframes hp-glow-pulse { 0% { filter: drop-shadow(0 0 0 var(--hip-glow-capture)); } 45% { filter: drop-shadow(0 0 12px var(--hip-glow-capture)); } 100% { filter: drop-shadow(0 0 2px var(--hip-glow-capture)); } }',
+        '@media (prefers-reduced-motion: reduce) { .hp-graph svg g.hp-glow-capture circle.hp-dot { animation: none; } }',
+      ].join('\n');
+
+      /** Poll the activity feed; it is decoration, so every failure is silent. */
+      function useActivity({ spaceId, enabled, intervalMs = 1000 }) {
+        const [feed, setFeed] = React.useState({ items: [], cursor: 0, at: 0 });
+        React.useEffect(() => {
+          if (!enabled) return undefined;
+          let alive = true;
+          let timer = 0;
+          const tick = async () => {
+            if (!alive) return;
+            try {
+              if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+              const query = new URLSearchParams();
+              if (spaceId) query.set('space', spaceId);
+              query.set('since', String(feed.cursor || 0));
+              const response = await fetch(API.activity + '?' + query.toString(), { headers: { accept: 'application/json' } });
+              if (!response.ok) return;
+              const payload = await response.json();
+              if (!alive) return;
+              const items = Array.isArray(payload.items) ? payload.items : [];
+              if (items.length > 0) setFeed({ items, cursor: Number(payload.cursor) || feed.cursor, at: Date.now() });
+            } catch {
+              /* activity is a hint, never a dependency */
+            }
+          };
+          tick();
+          timer = setInterval(tick, intervalMs);
+          return () => {
+            alive = false;
+            clearInterval(timer);
+          };
+        }, [spaceId, enabled, intervalMs, feed.cursor]);
+        return feed;
+      }
+
       function KnowledgeGraph(props) {
         const graph = props.graph;
-        const width = 640;
-        const height = 320;
+        const ui = (props.config && props.config.ui) || {};
+        const glowEnabled = ui.graphGlowEnabled !== false;
+        const glowLook = { preset: ui.graphGlowPreset || 'accent', custom: ui.graphGlowCustom || null };
+        const canvasTint = ui.graphCanvasTint || 'auto';
+        const colors = glowColors(glowLook);
+        const canvasBackground = canvasTint === 'none' ? 'transparent' : canvasTint === 'tint' ? 'rgba(79,140,255,0.055)' : 'rgba(15,23,42,0.035)';
+        const spaceId = props.spaceId || null;
+        const wrapRef = React.useRef(null);
+        const [boxWidth, setBoxWidth] = React.useState(640);
+        // Real pixels, not a fixed 640×320 drawing: a narrow side rail must not
+        // scale dots and labels down to nothing.
+        const width = Math.max(240, Math.round(boxWidth));
+        const height = Math.max(280, Math.min(520, Math.round(width * 0.55)));
         const nodes = (graph && graph.nodes) || [];
         const edges = (graph && graph.edges) || [];
         // Ghost nodes come from the tag tree's grace window (state/tag-tree.json via
@@ -1160,13 +1359,30 @@
         const allNodes = [...nodes, ...ghostRootNodes, ...ghostNodes];
         const allEdges = [...edges, ...ghostEdges];
 
+        const maxWeight = Math.max(1, ...allNodes.map((node) => node.weight || 0));
         const layoutRef = React.useRef(null);
         const layoutKey =
-          allNodes.length + ':' + allEdges.length + ':' + (graph ? graph.generatedAt : 0) + ':' + ghostNodes.map((node) => node.id).join(',');
+          allNodes.length +
+          ':' +
+          allEdges.length +
+          ':' +
+          (graph ? graph.generatedAt : 0) +
+          ':' +
+          ghostNodes.map((node) => node.id).join(',') +
+          ':' +
+          Math.round(width / 16) +
+          'x' +
+          Math.round(height / 16);
         if (!layoutRef.current || layoutRef.current.key !== layoutKey) {
-          layoutRef.current = { key: layoutKey, positions: separateOverlaps(computeLayout(allNodes, allEdges, width, height)) };
+          const world = layoutWorld({ width, height, count: allNodes.length });
+          const positions = separateOverlaps(computeLayout(allNodes, allEdges, world.width, world.height, maxWeight), {
+            width: world.width,
+            height: world.height,
+          });
+          layoutRef.current = { key: layoutKey, positions, world };
         }
         const positions = layoutRef.current.positions;
+        const world = layoutRef.current.world;
         const byId = new Map(positions.map((position) => [position.id, position]));
         const indexOfId = new Map(positions.map((position, i) => [position.id, i]));
 
@@ -1188,10 +1404,39 @@
           const v = viewRef.current;
           g.setAttribute('transform', `translate(${v.x}, ${v.y}) scale(${v.k})`);
         };
-        const resetView = () => {
-          viewRef.current = { x: 0, y: 0, k: 1 };
+        const fitToContent = () => {
+          viewRef.current = fitView(positions, { width, height });
           applyView();
         };
+        const resetView = fitToContent;
+
+        // Measure the card so the drawing matches the space it actually has.
+        React.useEffect(() => {
+          const el = wrapRef.current;
+          if (!el) return undefined;
+          const measure = () => {
+            const rect = typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null;
+            const next = Math.max(240, Math.round((rect && rect.width) || 640));
+            setBoxWidth((prev) => (Math.abs(prev - next) > 24 ? next : prev));
+          };
+          measure();
+          if (typeof ResizeObserver === 'function') {
+            const observer = new ResizeObserver(measure);
+            observer.observe(el);
+            return () => observer.disconnect();
+          }
+          if (typeof window !== 'undefined' && window.addEventListener) {
+            window.addEventListener('resize', measure);
+            return () => window.removeEventListener('resize', measure);
+          }
+          return undefined;
+        }, []);
+
+        // A fresh layout (or a resize) is shown in full.
+        React.useEffect(() => {
+          viewRef.current = fitView(positions, { width, height });
+          applyView();
+        }, [layoutKey, width, height]);
 
         React.useEffect(() => {
           aliveRef.current = true;
@@ -1251,7 +1496,49 @@
         }, [layoutKey, allNodes.length]);
 
         const [focus, setFocus] = React.useState(null);
-        const maxWeight = Math.max(1, ...allNodes.map((node) => node.weight || 0));
+        const feed = useActivity({ spaceId, enabled: glowEnabled });
+        const glowTimer = React.useRef(0);
+        React.useEffect(() => {
+          if (!glowEnabled) return undefined;
+          const clearGlow = () => {
+            for (const el of nodeEls.current) {
+              if (el && el.classList) el.classList.remove('hp-glow-strong', 'hp-glow-weak', 'hp-glow-capture');
+            }
+          };
+          const now = Date.now();
+          const fresh = (feed.items || []).filter((item) => now - (Number(item.at) || now) <= GLOW_FRESH_MS);
+          clearGlow();
+          if (fresh.length === 0) return undefined;
+          const strong = new Set();
+          const capture = new Set();
+          const weak = new Set();
+          for (const item of fresh) {
+            const tags = Array.isArray(item.tags) ? item.tags : [];
+            for (const tag of tags) {
+              if (typeof tag !== 'string') continue;
+              if (item.kind === 'capture') capture.add(tag);
+              else strong.add(tag);
+            }
+          }
+          for (const edge of allEdges) {
+            if (strong.has(edge.source)) weak.add(edge.target);
+            else if (strong.has(edge.target)) weak.add(edge.source);
+          }
+          for (const tag of strong) weak.delete(tag);
+          for (const tag of capture) weak.delete(tag);
+          for (const position of positions) {
+            const el = nodeEls.current[indexOfId.get(position.id)];
+            if (!el || !el.classList) continue;
+            if (capture.has(position.id)) el.classList.add('hp-glow-capture');
+            else if (strong.has(position.id) && strong.size <= GLOW_STRONG_TAG_LIMIT) el.classList.add('hp-glow-strong');
+            else if (weak.has(position.id) && weak.size <= GLOW_WEAK_TAG_LIMIT) el.classList.add('hp-glow-weak');
+          }
+          glowTimer.current = setTimeout(clearGlow, GLOW_DWELL_MS);
+          return () => {
+            if (glowTimer.current) clearTimeout(glowTimer.current);
+            clearGlow();
+          };
+        }, [feed.at, glowEnabled, layoutKey]);
 
         /** Repaint node transforms + every rendered line from the frozen array. */
         const paint = () => {
@@ -1390,7 +1677,8 @@
               const dx = b.x - a.x;
               const dy = b.y - a.y;
               const distance = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-              const force = ((distance - 80) / distance) * 0.06 * alpha * Math.min(2, link.weight);
+              const target = 46 + 0.9 * ((a.r || 6) + (b.r || 6));
+              const force = ((distance - target) / distance) * 0.06 * alpha * Math.min(2, link.weight);
               a.vx += dx * force;
               a.vy += dy * force;
               b.vx -= dx * force;
@@ -1400,8 +1688,8 @@
               const node = positions[i];
               node.vx *= 0.7;
               node.vy *= 0.7;
-              node.x = Math.max(24, Math.min(width - 24, node.x + node.vx));
-              node.y = Math.max(24, Math.min(height - 24, node.y + node.vy));
+              node.x = clampNumber(node.x + node.vx, GRAPH_PADDING, world.width - GRAPH_PADDING);
+              node.y = clampNumber(node.y + node.vy, GRAPH_PADDING, world.height - GRAPH_PADDING);
               // The centre node is pinned only while the pointer is down; after
               // release it settles like the rest of the local neighbourhood.
             }
@@ -1459,8 +1747,24 @@
           }
           const point = toSvg(evt);
           const position = positions[drag.index];
-          position.x = Math.max(24, Math.min(width - 24, point.x + drag.offsetX));
-          position.y = Math.max(24, Math.min(height - 24, point.y + drag.offsetY));
+          // Auto-pan near the edge: this is what lets a node be dragged past the
+          // visible frame instead of sticking to an invisible 640×320 wall.
+          const rect = svgRef.current && typeof svgRef.current.getBoundingClientRect === 'function' ? svgRef.current.getBoundingClientRect() : null;
+          if (rect) {
+            const view = viewRef.current;
+            let shiftX = 0;
+            let shiftY = 0;
+            if (evt.clientX < rect.left + GRAPH_AUTOPAN_EDGE) shiftX = evt.clientX - rect.left - GRAPH_AUTOPAN_EDGE;
+            else if (evt.clientX > rect.right - GRAPH_AUTOPAN_EDGE) shiftX = evt.clientX - rect.right + GRAPH_AUTOPAN_EDGE;
+            if (evt.clientY < rect.top + GRAPH_AUTOPAN_EDGE) shiftY = evt.clientY - rect.top - GRAPH_AUTOPAN_EDGE;
+            else if (evt.clientY > rect.bottom - GRAPH_AUTOPAN_EDGE) shiftY = evt.clientY - rect.bottom + GRAPH_AUTOPAN_EDGE;
+            if (shiftX || shiftY) {
+              viewRef.current = { ...view, x: view.x + shiftX, y: view.y + shiftY };
+              applyView();
+            }
+          }
+          position.x = clampNumber(point.x + drag.offsetX, GRAPH_PADDING, world.width - GRAPH_PADDING);
+          position.y = clampNumber(point.y + drag.offsetY, GRAPH_PADDING, world.height - GRAPH_PADDING);
           position.vx = 0;
           position.vy = 0;
           paint();
@@ -1492,7 +1796,17 @@
 
         return h(
           'div',
-          { style: cardStyle },
+          {
+            ref: wrapRef,
+            className: 'hp-graph',
+            style: {
+              ...cardStyle,
+              '--hip-glow-strong': colors.strong,
+              '--hip-glow-weak': colors.weak,
+              '--hip-glow-capture': colors.capture,
+            },
+          },
+          h('style', null, GRAPH_STYLE),
           h(
             'div',
             { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 6 } },
@@ -1502,10 +1816,22 @@
               { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
               h(
                 'div',
-                { style: { ...labelStyle, marginBottom: 0 }, title: '按住 Ctrl（Mac 为 Cmd）拖拽画布平移；Ctrl + 滚轮缩放；双击空白处重置视图' },
-                'Ctrl 拖拽平移 · Ctrl 滚轮缩放',
+                { style: { ...labelStyle, marginBottom: 0 }, title: '空白处拖拽平移；Ctrl + 滚轮缩放；双击空白或点「适应视图」回到全貌' },
+                '拖拽平移 · Ctrl 滚轮缩放',
               ),
-              h('div', { style: { ...labelStyle, marginBottom: 0 } }, `${fmtNumber(graph.nodeCount)} 节点 · ${fmtNumber(graph.edgeCount)} 边${graph.truncated ? '（已截断）' : ''}`),
+              h(
+                'button',
+                { type: 'button', onClick: fitToContent, style: toggleStyle(false), title: '缩放到刚好看见整张图谱' },
+                '适应视图',
+              ),
+              h(
+                'div',
+                { style: { ...labelStyle, marginBottom: 0 }, title: Number(graph.droppedNodes) > 0 ? '节点上限可在设置 → 图谱与光效里调整' : '当前显示全部节点' },
+                `${fmtNumber(graph.nodeCount)}/${fmtNumber(graph.totalNodes || graph.nodeCount)} 节点 · ${fmtNumber(graph.edgeCount)} 边${graph.truncated ? '（已截断）' : ''}`,
+              ),
+              Number(graph.droppedNodes) > 0
+                ? h('div', { style: { ...labelStyle, marginBottom: 0, color: palette.warn } }, `+${fmtNumber(graph.droppedNodes)} 节点未显示（按事件数从少到多隐藏）`)
+                : null,
               ghostNodes.length > 0
                 ? h(
                     'div',
@@ -1532,10 +1858,12 @@
             {
               ref: svgRef,
               width: '100%',
+              height,
               viewBox: `0 0 ${width} ${height}`,
-              style: { display: 'block', touchAction: 'none' },
+              style: { display: 'block', touchAction: 'none', background: canvasBackground, borderRadius: 6 },
               onPointerDown: (evt) => {
-                if ((evt.ctrlKey || evt.metaKey) && evt.target === evt.currentTarget) startPan(evt);
+                // Empty canvas: plain drag pans, no modifier needed.
+                if (evt.target === evt.currentTarget) startPan(evt);
               },
               onPointerMove,
               onPointerUp: endDrag,
@@ -1545,6 +1873,20 @@
               },
             },
             h('g', { ref: groupRef, transform: 'translate(0, 0) scale(1)' },
+            // The dashed frame is the layout world: everything inside is reachable
+            // by dragging, and it grows with the node count instead of clipping.
+            h('rect', {
+              key: 'world',
+              x: 0,
+              y: 0,
+              width: world.width,
+              height: world.height,
+              fill: 'none',
+              stroke: palette.border,
+              strokeDasharray: '6 6',
+              opacity: 0.5,
+              pointerEvents: 'none',
+            }),
             // Edges first, and only when BOTH endpoints are painted: no dangling lines.
             allEdges.map((edge, i) => {
               const a = byId.get(edge.source);
@@ -1576,7 +1918,7 @@
               if (!position) return null;
               const ghost = node.ghost === true;
               const ghostRoot = node.ghostRoot === true;
-              const radius = ghost ? 4 : ghostRoot ? 6 : 3 + (Math.sqrt((node.weight || 0) / maxWeight) || 0) * 7;
+              const radius = computeRadius(node, maxWeight);
               const core = !ghost && !ghostRoot && i < 5;
               const active = focus === node.id;
               return h(
@@ -1587,6 +1929,7 @@
                     nodeEls.current[i] = el;
                   },
                   transform: `translate(${position.x}, ${position.y})`,
+                  'data-node-id': node.id,
                   style: {
                     cursor: 'grab',
                     touchAction: 'none',
@@ -1608,6 +1951,7 @@
                   fill: 'transparent', // larger hit target, invisible
                 }),
                 h('circle', {
+                  className: 'hp-dot',
                   r: radius,
                   fill: ghost ? 'rgba(217,155,43,0.22)' : ghostRoot ? 'transparent' : active ? palette.accent : 'rgba(79,140,255,0.55)',
                   stroke: ghost || ghostRoot ? palette.warn : palette.border,
@@ -1624,7 +1968,7 @@
             }),
             ),
           ),
-          h('div', { style: { ...labelStyle, marginTop: 6, marginBottom: 0 } }, 'Ctrl+拖拽平移 · Ctrl+滚轮缩放 · 双击空白重置视图；拖拽节点可移动；单击查看标签；核心节点常显。幽灵节点＝宽限期内的层级记忆，仅在"历史全貌"可见（半透明、虚线、挂在父 root 下）。'),
+          h('div', { style: { ...labelStyle, marginTop: 6, marginBottom: 0 } }, '空白处拖拽平移 · Ctrl+滚轮缩放 · 双击空白或「适应视图」回到全貌；拖拽节点可移动（拖到边缘会自动平移，能把节点带到框外）；单击查看标签；核心节点常显。虚线框是布局边界，随节点数自动扩大。最近 recall 命中的标签会亮起，相邻标签弱亮。幽灵节点＝宽限期内的层级记忆，仅在"历史全貌"可见（半透明、虚线、挂在父 root 下）。'),
         );
       }
 
@@ -2266,7 +2610,12 @@
             ? h('div', { style: { ...labelStyle, marginBottom: 0 } }, `检索：${searchQuery}（命中 ${shownGraph.nodes.length} 个标签）`)
             : null,
           graphState.graph
-            ? h(KnowledgeGraph, { graph: shownGraph, ghosts: (graphState.tagTree && graphState.tagTree.ghosts) || [] })
+            ? h(KnowledgeGraph, {
+                graph: shownGraph,
+                config: payload.config || null,
+                spaceId: activeSpace || null,
+                ghosts: (graphState.tagTree && graphState.tagTree.ghosts) || [],
+              })
             : h('div', { style: { ...cardStyle, color: palette.muted, fontSize: 13 } }, graphState.error ? `图谱不可用：${graphState.error.code}` : '正在读取图谱缓存…'),
           // UI_TASK_1/3: business rows are CHECKBOXES for the regulated mover. The
           // old per-row transfer button and the raw event_ids text box are gone.
@@ -2573,6 +2922,15 @@
           enableReflection: Boolean(config.enableReflection),
           dreamIdleMinutes: Number(config.dreamIdleMinutes),
           graphMaxEdges: Number(config.graphMaxEdges),
+          graphMaxNodes: Number(config.graphMaxNodes ?? 80),
+          // v1.7.4 graph appearance: glow + canvas. Defaults mirror config.js.
+          ui: {
+            graphGlowEnabled: config.ui ? config.ui.graphGlowEnabled !== false : true,
+            graphGlowPreset: (config.ui && config.ui.graphGlowPreset) || 'accent',
+            graphGlowCustom: (config.ui && config.ui.graphGlowCustom) || '',
+            graphCanvasTint: (config.ui && config.ui.graphCanvasTint) || 'auto',
+            graphActivityPersist: Boolean(config.ui && config.ui.graphActivityPersist),
+          },
           storageBudgetMb: Number(config.storageBudgetMb),
           // L1.5 tag-tree lifecycle. Defaults mirror config.js; the form sends the
           // four dotted keys back in the same patch as every other setting.
@@ -2676,6 +3034,7 @@
       const NUMBER_RULES = [
         { key: 'dreamIdleMinutes', label: '空闲判定', min: 1, max: 525600 },
         { key: 'graphMaxEdges', label: '图谱最大边数', min: 100, max: 2000 },
+        { key: 'graphMaxNodes', label: '图谱节点上限', min: 10, max: 2000 },
         { key: 'storageBudgetMb', label: '存储预算', min: 10, max: 1000 },
         { key: 'decayHalfLifeDays', label: '记忆半衰期', min: 7, max: 365 },
         { key: 'activeSetCap', label: '活跃标签上限', min: 100, max: 1000 },
@@ -2928,11 +3287,110 @@
        * item each; `visibleInSimple` makes the 简洁模式 promise (身份 / 上下文窗口 / 存储迁移 /
        * 原始回合留存) declarative instead of a `simpleMode &&` scattered across the JSX.
        */
+      /**
+       * v1.7.4: 图谱与光效。节点上限决定「最少事件先出局」的截断点；光效把 recall
+       * 命中的标签点亮（强/弱/脉冲三级），颜色默认由主题强调色派生。
+       */
+      function SettingsGraphGroup(bag) {
+        const { draft, edit, disabled } = bag;
+        const ui = draft.ui || {};
+        return [
+          h(
+            Section,
+            { title: '图谱规模', hint: '节点按「事件数最少优先」隐藏，事件最多的标签永远保留；被隐藏的数量会在图标题里以 +N 提示。' },
+            h(Field, {
+              label: '节点上限（graphMaxNodes）',
+              hint: '默认 80。调大能看见更多标签，但布局更密。',
+              value: draft.graphMaxNodes,
+              min: 10,
+              max: 2000,
+              step: 10,
+              onChange: (value) => edit('graphMaxNodes', value),
+              disabled,
+            }),
+            h(Field, {
+              label: '边上限（graphMaxEdges）',
+              hint: '保存后立即按新上限重新拉取 /api/hippocampus/graph 并重绘。',
+              value: draft.graphMaxEdges,
+              min: 100,
+              max: 2000,
+              step: 100,
+              onChange: (value) => edit('graphMaxEdges', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            { title: 'recall 光效', hint: '记忆被 recall 命中时对应标签强光亮起、相邻标签弱亮；新写入的标签脉冲一次（620ms），2.4 秒后自动淡出。' },
+            h(Toggle, {
+              label: '启用光效',
+              hint: '关闭后图谱不再随 recall 亮起（静态偏好或低性能设备）。',
+              checked: ui.graphGlowEnabled !== false,
+              onChange: (value) => edit('ui.graphGlowEnabled', value),
+              disabled,
+            }),
+            h(Select, {
+              label: '预设色（ui.graphGlowPreset）',
+              hint: 'accent 跟随主题强调色（默认，白底也够对比）；vivid / warm 为高对比预设。',
+              value: ui.graphGlowPreset || 'accent',
+              options: [
+                { value: 'accent', label: 'accent — 跟随主题强调色（默认）' },
+                { value: 'vivid', label: 'vivid — 冷绿高对比' },
+                { value: 'warm', label: 'warm — 暖橙高对比' },
+              ],
+              onChange: (value) => edit('ui.graphGlowPreset', value),
+              disabled,
+            }),
+            h(
+              'div',
+              { style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', margin: '6px 0 12px' } },
+              h('div', { style: { ...labelStyle, marginBottom: 0, flex: '1 1 220px' } }, '自定义光色（ui.graphGlowCustom）'),
+              h('input', {
+                type: 'color',
+                value: normalizeHex(ui.graphGlowCustom) || '#4f8cff',
+                disabled,
+                onChange: (evt) => edit('ui.graphGlowCustom', evt.target.value),
+                style: { width: 44, height: 28, padding: 2, border: `1px solid ${palette.border}`, borderRadius: 8, background: 'transparent' },
+              }),
+              h(
+                'button',
+                { type: 'button', style: smallButtonStyle, disabled, onClick: () => edit('ui.graphGlowCustom', '') },
+                '恢复跟随预设',
+              ),
+            ),
+            h(Select, {
+              label: '画布底色（ui.graphCanvasTint）',
+              hint: 'auto 给一层极淡底色提高对比；none 完全透明，跟随主题；tint 稍强。',
+              value: ui.graphCanvasTint || 'auto',
+              options: [
+                { value: 'auto', label: 'auto — 极淡底色（默认）' },
+                { value: 'tint', label: 'tint — 更明显的底色' },
+                { value: 'none', label: 'none — 透明' },
+              ],
+              onChange: (value) => edit('ui.graphCanvasTint', value),
+              disabled,
+            }),
+          ),
+          h(
+            Section,
+            { title: '活动流', hint: '光效读取的是最近的 recall / capture 事件（不含敏感标签）。持久化只影响重启后能否回放，默认关闭。' },
+            h(Toggle, {
+              label: '活动流落盘（ui.graphActivityPersist）',
+              hint: '默认关闭：活动只在内存里，重启即清空。打开后写入 state/activity.json，重启仍能看到最近的闪烁历史。',
+              checked: Boolean(ui.graphActivityPersist),
+              onChange: (value) => edit('ui.graphActivityPersist', value),
+              disabled,
+            }),
+          ),
+        ];
+      }
+
       const SETTINGS_GROUPS = [
         { id: 'identity', label: '身份与行为', hint: '人格锚点 · 空闲行为', visibleInSimple: true },
         { id: 'context', label: '上下文与注入', hint: '窗口记账 · 注入形态 · 运行模式 · 检索 · 调度', visibleInSimple: true },
         { id: 'ingest', label: '摄入与蒸馏', hint: '打标 · 工具裁剪 · 能力开关 · Dream / L2 合并 / L2.5', visibleInSimple: false },
         { id: 'retention', label: '留存与归档', hint: 'raw 冷热分层 · 标签树 · 老化 · 存储图谱 · 删除复习', visibleInSimple: true },
+        { id: 'graph', label: '图谱与光效', hint: '节点上限 · recall 光效 · 预设色 · 画布底色 · 活动持久化', visibleInSimple: false },
         { id: 'space', label: '空间与存储', hint: '多空间路由 · 会话交接 · 数据目录迁移', visibleInSimple: true },
       ];
 
@@ -3994,6 +4452,7 @@
               index: { ...(prev.index || {}) },
               temp: { ...(prev.temp || {}) },
               tagTree: { ...(prev.tagTree || {}) },
+              ui: { ...(prev.ui || {}) },
               // tools.disabled is an ARRAY: clone it so a cancelled edit cannot
               // mutate the previous draft's array in place.
               tools: {
@@ -4049,6 +4508,12 @@
             enableReflection: Boolean(draft.enableReflection),
             dreamIdleMinutes: Number(draft.dreamIdleMinutes),
             graphMaxEdges: Number(draft.graphMaxEdges),
+            graphMaxNodes: Number(draft.graphMaxNodes),
+            'ui.graphGlowEnabled': Boolean((draft.ui || {}).graphGlowEnabled),
+            'ui.graphGlowPreset': (draft.ui || {}).graphGlowPreset || 'accent',
+            'ui.graphGlowCustom': normalizeHex((draft.ui || {}).graphGlowCustom),
+            'ui.graphCanvasTint': (draft.ui || {}).graphCanvasTint || 'auto',
+            'ui.graphActivityPersist': Boolean((draft.ui || {}).graphActivityPersist),
             storageBudgetMb: Number(draft.storageBudgetMb),
             'decay.halfLifeDays': Number(draft.decayHalfLifeDays),
             'activeSet.cap': Number(draft.activeSetCap),
@@ -4331,6 +4796,11 @@ h(
               ),
               h(
                 SettingsGroup,
+                { groupId: 'graph', label: '图谱与光效', hint: '节点上限 · recall 光效 · 预设色 · 画布底色 · 活动持久化', groupRefs },
+                ...SettingsGraphGroup(settingsBag),
+              ),
+              h(
+                SettingsGroup,
                 { groupId: 'space', label: '空间与存储', hint: '多空间路由 · 会话交接 · 数据目录迁移', groupRefs },
                 ...SettingsSpaceGroup(settingsBag),
               ),
@@ -4385,6 +4855,9 @@ h(
         retryPolicy: decideRetry,
         // Pure geometry for the history view: testable without a DOM.
         ghostGraphParts,
+        // v1.7.4 graph geometry: layout world, force model, overlap separation and
+        // view fitting are pure functions, so the tests assert real numbers.
+        graphGeometry: { computeLayout, separateOverlaps, layoutWorld, fitView, computeRadius, graphBounds, glowColors, mixHex },
         // v1.5.0 pure helpers. The panel/settings can only be exercised in a
         // browser, but these three carry every decision worth locking: the session
         // status line, query filtering (edge consistency) and soft space-follow.

@@ -43,6 +43,10 @@ export const FLAT_ALIASES = Object.freeze({
 export const EVENT_TIME_POLICIES = Object.freeze(['content', 'explicit', 'ingest']);
 /** Raw-turn retention modes: off / gated by value / everything. */
 export const RAW_MODES = Object.freeze(['off', 'salience', 'all']);
+/** v1.7.4 graph glow presets: named palettes the panel can render without a custom colour. */
+export const GRAPH_GLOW_PRESETS = Object.freeze(['accent', 'vivid', 'warm']);
+/** v1.7.4 canvas tint modes: follow the theme / force a tint / stay neutral. */
+export const GRAPH_CANVAS_TINTS = Object.freeze(['auto', 'tint', 'none']);
 
 /**
  * Tool suffixes this plugin registers (`${toolPrefix}_<suffix>`). This is the
@@ -99,6 +103,9 @@ export const CONFIG_KEYS = Object.freeze([
   'dream',
   'enableReflection',
   'graphMaxEdges',
+  // v1.7.4: read-time node ceiling, applied next to graphMaxEdges.
+  'graphMaxNodes',
+  'ui',
   'storageBudgetMb',
   'maxRecallTopK',
   'retrieval',
@@ -181,6 +188,20 @@ export const DEFAULT_CONFIG = Object.freeze({
   // Edges returned by /api/memory/graph. The offline cache may hold up to
   // GRAPH_HARD_CAP; this is the read-time ceiling, so changing it is cheap.
   graphMaxEdges: 500,
+  // Nodes returned by the same route (v1.7.4): trimming is a pure projection over
+  // the cached graph, so the ceiling is independent from graphMaxEdges.
+  graphMaxNodes: 80,
+  // v1.7.4 graph presentation only. None of these values changes what is stored;
+  // they are read by the Web panel (and the activity route) and never by recall.
+  ui: Object.freeze({
+    graphGlowEnabled: true,
+    graphGlowPreset: 'accent',
+    // `null` = follow the preset; `#rrggbb` = an explicit glow colour.
+    graphGlowCustom: null,
+    graphCanvasTint: 'auto',
+    // Opt-in persistence of the recent-activity ring (state/activity.json).
+    graphActivityPersist: false,
+  }),
   // Display threshold for the storage ring (MB). Never evicts anything.
   storageBudgetMb: 50,
   maxRecallTopK: 100,
@@ -492,6 +513,23 @@ function requireEnum(value, key, allowed) {
   return value;
 }
 
+/**
+ * v1.7.4: `null` (follow the preset) or an explicit `#rrggbb` colour. Anything
+ * else is a config error carrying the key path — a typo must not silently render
+ * an invisible glow.
+ */
+function requireHexColorOrNull(value, key) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(value)) {
+    throw configError(
+      ErrorCodes.CONFIG_INVALID_TYPE,
+      `config.${key} must be null or a #rrggbb colour, got ${JSON.stringify(value)}`,
+      { key, expected: 'null | #rrggbb', got: value },
+    );
+  }
+  return value;
+}
+
 function requireStringArray(value, key) {
   if (!Array.isArray(value)) {
     throw configError(ErrorCodes.CONFIG_INVALID_TYPE, `config.${key} must be an array of strings`, {
@@ -539,7 +577,7 @@ function normaliseRaw(raw) {
   }
 
   const out = { ...nested };
-  for (const group of ['retrieval', 'context', 'index', 'temp', 'decay', 'activeSet', 'raw', 'delete', 'review', 'migration', 'identity', 'tools', 'dream', 'tagging', 'features', 'l2Merge']) {
+  for (const group of ['retrieval', 'context', 'index', 'temp', 'decay', 'activeSet', 'raw', 'delete', 'review', 'migration', 'identity', 'tools', 'dream', 'tagging', 'features', 'l2Merge', 'ui']) {
     if (isPlainObject(nested[group])) out[group] = { ...nested[group] };
   }
   for (const [alias, path] of Object.entries(FLAT_ALIASES)) {
@@ -757,7 +795,7 @@ function attachConfigMeta(config, migration) {
 function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
   const input = normaliseRaw(raw);
 
-  for (const group of ['retrieval', 'context', 'index', 'temp', 'decay', 'activeSet', 'raw', 'delete', 'review', 'migration', 'identity', 'tools', 'dream', 'tagging', 'features', 'l2Merge']) {
+  for (const group of ['retrieval', 'context', 'index', 'temp', 'decay', 'activeSet', 'raw', 'delete', 'review', 'migration', 'identity', 'tools', 'dream', 'tagging', 'features', 'l2Merge', 'ui']) {
     if (group in input && input[group] !== undefined && !isPlainObject(input[group])) {
       throw configError(ErrorCodes.CONFIG_INVALID_TYPE, `config.${group} must be an object`, { key: group });
     }
@@ -1505,6 +1543,39 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
     'graphMaxEdges',
     { min: 100, max: 2000 },
   );
+  // v1.7.4 node ceiling: same fail-fast contract, independent from the edge limit.
+  const graphMaxNodes = requireInteger(
+    input.graphMaxNodes === undefined ? defaults.graphMaxNodes : input.graphMaxNodes,
+    'graphMaxNodes',
+    { min: 10, max: 2000 },
+  );
+  // v1.7.4 UI-only presentation settings. They never change stored data, but a
+  // typo must still fail fast instead of silently rendering an invisible graph.
+  const uiIn = input.ui ?? {};
+  const uiConfig = Object.freeze({
+    graphGlowEnabled: requireBoolean(
+      uiIn.graphGlowEnabled === undefined ? defaults.ui.graphGlowEnabled : uiIn.graphGlowEnabled,
+      'ui.graphGlowEnabled',
+    ),
+    graphGlowPreset: requireEnum(
+      uiIn.graphGlowPreset === undefined ? defaults.ui.graphGlowPreset : uiIn.graphGlowPreset,
+      'ui.graphGlowPreset',
+      GRAPH_GLOW_PRESETS,
+    ),
+    graphGlowCustom: requireHexColorOrNull(
+      uiIn.graphGlowCustom === undefined ? defaults.ui.graphGlowCustom : uiIn.graphGlowCustom,
+      'ui.graphGlowCustom',
+    ),
+    graphCanvasTint: requireEnum(
+      uiIn.graphCanvasTint === undefined ? defaults.ui.graphCanvasTint : uiIn.graphCanvasTint,
+      'ui.graphCanvasTint',
+      GRAPH_CANVAS_TINTS,
+    ),
+    graphActivityPersist: requireBoolean(
+      uiIn.graphActivityPersist === undefined ? defaults.ui.graphActivityPersist : uiIn.graphActivityPersist,
+      'ui.graphActivityPersist',
+    ),
+  });
   // Ring budget: integer MB, fail-fast. The UI recomputes the ring from this
   // value, so an out-of-range number is a config bug, not something to clamp.
   const storageBudgetMb = requireInteger(
@@ -1533,6 +1604,8 @@ function buildResolvedConfig(raw = {}, { env = process.env } = {}) {
     dream: dreamConfig,
     enableReflection,
     graphMaxEdges,
+    graphMaxNodes,
+    ui: uiConfig,
     storageBudgetMb,
     maxRecallTopK,
     retrieval: { topK: retrievalTopK },

@@ -228,6 +228,8 @@ test('validatePatch rejects non-objects and accepts only the editable set', () =
     // v1.5.6 capability flags nest under their own group.
     'features',
     'graphMaxEdges',
+    // v1.7.4 graph node cap + glow/canvas knobs nest under their own groups.
+    'graphMaxNodes',
     'identity',
     'index',
     // v1.5.6 L2 multi-merge tunables.
@@ -247,6 +249,7 @@ test('validatePatch rejects non-objects and accepts only the editable set', () =
     'temp',
     // v1.5.3 tool schema pruning: tools.disabled nests under its own group.
     'tools',
+    'ui',
   ]);
 });
 
@@ -301,6 +304,7 @@ test('registerMemoryRoutes registers the full route table and disposes it, or re
     MEMORY_API.stats,
     MEMORY_API.config,
     MEMORY_API.graph,
+    MEMORY_API.activity,
     MEMORY_API.retry,
     MEMORY_API.transfer,
     MEMORY_API.memories,
@@ -308,13 +312,14 @@ test('registerMemoryRoutes registers the full route table and disposes it, or re
     MEMORY_API.sessionReset,
     MEMORY_API.orchestratorInstall,
   ]);
-  assert.deepEqual(registered.map((route) => route.kind), ['exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact']);
+  assert.deepEqual(registered.map((route) => route.kind), ['exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact', 'exact']);
   result.dispose();
   assert.deepEqual(
     disposed.sort(),
     [
       MEMORY_API.config,
       MEMORY_API.graph,
+      MEMORY_API.activity,
       MEMORY_API.memories,
       MEMORY_API.orchestratorInstall,
       MEMORY_API.retry,

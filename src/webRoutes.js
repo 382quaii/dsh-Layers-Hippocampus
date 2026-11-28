@@ -30,6 +30,8 @@ export const MEMORY_API = Object.freeze({
   stats: '/api/hippocampus/stats',
   config: '/api/hippocampus/config',
   graph: '/api/hippocampus/graph',
+  // v1.7.4: bounded recent recall/capture ring (tags only, never bodies).
+  activity: '/api/hippocampus/activity',
   retry: '/api/hippocampus/retry',
   transfer: '/api/hippocampus/transfer',
   // Per-memory projection for the panel's human-initiated 分享/转移 button.
@@ -53,6 +55,13 @@ export const EDITABLE_CONFIG_KEYS = Object.freeze([
   'enableReflection',
   'dreamIdleMinutes',
   'graphMaxEdges',
+  'graphMaxNodes',
+  // v1.7.4 graph presentation (glow / canvas tint) + activity-ring persistence.
+  'ui.graphGlowEnabled',
+  'ui.graphGlowPreset',
+  'ui.graphGlowCustom',
+  'ui.graphCanvasTint',
+  'ui.graphActivityPersist',
   'storageBudgetMb',
   'maxRecallTopK',
   'retrieval.topK',
@@ -442,6 +451,29 @@ export function createMemoryRoutes({ runtime, persist = null, logger = null }) {
     }
   };
 
+  // Activity (v1.7.4): the recent recall/capture ring the panel flashes tags from.
+  // Read-only and independent of the memory phase: it is a hint, not stored truth.
+  const activityHandler = async (req, res) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      sendState(res, 405, runtime, { ok: false, error: { code: 'MEM_E_INVALID_INPUT', message: 'use GET' } });
+      return;
+    }
+    try {
+      const url = new URL(String(req.url ?? MEMORY_API.activity), 'http://localhost');
+      const sinceRaw = Number(url.searchParams.get('since'));
+      const since = Number.isFinite(sinceRaw) && sinceRaw > 0 ? Math.trunc(sinceRaw) : 0;
+      // A missing `limit` must mean 64, not 0 (Number(null) === 0 would clamp to 1).
+      const limitParam = url.searchParams.get('limit');
+      const limitRaw = Number(limitParam);
+      const limit = limitParam !== null && Number.isFinite(limitRaw) ? Math.min(Math.max(Math.trunc(limitRaw), 1), 64) : 64;
+      const payload = runtime.activityPayload({ spaceId: requestedSpace(req), since, limit });
+      sendState(res, 200, runtime, payload);
+    } catch (error) {
+      log(`activity failed: ${error?.message ?? error}`);
+      fail(res, 500, error, runtime);
+    }
+  };
+
   // Retry: only meaningful while the phase is `failed`; the runtime owns the
   // state machine, so this handler never starts a second bootstrap by itself.
   const retryHandler = async (req, res) => {
@@ -646,6 +678,7 @@ export function createMemoryRoutes({ runtime, persist = null, logger = null }) {
     { kind: 'exact', path: MEMORY_API.stats, handler: statsHandler },
     { kind: 'exact', path: MEMORY_API.config, handler: configHandler },
     { kind: 'exact', path: MEMORY_API.graph, handler: graphHandler },
+    { kind: 'exact', path: MEMORY_API.activity, handler: activityHandler },
     { kind: 'exact', path: MEMORY_API.retry, handler: retryHandler },
     { kind: 'exact', path: MEMORY_API.transfer, handler: transferHandler },
     { kind: 'exact', path: MEMORY_API.memories, handler: memoriesHandler },

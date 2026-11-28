@@ -357,13 +357,17 @@ export class Memory {
    * @param {object} [options.clock] Clock with now(); never defaulted in tests
    * @param {object} [options.policy] partial policy overrides
    * @param {object} [options.config] { maxSegmentRecords, context }
+   * @param {object|null} [options.activity] v1.7.4 activity ring (read-time hints only)
    */
-  constructor({ dataDir, clock = new SystemClock(), policy = {}, config = {}, spaces = null, spacesFactory = null, transfer = null, federation = null, dedupe = null, spaceId = DEFAULT_SPACE_ID }) {
+  constructor({ dataDir, clock = new SystemClock(), policy = {}, config = {}, spaces = null, spacesFactory = null, transfer = null, federation = null, dedupe = null, spaceId = DEFAULT_SPACE_ID, activity = null }) {
     if (!dataDir) throw new MemoryError(ErrorCodes.INVALID_CONFIG, 'dataDir is required');
     assertClock(clock);
     this.dataDir = path.resolve(dataDir);
     this.clock = clock;
     this.config = config;
+    // v1.7.4: optional activity ring. `null` means "no hints" and every caller must
+    // behave identically; a store failure is swallowed at the use site.
+    this.activity = activity;
     // v1.5.6 pre-ingest tagging: counters for the panel, and a warning hook the
     // plugin adapter wires to the Host logger (a miss must never break a write).
     this._autoTag = { applied: 0, misses: 0, lastMissAt: null };
@@ -1447,6 +1451,25 @@ export class Memory {
         ...(this._boot && this._boot.status !== 'ok' ? [`boot-check:${this._boot.status}`] : []),
       ],
     };
+    // v1.7.4 activity ring: record AFTER the secret/sensitive gates, so a withheld
+    // hit can never leak its tags through a UI hint. Best-effort only — a broken
+    // store must not change scoring, ordering, notes or the payload.
+    if (this.activity) {
+      try {
+        const tags = [];
+        const eventIds = [];
+        for (const hit of cleared.list) {
+          for (const tag of hit?.tags ?? []) {
+            const value = typeof tag === 'string' ? tag : tag?.tag;
+            if (typeof value === 'string' && value) tags.push(value);
+          }
+          if (typeof hit?.eventId === 'string' && hit.eventId) eventIds.push(hit.eventId);
+        }
+        this.activity.record({ kind: 'recall', tags, eventIds, source: 'recall' });
+      } catch {
+        // A hint is cosmetic; recall itself must never fail because of it.
+      }
+    }
     return this.applyPayloadBudget(payload);
   }
 
