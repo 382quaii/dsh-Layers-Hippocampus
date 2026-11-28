@@ -135,11 +135,21 @@ test('glow colours answer for every preset and for a custom accent', () => {
   assert.notEqual(custom.strong, module.graphGeometry.glowColors({ preset: 'accent' }).strong);
 });
 
-test('the graph measures its container and can pan past the visible frame', () => {
+test('the graph measures its container and lets a node leave the visible frame', () => {
   const source = fs.readFileSync(CLIENT_PATH, 'utf8');
-  for (const marker of ['ResizeObserver', 'fitToContent', 'layoutWorld', 'GRAPH_AUTOPAN_EDGE', 'graphGeometry', 'useActivity', 'hp-glow-strong', 'api/hippocampus/activity']) {
+  for (const marker of ['ResizeObserver', 'fitToContent', 'layoutWorld', 'GRAPH_DRAG_GUTTER', 'graphGeometry', 'useActivity', 'hp-glow-strong', 'api/hippocampus/activity']) {
     assert.ok(source.includes(marker), `ui/client.js must implement ${marker}`);
   }
   assert.equal(source.includes('const width = 640;'), false, 'the fixed 640px drawing box must be gone');
   assert.equal(source.includes('Math.min(width - 24, point.x + drag.offsetX)'), false, 'drag must no longer clamp to the old box');
+
+  // v1.7.5 regression: dragging a node must not pan the canvas. The old auto-pan
+  // shifted viewRef while the pointer moved, so the node appeared to fly away.
+  const start = source.indexOf('const onPointerMove = (evt) => {');
+  const end = source.indexOf('const endDrag = (evt) => {');
+  assert.ok(start > 0 && end > start, 'node-drag handler exists');
+  const drag = source.slice(start, end);
+  assert.equal(drag.includes('applyView()'), false, 'node drag must not move the canvas');
+  assert.equal(drag.includes('viewRef.current ='), false, 'node drag must not rewrite the view transform');
+  assert.ok(drag.includes('GRAPH_DRAG_GUTTER'), 'the node may be parked outside the world');
 });

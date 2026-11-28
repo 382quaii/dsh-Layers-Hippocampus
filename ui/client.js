@@ -931,7 +931,12 @@
       const GRAPH_MAX_RADIUS = 14;
       const GRAPH_LABEL_ROOM = 26;
       const GRAPH_PADDING = 16;
-      const GRAPH_AUTOPAN_EDGE = 28;
+      // v1.7.5: dragging a node must NOT move the canvas. The old auto-pan made
+      // the view follow the pointer, so the node looked like it flew away instead
+      // of leaving the frame. Nodes may now be parked in a gutter around the world
+      // (still recoverable with 适应视图 / 双击), and the canvas only moves when the
+      // user drags empty space.
+      const GRAPH_DRAG_GUTTER = 240;
 
       function clampNumber(value, low, high) {
         const numeric = Number(value);
@@ -1688,8 +1693,8 @@
               const node = positions[i];
               node.vx *= 0.7;
               node.vy *= 0.7;
-              node.x = clampNumber(node.x + node.vx, GRAPH_PADDING, world.width - GRAPH_PADDING);
-              node.y = clampNumber(node.y + node.vy, GRAPH_PADDING, world.height - GRAPH_PADDING);
+              node.x = clampNumber(node.x + node.vx, GRAPH_PADDING - GRAPH_DRAG_GUTTER, world.width - GRAPH_PADDING + GRAPH_DRAG_GUTTER);
+              node.y = clampNumber(node.y + node.vy, GRAPH_PADDING - GRAPH_DRAG_GUTTER, world.height - GRAPH_PADDING + GRAPH_DRAG_GUTTER);
               // The centre node is pinned only while the pointer is down; after
               // release it settles like the rest of the local neighbourhood.
             }
@@ -1747,24 +1752,10 @@
           }
           const point = toSvg(evt);
           const position = positions[drag.index];
-          // Auto-pan near the edge: this is what lets a node be dragged past the
-          // visible frame instead of sticking to an invisible 640×320 wall.
-          const rect = svgRef.current && typeof svgRef.current.getBoundingClientRect === 'function' ? svgRef.current.getBoundingClientRect() : null;
-          if (rect) {
-            const view = viewRef.current;
-            let shiftX = 0;
-            let shiftY = 0;
-            if (evt.clientX < rect.left + GRAPH_AUTOPAN_EDGE) shiftX = evt.clientX - rect.left - GRAPH_AUTOPAN_EDGE;
-            else if (evt.clientX > rect.right - GRAPH_AUTOPAN_EDGE) shiftX = evt.clientX - rect.right + GRAPH_AUTOPAN_EDGE;
-            if (evt.clientY < rect.top + GRAPH_AUTOPAN_EDGE) shiftY = evt.clientY - rect.top - GRAPH_AUTOPAN_EDGE;
-            else if (evt.clientY > rect.bottom - GRAPH_AUTOPAN_EDGE) shiftY = evt.clientY - rect.bottom + GRAPH_AUTOPAN_EDGE;
-            if (shiftX || shiftY) {
-              viewRef.current = { ...view, x: view.x + shiftX, y: view.y + shiftY };
-              applyView();
-            }
-          }
-          position.x = clampNumber(point.x + drag.offsetX, GRAPH_PADDING, world.width - GRAPH_PADDING);
-          position.y = clampNumber(point.y + drag.offsetY, GRAPH_PADDING, world.height - GRAPH_PADDING);
+          // The node follows the pointer and may leave the visible frame: the only
+          // limit is the world plus a gutter, so nothing is permanently lost.
+          position.x = clampNumber(point.x + drag.offsetX, GRAPH_PADDING - GRAPH_DRAG_GUTTER, world.width - GRAPH_PADDING + GRAPH_DRAG_GUTTER);
+          position.y = clampNumber(point.y + drag.offsetY, GRAPH_PADDING - GRAPH_DRAG_GUTTER, world.height - GRAPH_PADDING + GRAPH_DRAG_GUTTER);
           position.vx = 0;
           position.vy = 0;
           paint();
@@ -1968,7 +1959,7 @@
             }),
             ),
           ),
-          h('div', { style: { ...labelStyle, marginTop: 6, marginBottom: 0 } }, '空白处拖拽平移 · Ctrl+滚轮缩放 · 双击空白或「适应视图」回到全貌；拖拽节点可移动（拖到边缘会自动平移，能把节点带到框外）；单击查看标签；核心节点常显。虚线框是布局边界，随节点数自动扩大。最近 recall 命中的标签会亮起，相邻标签弱亮。幽灵节点＝宽限期内的层级记忆，仅在"历史全貌"可见（半透明、虚线、挂在父 root 下）。'),
+          h('div', { style: { ...labelStyle, marginTop: 6, marginBottom: 0 } }, '空白处拖拽平移 · Ctrl+滚轮缩放 · 双击空白或「适应视图」回到全貌；拖拽节点可移动，节点能被拖出可见范围（画布不会跟着跑，点「适应视图」就能把它找回来）；单击查看标签；核心节点常显。虚线框是布局边界，随节点数自动扩大。最近 recall 命中的标签会亮起，相邻标签弱亮。幽灵节点＝宽限期内的层级记忆，仅在"历史全貌"可见（半透明、虚线、挂在父 root 下）。'),
         );
       }
 

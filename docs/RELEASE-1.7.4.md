@@ -35,9 +35,10 @@
   再做 16 轮边界感知的分离。
 - **看得全**：`fitView()` 一次把整张图放进视口（`k ≤ 1.4`，单点也不会被放大成球），
   `resetView = fitToContent`；标题栏新增「适应视图」按钮，双击空白同样复位。
-- **拖得出边界**：拖拽夹取改用世界尺寸（`[GRAPH_PADDING, world.width - GRAPH_PADDING]`），
-  指针进入视口边缘 28px（`GRAPH_AUTOPAN_EDGE`）内自动平移视野，世界外预留 160px 缓冲带 ⇒
-  节点可以被带到可见范围之外；画一条**虚线世界边界**，让「边界」本身可见。
+- **拖得出边界**：拖拽节点时**画布完全不移动**（早期实现的边缘自动平移会让节点与指针失配、
+  每动一下就朝一个方向跳一段，已废弃），节点跟随指针，坐标夹取放宽到 world 外
+  `GRAPH_DRAG_GUTTER = 240` 的走廊 ⇒ 节点可以被带到可见范围之外，随时靠「适应视图」/双击空白找回；
+  只有拖空白处才平移画布。画一条**虚线世界边界**，让「边界」本身可见。
 
 ## 3. 节点上限 80（`src/graph.js#trimGraph`）
 
@@ -81,8 +82,9 @@
 - `test/v174.ui.test.js`（8 例）：`graphGeometry` 导出齐全；`layoutWorld` 随节点数增长且 ≤3×；
   `computeLayout` 全部落在世界内、半径 4–14、x/y 铺开 > 世界 30%；`separateOverlaps`
   不越界且保持间距；`fitView` 整图入视口且缩放有上限；`glowColors` 三预设 + 自定义均为 hex；
-  源码契约（`ResizeObserver`/`fitToContent`/`GRAPH_AUTOPAN_EDGE`/`useActivity`/`hp-glow-strong`，
-  且不再有 `const width = 640;` 与旧拖拽夹取）。
+  源码契约（`ResizeObserver`/`fitToContent`/`GRAPH_DRAG_GUTTER`/`useActivity`/`hp-glow-strong`，
+  且不再有 `const width = 640;` 与旧拖拽夹取；拖拽节点区间内**不得**出现 `applyView()` /
+  `viewRef.current =`——节点拖拽绝不移动画布）。
 - `test/v174.graph.test.js`（5 例）：`trimGraph` 的事件数排序、边过滤、上限与 payload 字段。
 - `test/v174.activity.test.js`（6 例）：环形缓冲、敏感标签剥离、游标、持久化开关、损坏文件容错。
 - 全量：`node test/run.mjs` → **590/590 通过**（92 个测试文件）。

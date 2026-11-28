@@ -17,8 +17,12 @@ recall 时命中的标签会真的亮起来。**
   （`0.9 * spacing²`），向心力改成温和弹簧（`0.02 * alpha`），最小距离 6px 防爆，
   标签留白 `GRAPH_LABEL_ROOM = 26`，最大速度收敛即早停；容器用 `ResizeObserver` 测量，
   `viewBox` 跟着容器走、节点与文字保持固定像素大小；初始 `fitView()` 一屏看全，
-  拖到边缘 28px 内自动平移（`GRAPH_AUTOPAN_EDGE`），world 之外还有 160px 缓冲带——
+  拖拽节点时**画布不动**，节点跟随指针、可以停在 world 之外 `GRAPH_DRAG_GUTTER = 240` 的走廊里
+  （「适应视图」或双击空白就能把它找回来）；画布只在拖空白处平移——
   **节点可以被拖出可见范围**；新增「适应视图」按钮与虚线世界边界，双击空白仍然重置。
+  规划期曾试过「指针进边缘 28px 就自动平移视野」，实测在同一帧里先按旧视图换算指针坐标、
+  再平移视图，节点与指针失配 ⇒ 每动一下就朝一个方向猛跳一段。该做法已删除，
+  拖拽节点**永不**改动视图变换（回归测试直接断言这段代码里不出现 `applyView()`）。
 - **Added — 节点上限 80（`src/graph.js#trimGraph`）**。`graphMaxNodes` 默认 80（10–2000），
   超出时按**事件数最少优先**隐藏（`events` ASC → `weight` ASC → `id` ASC），
   边同步过滤并按 weight 截断；payload 增加 `totalNodes` / `droppedNodes` / `droppedEdges`，
