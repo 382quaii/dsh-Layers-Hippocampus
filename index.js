@@ -1422,6 +1422,36 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
    * Reads during startup. A migration has a source of truth that is still valid:
    * the legacy directory. Serving from it beats both an empty answer and a stall.
    */
+  /**
+   * v1.7.4: the panel's glow feed, recorded at the RUNTIME boundary on purpose.
+   *
+   * `memory.recall()` does not necessarily run on this facade: with multi-space it
+   * routes through `spaces.run()`, and a cross-space recall fans out to per-space
+   * `Memory` instances. A hook inside `Memory#_recallLocal` therefore only fires for
+   * whichever instance happened to serve the call — in a two-space profile the
+   * default ring stayed empty and the graph never lit up. Recording here means one
+   * place, one store per answering space, and the same payload shape for every path.
+   * Tags only: ActivityStore strips `sensitive:` / `privacy:` before they can reach
+   * the panel, and a broken ring must never affect the recall result itself.
+   */
+  const noteRecallActivity = (result, spaceId = null) => {
+    try {
+      const tags = [];
+      const eventIds = [];
+      for (const hit of result?.hits ?? []) {
+        for (const tag of hit?.tags ?? []) {
+          const value = typeof tag === 'string' ? tag : tag?.tag;
+          if (typeof value === 'string' && value) tags.push(value);
+        }
+        if (typeof hit?.eventId === 'string' && hit.eventId) eventIds.push(hit.eventId);
+      }
+      if (tags.length === 0 && eventIds.length === 0) return;
+      runtime.activityFor(spaceId ?? result?.spaceId ?? null).record({ kind: 'recall', tags, eventIds, source: 'recall' });
+    } catch {
+      // A hint is cosmetic; recall itself must never fail because of it.
+    }
+  };
+
   runtime.recall = async (query) => {
     if (runtime.phase === 'ready') {
       runtime.recordToolCall();
@@ -1436,9 +1466,13 @@ export function createRuntime({ ctx = null, config, options, clock, raw = null, 
         runtime.multiSpaceAvailable?.() &&
         memory.spaces.status().ids.length > 1
       ) {
-        return memory.recallAcrossSpaces(query ?? {});
+        const result = await memory.recallAcrossSpaces(query ?? {});
+        noteRecallActivity(result, null);
+        return result;
       }
-      return memory.recall(query);
+      const result = await memory.recall(query);
+      noteRecallActivity(result, query && typeof query === 'object' ? query.targetSpaceId ?? null : null);
+      return result;
     }
     if (runtime.legacy) {
       runtime.recordToolCall();

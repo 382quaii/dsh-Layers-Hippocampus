@@ -14,7 +14,9 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { ActivityStore } from '../src/activity.js';
-import { tempDir } from './helpers.js';
+import { createRuntime } from '../index.js';
+import { resolveConfig, toMemoryOptions } from '../src/config.js';
+import { createOrchestratorStub, FakeClock, T0, tempDir } from './helpers.js';
 
 test('record assigns increasing seq and recent honors the since cursor', () => {
   const store = new ActivityStore({ limit: 8 });
@@ -118,6 +120,51 @@ test('a corrupt persistence file reads as empty and never throws', () => {
     assert.ok(store.record({ kind: 'recall', tags: ['after-corruption'] }));
     assert.equal(store.recent().items.length, 1);
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a real runtime recall feeds the ring the panel polls', async () => {
+  // Regression: the hook used to live in `Memory#_recallLocal`. In a multi-space
+  // profile a recall is routed through `spaces.run()` (and a cross-space read fans
+  // out to per-space instances), so the instance that served the call was not the
+  // one the route reads and the graph never lit up. The hook is now at
+  // `runtime.recall`, which is the single boundary every path crosses.
+  const dir = tempDir('v174-activity-runtime');
+  const config = resolveConfig({
+    dataDir: dir,
+    autoMaintainOnBoot: false,
+    context: { nativeTokenLimit: 1_000_000, autoRolloverThreshold: 0.85, maxTokens: 100_000 },
+  });
+  const clock = new FakeClock(T0);
+  const runtime = createRuntime({ config, options: toMemoryOptions(config), clock, orchestrator: createOrchestratorStub() });
+  try {
+    runtime.start();
+    await runtime.ready;
+    await runtime.memory.remember({ content: '光效联调条目 alpha', tags: ['project:alpha', 'lesson'], salience: 0.9 });
+    await runtime.memory.remember({ content: '光效联调条目 beta', tags: ['project:beta'], salience: 0.9 });
+
+    assert.equal(runtime.activityPayload().items.length, 0, 'nothing lights up before a read');
+
+    const result = await runtime.recall({ text: '光效联调条目', topK: 5 });
+    assert.ok(result.hits.length >= 2);
+
+    const feed = runtime.activityPayload({ limit: 10 });
+    assert.equal(feed.items.length, 1, 'one recall = one ring entry');
+    assert.equal(feed.items[0].kind, 'recall');
+    assert.ok(feed.items[0].tags.includes('project:alpha'), 'the tags of the hits are what lights up');
+    assert.deepEqual(
+      feed.items[0].eventIds.slice().sort(),
+      result.hits.map((hit) => hit.eventId).sort(),
+      'the panel needs the hit ids to resolve nodes',
+    );
+    assert.equal(runtime.activityPayload({ since: feed.cursor }).items.length, 0, 'the cursor is exclusive');
+
+    // The store is per-space; a spaced read lands in that space's own ring.
+    await runtime.recall({ text: '光效联调条目', topK: 5, targetSpaceId: 'default' });
+    assert.equal(runtime.activityPayload({ limit: 10 }).items.length, 2);
+  } finally {
+    runtime.stop?.();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

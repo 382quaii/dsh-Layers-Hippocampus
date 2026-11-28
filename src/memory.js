@@ -1451,25 +1451,11 @@ export class Memory {
         ...(this._boot && this._boot.status !== 'ok' ? [`boot-check:${this._boot.status}`] : []),
       ],
     };
-    // v1.7.4 activity ring: record AFTER the secret/sensitive gates, so a withheld
-    // hit can never leak its tags through a UI hint. Best-effort only — a broken
-    // store must not change scoring, ordering, notes or the payload.
-    if (this.activity) {
-      try {
-        const tags = [];
-        const eventIds = [];
-        for (const hit of cleared.list) {
-          for (const tag of hit?.tags ?? []) {
-            const value = typeof tag === 'string' ? tag : tag?.tag;
-            if (typeof value === 'string' && value) tags.push(value);
-          }
-          if (typeof hit?.eventId === 'string' && hit.eventId) eventIds.push(hit.eventId);
-        }
-        this.activity.record({ kind: 'recall', tags, eventIds, source: 'recall' });
-      } catch {
-        // A hint is cosmetic; recall itself must never fail because of it.
-      }
-    }
+    // v1.7.4 activity ring: recorded by the RUNTIME (`index.js#noteRecallActivity`),
+    // not here. In a multi-space profile a recall is routed through `spaces.run()`
+    // and cross-space reads fan out to per-space `Memory` instances, so a hook at
+    // this level only fires for whichever instance happened to serve the call and
+    // the graph's default ring stayed empty. See index.js for the single hook.
     return this.applyPayloadBudget(payload);
   }
 

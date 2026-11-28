@@ -23,6 +23,14 @@ recall 时命中的标签会真的亮起来。**
   规划期曾试过「指针进边缘 28px 就自动平移视野」，实测在同一帧里先按旧视图换算指针坐标、
   再平移视图，节点与指针失配 ⇒ 每动一下就朝一个方向猛跳一段。该做法已删除，
   拖拽节点**永不**改动视图变换（回归测试直接断言这段代码里不出现 `applyView()`）。
+- **Fixed — 光效永远不亮（活动环记错了实例）**。活动环的写入原本挂在
+  `Memory#_recallLocal` 末尾，但多空间 profile 里 `memory.recall()` 会经
+  `spaces.run()` 路由、跨空间读还会扇出到每个空间自己的 `Memory` 实例——真正
+  执行的那一个不是路由读的那个，于是 `/api/hippocampus/activity` 永远是空数组，
+  图谱一次都不会亮。现在改为在 `runtime.recall` 这一个边界统一记
+  （`index.js#noteRecallActivity`，单空间 / 跨空间 / 指定 `targetSpaceId` 三条路
+  都覆盖，按应答空间落到各自环里），并新增运行时级回归测试
+  `test/v174.activity.test.js`「a real runtime recall feeds the ring the panel polls」。
 - **Added — 节点上限 80（`src/graph.js#trimGraph`）**。`graphMaxNodes` 默认 80（10–2000），
   超出时按**事件数最少优先**隐藏（`events` ASC → `weight` ASC → `id` ASC），
   边同步过滤并按 weight 截断；payload 增加 `totalNodes` / `droppedNodes` / `droppedEdges`，
@@ -43,7 +51,7 @@ recall 时命中的标签会真的亮起来。**
   新配置 `graphMaxNodes` 与 `ui.{graphGlowEnabled, graphGlowPreset, graphGlowCustom, graphCanvasTint, graphActivityPersist}`，
   全部可在设置 UI 改。
 - **Tests**：`test/v174.ui.test.js`（几何纯函数真值断言 + 源码契约）、`test/v174.graph.test.js`、
-  `test/v174.activity.test.js`；全量 **590 / 590 通过，92 个测试文件**。
+  `test/v174.activity.test.js`；全量 **591 / 591 通过，92 个测试文件**。
 
 ## [1.7.3] — 2026-11-27
 

@@ -1,7 +1,7 @@
 # Release 1.7.4 — 图谱布局世界 · 节点上限 80 · recall 光效
 
 > 版本：**1.7.4**（2026-11-28）
-> 基线：`dsh-memory` 工作区，全量 **590/590 测试通过**（92 个测试文件；`dsh-orchestrator` 31/31）
+> 基线：`dsh-memory` 工作区，全量 **591/591 测试通过**（92 个测试文件；`dsh-orchestrator` 31/31）
 > 上一版：`docs/RELEASE-1.7.3.md`（上下文物理折叠 / raw 墓碑覆盖层 / 敏感硬拦截 / 交接标记过期）
 
 ---
@@ -87,7 +87,7 @@
   `viewRef.current =`——节点拖拽绝不移动画布）。
 - `test/v174.graph.test.js`（5 例）：`trimGraph` 的事件数排序、边过滤、上限与 payload 字段。
 - `test/v174.activity.test.js`（6 例）：环形缓冲、敏感标签剥离、游标、持久化开关、损坏文件容错。
-- 全量：`node test/run.mjs` → **590/590 通过**（92 个测试文件）。
+- 全量：`node test/run.mjs` → **591/591 通过**（92 个测试文件）。
 
 ## 7. 发布
 
